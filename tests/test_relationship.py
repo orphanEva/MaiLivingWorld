@@ -12,7 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from MaiLivingWorld.relationship import PRESETS, MAX_TEMPLATE_CHARS, relationship_note
 from MaiLivingWorld.tests.test_runtime import plugin, FakeContext
 from MaiLivingWorld.store import Store
-from MaiLivingWorld.tests.test_owner import message
+def message(user_id='12345678', platform='qq', group_id=None, sid='qq_private_12345678', text='我是主人'):
+    return {'platform':platform, 'session_id':sid, 'message_info':{
+        'user_info':{'user_id':user_id,'user_nickname':'主人'},
+        'group_info':{'group_id':group_id} if group_id else None},
+        'raw_message':[{'type':'text','data':text}]}
+
 
 
 class RelationshipPolicyTests(unittest.TestCase):
