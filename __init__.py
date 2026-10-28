@@ -1,0 +1,1 @@
+"""MaiLivingWorld independent MaiBot plugin."""
