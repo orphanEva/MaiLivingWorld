@@ -13,13 +13,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from maibot_sdk import API, Tool, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Tool, Field, MaiBotPlugin, PluginConfigBase, HookHandler
+from maibot_sdk.types import HookMode, HookOrder, ErrorPolicy
 
 from .bilibili import fetch_popular
 from .explore import Story, choose_story, fetch_feed, parse_feed
 from .policy import is_quiet, parse_decision
 from .store import Store
 from .mysql_store import MySQLStore
+from .owner import extract_sender, is_owner, normalize_qq, owner_hint, inject_owner_prompt
 
 
 class General(PluginConfigBase):
@@ -45,6 +47,16 @@ class Audience(PluginConfigBase):
     quiet_end: str = Field(default="09:00", description="免打扰结束，例如 09:00；开始与结束相同表示关闭")
     history_gate: bool = Field(default=True, description="没有值得分享的真实见闻时，允许模型判断是否延续旧话题")
     recent_message_limit: int = Field(default=25, ge=2, le=80, description="只读取当前聊天流的最近消息；不跨群/私聊混用")
+
+
+class Owner(PluginConfigBase):
+    __ui_label__ = "03 / 主人识别（QQ 可信身份）"
+    enabled: bool = Field(default=False, description="根据 QQ 平台提供的用户ID识别主人；不改变其他插件的管理员权限")
+    qq: str = Field(default="", description="绑定主人 QQ 号（只填数字）；不要在公开仓库写入真实号码")
+    title: str = Field(default="主人", description="聊天时使用的关系称呼")
+    recognize_in_groups: bool = Field(default=True, description="群聊中主人本人发消息时注入本轮身份提示")
+    recognize_in_private: bool = Field(default=True, description="在与主人 QQ 的私聊中注入本轮身份提示")
+    add_to_private_targets: bool = Field(default=False, description="可选：将主人加入主动私聊白名单；默认不自动联系主人")
 
 
 class Explorer(PluginConfigBase):
@@ -91,6 +103,7 @@ class Config(PluginConfigBase):
     storage: Storage = Field(default_factory=Storage)
     general: General = Field(default_factory=General)
     audience: Audience = Field(default_factory=Audience)
+    owner: Owner = Field(default_factory=Owner)
     explorer: Explorer = Field(default_factory=Explorer)
     brain: Brain = Field(default_factory=Brain)
     memory: Memory = Field(default_factory=Memory)
@@ -122,6 +135,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._last_chat_check = 0.0
         self._scan_errors: dict[str, str] = {}
         self._last_decision: dict[tuple[str,bool],float] = {}
+        self._owner_events: dict[str, tuple[float, bool, str, str]] = {}
 
     async def on_load(self):
         storage = self.config.storage
@@ -142,8 +156,85 @@ class MaiLivingWorld(MaiBotPlugin):
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.2.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.3.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
+
+
+    async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
+        # 配置更新后旧身份缓存立即失效。
+        self._owner_events.clear()
+        self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
+
+    async def _owner_session_id(self, sender):
+        if sender.stream_id:
+            return sender.stream_id
+        try:
+            if sender.kind == "group":
+                stream = await self.ctx.chat.get_stream_by_group_id(sender.target_id)
+            else:
+                stream = await self.ctx.chat.get_stream_by_user_id(sender.target_id, platform="qq")
+            return _stream_id(stream) if stream else ""
+        except Exception:
+            return ""
+
+    @HookHandler(
+        "chat.receive.after_process", name="living_world_owner_identity",
+        description="仅用平台 QQ 用户ID核验发言者；不解析用户自称",
+        mode=HookMode.BLOCKING, order=HookOrder.EARLY, error_policy=ErrorPolicy.SKIP,
+    )
+    async def capture_owner(self, message: Any = None, **kwargs):
+        cfg = self.config.owner
+        if not cfg.enabled or not normalize_qq(cfg.qq):
+            self._owner_events.clear()
+            return {"action": "continue"}
+        sender = extract_sender(message)
+        if not sender:
+            return {"action": "continue"}
+        sid = await self._owner_session_id(sender)
+        if not sid:
+            return {"action": "continue"}
+        verified = is_owner(sender, cfg.qq) and (
+            cfg.recognize_in_groups if sender.kind == "group" else cfg.recognize_in_private
+        )
+        now = time.monotonic()
+        # 每条新消息覆盖同会话状态，非主人群友消息会清除识别结果。
+        self._owner_events[sid] = (now, verified, sender.kind, normalize_qq(cfg.qq))
+        if len(self._owner_events) > 200:
+            self._owner_events = {k:v for k,v in self._owner_events.items() if now-v[0] < 90}
+        return {"action": "continue"}
+
+    def _owner_prompt_for(self, kwargs: dict[str, Any]) -> str:
+        cfg = self.config.owner
+        if not cfg.enabled or not normalize_qq(cfg.qq):
+            return ""
+        # 不从提示词猜测，不使用跨聊天流全局兜底。
+        sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        if not sid:
+            return ""
+        hit = self._owner_events.get(sid)
+        if not hit or not hit[1] or hit[3] != normalize_qq(cfg.qq) or time.monotonic()-hit[0] > 90:
+            return ""
+        return owner_hint(cfg.title, hit[2])
+
+    @HookHandler(
+        "maisaka.planner.before_request", name="living_world_owner_planner",
+        description="仅对平台身份确认的会话注入主人称呼提示",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def owner_planner_prompt(self, **kwargs):
+        prompt = self._owner_prompt_for(kwargs)
+        updated = inject_owner_prompt(kwargs, prompt) if prompt else None
+        return {"action":"continue", "modified_kwargs":updated} if updated is not None else {"action":"continue"}
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request", name="living_world_owner_replyer",
+        description="QQ主人发言时为回复模型注入临时关系提示",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def owner_reply_prompt(self, **kwargs):
+        prompt = self._owner_prompt_for(kwargs)
+        updated = inject_owner_prompt(kwargs, prompt) if prompt else None
+        return {"action":"continue", "modified_kwargs":updated} if updated is not None else {"action":"continue"}
 
     async def on_unload(self):
         t=self._loop_task
@@ -154,6 +245,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 await t
             except asyncio.CancelledError:
                 pass
+        self._owner_events.clear()
         if self._store:
             self._store.close()
             self._store=None
@@ -167,6 +259,7 @@ class MaiLivingWorld(MaiBotPlugin):
             "storage_backend": self.config.storage.backend,
             "private_targets": len(_clean_ids(self.config.audience.private_users)),
             "group_targets": len(_clean_ids(self.config.audience.group_ids)),
+            "owner_identity_enabled": self.config.owner.enabled and bool(normalize_qq(self.config.owner.qq)),
             "statistics": self._store.statistics() if self._store else {},
             "source_errors": self._scan_errors,
         }
@@ -240,7 +333,12 @@ class MaiLivingWorld(MaiBotPlugin):
             self.ctx.logger.debug("[MaiLivingWorld] 免打扰，暂不主动联系")
             return
         # 同一个 worker 先尝试私聊后尝试群聊；只针对明确白名单。
-        targets = [("private",uid) for uid in _clean_ids(cfg.private_users)] + [("group",gid) for gid in _clean_ids(cfg.group_ids)]
+        private_targets = _clean_ids(cfg.private_users)
+        if self.config.owner.enabled and self.config.owner.add_to_private_targets:
+            owner_qq = normalize_qq(self.config.owner.qq)
+            if owner_qq and owner_qq not in private_targets:
+                private_targets.append(owner_qq)
+        targets = [("private",uid) for uid in private_targets] + [("group",gid) for gid in _clean_ids(cfg.group_ids)]
         if not targets:
             self.ctx.logger.warning("[MaiLivingWorld] 白名单为空，只收集信息，不主动联系")
             return

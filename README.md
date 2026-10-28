@@ -1,4 +1,4 @@
-# MaiLivingWorld · 麦麦的小世界 v0.2.0（SQLite / MySQL 双后端）
+# MaiLivingWorld · 麦麦的小世界 v0.3.0（QQ 主人识别）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
@@ -12,6 +12,7 @@
 | 筛选有趣素材 | ✅ 调用 MaiBot `utils` 任务选择一个话题，也允许拒绝 |
 | 记住外部探索 | ✅ 可选写入 A_Memorix `memory.ingest_summary`（单独 chat_id） |
 | SQLite / MySQL 去重存储 | ✅ WebUI 配置切换；MySQL 需可达的服务与专用数据库 |
+| QQ 主人识别 | ✅ 经适配器提供的真实 QQ ID 验证，群聊/私聊临时身份提示；不授予管理员权限 |
 | 现有 QQ 表情包 | ✅ 不覆盖、不接管。Planner 可继续调用你已安装的表情选择插件 |
 | 聊天时查看已发现资讯 | ✅ `get_living_discoveries` Tool，仅返回公开素材 |
 | 登录 B 站、刷推荐算法 | ❌ 未实现 |
@@ -24,13 +25,33 @@
 
 1. 确保 MaiBot `>=1.3.10`，插件 SDK `>=2.12.0`。
 2. 打开 MaiBot WebUI：**插件扩展 → 更多操作 → 从 ZIP 安装插件**。
-3. 选择 `MaiLivingWorld-v0.2.0-WebUI.zip`（不需要手工解压）。
+3. 选择 `MaiLivingWorld-v0.3.0-WebUI.zip`（不需要手工解压）。
 4. 安装完成后到插件管理打开 **MaiLivingWorld · 麦麦的小世界**，在 WebUI 插件设置里调整配置。
 5. **如果之前安装了 `MaiProactive` 或其他会主动唤醒的插件，先禁用它们的主动发送功能。** 否则不同插件的频率限制互不知晓，可能重复打扰。
 6. ZIP 安装不会覆盖同 ID 已安装插件。升级本插件前先在 WebUI 备份配置和数据并按官方方式卸载或发布新版；勿直接覆盖数据库记录。
 
 ZIP 内部是单一 `MaiLivingWorld/` 文件夹，直接包含 `_manifest.json` 和 `plugin.py`，符合官方 ZIP 结构要求。
 
+
+## QQ 主人识别（v0.3.0）
+
+在插件 WebUI 配置面板中找到 **03 / 主人识别**：
+
+```toml
+[owner]
+enabled = true
+qq = "填写你的QQ号"
+title = "主人"
+recognize_in_groups = true
+recognize_in_private = true
+add_to_private_targets = false
+```
+
+身份判断**只依据 QQ 适配器提供的结构化发送者 ID**；昵称、头像、聊天正文中的自称都不是认证依据。只有实际收到主人消息后、且模型请求明确携带同一会话 ID 时，才会临时给 Planner / Replyer 注入识别提示；同群其他人发言会清除匹配状态。提示 90 秒过期，配置变更或插件卸载也会清除。若 Hook 缺失可靠会话 ID，安全起见不进行识别。
+
+此能力只影响聊天关系与称呼，不会绕过 MaiBot 原有权限系统或其他插件的管理命令。**识别主人并不等于取得管理员权限。** 选配 `add_to_private_targets=true` 才会将主人加入本插件的自主私聊白名单，仍受免打扰、每日次数与演练模式限制。
+
+不要把真实 QQ 号写入公开 GitHub 源码；仅在自己 MaiBot 实例的插件设置中填写。
 
 ## 什么是“去重”？为何增加 MySQL？
 

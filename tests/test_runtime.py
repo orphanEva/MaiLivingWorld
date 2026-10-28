@@ -16,6 +16,12 @@ from pydantic import BaseModel, Field
 fake = types.ModuleType("maibot_sdk")
 fake.API = lambda *a, **k: lambda f:f
 fake.Tool = lambda *a, **k: lambda f:f
+fake.HookHandler = lambda *a, **k: lambda f:f
+fake_types = types.ModuleType("maibot_sdk.types")
+fake_types.HookMode = types.SimpleNamespace(BLOCKING="blocking")
+fake_types.HookOrder = types.SimpleNamespace(EARLY="early", NORMAL="normal")
+fake_types.ErrorPolicy = types.SimpleNamespace(SKIP="skip")
+sys.modules.setdefault("maibot_sdk.types",fake_types)
 fake.Field = Field
 fake.PluginConfigBase = BaseModel
 fake.MaiBotPlugin = type("MaiBotPlugin",(object,),{})

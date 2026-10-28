@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "统一主动聊天、B站与RSS只读探索、A_Memorix、SQLite/MySQL可选持久化和去重；默认演练模式。",
+  "description": "统一主动聊天、B站与RSS只读探索、A_Memorix、SQLite/MySQL可选持久化和去重、可信QQ主人身份识别；默认演练模式。",
   "author": {
     "name": "Community integration / independent implementation"
   },
