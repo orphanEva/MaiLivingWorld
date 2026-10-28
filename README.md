@@ -1,10 +1,10 @@
-# MaiLivingWorld · 麦麦的小世界 v0.3.0（QQ 主人识别）
+# MaiLivingWorld · 麦麦的小世界 v0.4.0（主人专属关系模板）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
 ## 功能与边界
 
-| 能力 | v0.2.0 状态 |
+| 能力 | v0.4.0 状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
@@ -25,7 +25,7 @@
 
 1. 确保 MaiBot `>=1.3.10`，插件 SDK `>=2.12.0`。
 2. 打开 MaiBot WebUI：**插件扩展 → 更多操作 → 从 ZIP 安装插件**。
-3. 选择 `MaiLivingWorld-v0.3.0-WebUI.zip`（不需要手工解压）。
+3. 选择 `MaiLivingWorld-v0.4.0-WebUI.zip`（不需要手工解压）。
 4. 安装完成后到插件管理打开 **MaiLivingWorld · 麦麦的小世界**，在 WebUI 插件设置里调整配置。
 5. **如果之前安装了 `MaiProactive` 或其他会主动唤醒的插件，先禁用它们的主动发送功能。** 否则不同插件的频率限制互不知晓，可能重复打扰。
 6. ZIP 安装不会覆盖同 ID 已安装插件。升级本插件前先在 WebUI 备份配置和数据并按官方方式卸载或发布新版；勿直接覆盖数据库记录。
@@ -33,7 +33,7 @@
 ZIP 内部是单一 `MaiLivingWorld/` 文件夹，直接包含 `_manifest.json` 和 `plugin.py`，符合官方 ZIP 结构要求。
 
 
-## QQ 主人识别（v0.3.0）
+## QQ 主人识别与关系模板（v0.4.0）
 
 在插件 WebUI 配置面板中找到 **03 / 主人识别**：
 
@@ -45,6 +45,10 @@ title = "主人"
 recognize_in_groups = true
 recognize_in_private = true
 add_to_private_targets = false
+relationship_enabled = true
+relationship_mode = "banter"        # banter / gentle / tsundere / custom
+private_template = ""              # 留空使用预设
+group_template = ""                # 留空使用预设
 ```
 
 身份判断**只依据 QQ 适配器提供的结构化发送者 ID**；昵称、头像、聊天正文中的自称都不是认证依据。只有实际收到主人消息后、且模型请求明确携带同一会话 ID 时，才会临时给 Planner / Replyer 注入识别提示；同群其他人发言会清除匹配状态。提示 90 秒过期，配置变更或插件卸载也会清除。若 Hook 缺失可靠会话 ID，安全起见不进行识别。
@@ -52,6 +56,21 @@ add_to_private_targets = false
 此能力只影响聊天关系与称呼，不会绕过 MaiBot 原有权限系统或其他插件的管理命令。**识别主人并不等于取得管理员权限。** 选配 `add_to_private_targets=true` 才会将主人加入本插件的自主私聊白名单，仍受免打扰、每日次数与演练模式限制。
 
 不要把真实 QQ 号写入公开 GitHub 源码；仅在自己 MaiBot 实例的插件设置中填写。
+
+### 主人专属关系模板（不替换原人格）
+
+普通群友仍使用 MaiBot 原本的人格和回复风格，只有可信 QQ ID 验证成功的主人消息才会触发关系提示。
+
+| 模式 | 私聊风格 | 群聊风格 |
+| --- | --- | --- |
+| `banter` | 损友亲近、互怼接梗 | 比普通群友熟络，但不围着主人转 |
+| `gentle` | 温柔偏心、有主见 | 熟悉而克制 |
+| `tsundere` | 嘴硬心软，不套用固定口癖 | 偶尔互怼 |
+| `custom` | 填写 `private_template` | 填写 `group_template` |
+
+每段自定义文字最多取 1600 字符，填写后优先于预设。可以只自定义一段。群聊始终附加“不主动泄露私聊内容、隐私或私人记忆”的约束。定时主动私聊主人时，也会应用私聊风格；其他 QQ 用户、群聊都不会使用私聊模板。
+
+主人识别**不会改变管理员授权**。不要把真实 QQ 号、私人模板或数据库密码提交到公开仓库。
 
 ## 什么是“去重”？为何增加 MySQL？
 
@@ -67,7 +86,7 @@ SQLite 和 MySQL 实现相同接口；SQLite 零配置单机更简单，MySQL �
 
 1. 确认 MaiBot 所在 Docker 容器能访问 MySQL。两个容器同一个自定义 Docker 网络时，`mysql_host` 可填写数据库服务名；不同机器请填**私有网络地址**，不要将 MySQL 3306 暴露公网。
 2. 用 `sql/mysql.sql` 的建库语句先创建 `mai_living_world` 数据库，给插件一个只允许访问该库的独立账号。插件启动时会自动创建表；首次运行账号需要 `CREATE` 权限。
-3. 在 WebUI 插件设置中找到 **「06 / 数据持久化」**，填写以下参数：
+3. 在 WebUI 插件设置中找到 **「07 / 数据持久化」**，填写以下参数：
 
 ```toml
 [storage]
@@ -106,9 +125,9 @@ WebUI 找到以下分组。保存设置后确认插件已启用：
 
 - **01 / 基础与安全**：`enabled = true`、`dry_run = true`。
 - **02 / 允许联系的 QQ**：`private_users = ["你的QQ号"]`，`group_ids = []`。必须先和麦麦有 QQ 私聊消息。
-- **03 / 外部世界**：`enabled = true`，`bilibili_popular_enabled = true`。
+- **04 / 外部世界**：`enabled = true`，`bilibili_popular_enabled = true`。
 - `rss_feed_urls = ["https://rsshub.app/xiaoheihe/news"]` 是示例；小黑盒源失效或 RSSHub 拒绝访问可改为 `[]`，不影响 B 站源。
-- **04 / 自主决策**：`model_task = "utils"`，选题模型必须已经在 MaiBot 正常配置。可以设为你现有的其他可用模型任务。
+- **05 / 自主决策**：`model_task = "utils"`，选题模型必须已经在 MaiBot 正常配置。可以设为你现有的其他可用模型任务。
 
 默认有 25 秒启动等待和 60 秒内部检查，首次检查成功后才产生数据；不要因为安装即刻无消息就认为失败。演练模式会真实访问资讯源并调用模型、**会消耗 API Token**，但不会唤醒发消息、不会写入 A_Memorix。为了省钱，模型评估同一目标默认至少间隔 120 分钟。
 

@@ -10,7 +10,7 @@ import json
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from maibot_sdk import API, Tool, Field, MaiBotPlugin, PluginConfigBase, HookHandler
@@ -22,6 +22,7 @@ from .policy import is_quiet, parse_decision
 from .store import Store
 from .mysql_store import MySQLStore
 from .owner import extract_sender, is_owner, normalize_qq, owner_hint, inject_owner_prompt
+from .relationship import relationship_note
 
 
 class General(PluginConfigBase):
@@ -35,7 +36,7 @@ class General(PluginConfigBase):
 
 class Audience(PluginConfigBase):
     __ui_label__ = "02 / 允许联系的 QQ"
-    private_users: list[str] = Field(default_factory=list, description="允许主动私聊的QQ号，如 ['3166465062']；必须有既存私聊会话")
+    private_users: list[str] = Field(default_factory=list, description="允许主动私聊的QQ号，如 ['12345678']；必须有既存私聊会话")
     group_ids: list[str] = Field(default_factory=list, description="允许主动发言的群号，空列表表示不向任何群主动发言")
     private_min_idle_minutes: int = Field(default=90, ge=1, le=43200, description="私聊静默至少多久才考虑发起")
     group_min_idle_minutes: int = Field(default=35, ge=1, le=10080, description="群聊静默至少多久才考虑带话题出来")
@@ -57,10 +58,14 @@ class Owner(PluginConfigBase):
     recognize_in_groups: bool = Field(default=True, description="群聊中主人本人发消息时注入本轮身份提示")
     recognize_in_private: bool = Field(default=True, description="在与主人 QQ 的私聊中注入本轮身份提示")
     add_to_private_targets: bool = Field(default=False, description="可选：将主人加入主动私聊白名单；默认不自动联系主人")
+    relationship_enabled: bool = Field(default=True, description="主人专属关系风格；关闭后仍识别主人，但不添加亲疏表达指引")
+    relationship_mode: Literal["banter", "gentle", "tsundere", "custom"] = Field(default="banter", description="风格预设：banter=损友亲近、gentle=温柔偏心、tsundere=嘴硬心软、custom=完全自定义")
+    private_template: str = Field(default="", description="私聊专属风格模板；留空使用所选预设。建议写相处方式而不是固定台词")
+    group_template: str = Field(default="", description="群聊专属风格模板；留空使用所选预设。请勿填入私聊秘密")
 
 
 class Explorer(PluginConfigBase):
-    __ui_label__ = "03 / 外部世界（只读）"
+    __ui_label__ = "04 / 外部世界（只读）"
     enabled: bool = Field(default=False, description="外部探索开关：只有打开后才联网抓取")
     scan_interval_minutes: int = Field(default=90, ge=10, le=1440, description="外部资料抓取间隔；与主动联系检查周期分开")
     bilibili_popular_enabled: bool = Field(default=True, description="读取B站公开热门视频标题/简介，不需要账号，也不观看视频")
@@ -75,20 +80,20 @@ class Explorer(PluginConfigBase):
 
 
 class Brain(PluginConfigBase):
-    __ui_label__ = "04 / 自主决策"
+    __ui_label__ = "05 / 自主决策"
     model_task: str = Field(default="utils", description="模型任务名，使用你已经配置的MaiBot模型")
     use_llm_selection: bool = Field(default=True, description="由模型决定是否值得分享某条资料；失败则保守跳过")
     proactive_priority: str = Field(default="low", description="唤醒优先级 low / normal / high；建议保持 low")
 
 
 class Memory(PluginConfigBase):
-    __ui_label__ = "05 / 长期经历（A_Memorix）"
+    __ui_label__ = "06 / 长期经历（A_Memorix）"
     enabled: bool = Field(default=True, description="正式模式选中资讯后尝试写入A_Memorix；若记忆能力未安装则跳过")
     chat_id: str = Field(default="living_world_explore", description="外部经历独立记忆作用域；避免误写入私密聊天流")
 
 
 class Storage(PluginConfigBase):
-    __ui_label__ = "06 / 数据持久化（SQLite 或 MySQL）"
+    __ui_label__ = "07 / 数据持久化（SQLite 或 MySQL）"
     backend: str = Field(default="sqlite", description="存储类型：sqlite 或 mysql。更换后须重载插件；不自动迁移旧数据")
     mysql_host: str = Field(default="mysql", description="MySQL 主机名/IP；同一个 Docker 网络可填容器服务名")
     mysql_port: int = Field(default=3306, ge=1, le=65535, description="MySQL 连接端口")
@@ -156,7 +161,7 @@ class MaiLivingWorld(MaiBotPlugin):
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.3.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
 
@@ -203,6 +208,14 @@ class MaiLivingWorld(MaiBotPlugin):
             self._owner_events = {k:v for k,v in self._owner_events.items() if now-v[0] < 90}
         return {"action": "continue"}
 
+    def _relation_for(self, kind: str) -> str:
+        cfg = self.config.owner
+        if not cfg.enabled or not cfg.relationship_enabled or not normalize_qq(cfg.qq):
+            return ""
+        return relationship_note(
+            cfg.relationship_mode, kind, cfg.private_template, cfg.group_template
+        )
+
     def _owner_prompt_for(self, kwargs: dict[str, Any]) -> str:
         cfg = self.config.owner
         if not cfg.enabled or not normalize_qq(cfg.qq):
@@ -214,7 +227,7 @@ class MaiLivingWorld(MaiBotPlugin):
         hit = self._owner_events.get(sid)
         if not hit or not hit[1] or hit[3] != normalize_qq(cfg.qq) or time.monotonic()-hit[0] > 90:
             return ""
-        return owner_hint(cfg.title, hit[2])
+        return owner_hint(cfg.title, hit[2], self._relation_for(hit[2]))
 
     @HookHandler(
         "maisaka.planner.before_request", name="living_world_owner_planner",
@@ -405,6 +418,13 @@ class MaiLivingWorld(MaiBotPlugin):
                 "禁止编造外部经历、不要固定问候，也不要暴露其他群或私聊的信息。"
                 f"\n历史待接话题：{topic}"
             )
+        # 定时主动联系主人不依赖最新一条来信，但仅限配置中明确绑定的 QQ 私聊目标。
+        # 特殊关系模板不会混入其他私聊或任何群聊的主动唤醒。
+        if (kind == "private" and self.config.owner.enabled
+                and normalize_qq(self.config.owner.qq) == ident):
+            style = self._relation_for("private")
+            if style:
+                intent += "\n\n" + style
         if self.config.general.dry_run:
             self.ctx.logger.info("[MaiLivingWorld][DRY-RUN] 目标=%s 计划=%s 题目=%s",target,"explore" if story else "history",story['title'] if story else topic)
             return

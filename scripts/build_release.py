@@ -11,7 +11,7 @@ manifest = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
 version = manifest["version"]
 required = (
     "__init__.py", "_manifest.json", "plugin.py", "policy.py", "explore.py",
-    "bilibili.py", "store.py", "mysql_store.py", "owner.py", "README.md", "LICENSE",
+    "bilibili.py", "store.py", "mysql_store.py", "owner.py", "relationship.py", "README.md", "LICENSE",
 )
 for name in required:
     if not (ROOT / name).is_file():
