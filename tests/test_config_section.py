@@ -36,7 +36,7 @@ class ConfigSectionTests(unittest.TestCase):
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(total_fields, 56)
         import re
-        comments = re.findall(r"^# [^\\n]+\\n[a-z_][a-z_0-9]*\\s*=", content, flags=re.M)
+        comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
 
     def test_manifest_version_consistent(self):
