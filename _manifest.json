@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "统一主动聊天、B站与RSS只读探索、A_Memorix、SQLite/MySQL去重、QQ主人识别及专属关系风格模板；默认演练模式。",
+  "description": "主动聊天、公开世界探索、A_Memorix记忆桥与可审计的主人私聊反思成长；默认关闭反思。",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"
