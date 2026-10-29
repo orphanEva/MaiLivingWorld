@@ -1,5 +1,12 @@
 # 更新记录
 
+## v0.4.2 — 2026-10-29
+
+- 修复 MaiBot WebUI 配置校验失败：在配置模型中声明必需的 `[plugin]` 节和 `plugin.config_version`。
+- `plugin.enabled` 作为插件总开关，与 `general.enabled` 的主动活动开关分离，默认不主动发消息。
+- 补充回归测试，避免重新生成不合法的插件配置；不覆盖用户的 QQ、MySQL 配置。
+
+
 ## v0.4.1 — 2026-10-29
 
 - 修复 WebUI ZIP 安装时 Manifest v2 校验失败：补全必填的 `author.url` 和 `urls`。

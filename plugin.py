@@ -25,6 +25,17 @@ from .owner import extract_sender, is_owner, normalize_qq, owner_hint, inject_ow
 from .relationship import relationship_note
 
 
+class PluginSection(PluginConfigBase):
+    """SDK/Host 要求的标准插件设置节；不能用 general 代替。"""
+    __ui_label__ = "00 / 插件设置"
+    enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
+    config_version: str = Field(
+        default="0.4.2",
+        description="配置格式版本，随插件升级自动迁移",
+        json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
+    )
+
+
 class General(PluginConfigBase):
     __ui_label__ = "01 / 基础与安全"
     enabled: bool = Field(default=False, description="总开关。首次安装保持关闭；确认配置后手动启用")
@@ -105,6 +116,7 @@ class Storage(PluginConfigBase):
 
 
 class Config(PluginConfigBase):
+    plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
     general: General = Field(default_factory=General)
     audience: Audience = Field(default_factory=Audience)
@@ -161,7 +173,7 @@ class MaiLivingWorld(MaiBotPlugin):
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.1；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.2；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
 
@@ -189,7 +201,7 @@ class MaiLivingWorld(MaiBotPlugin):
     )
     async def capture_owner(self, message: Any = None, **kwargs):
         cfg = self.config.owner
-        if not cfg.enabled or not normalize_qq(cfg.qq):
+        if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
             self._owner_events.clear()
             return {"action": "continue"}
         sender = extract_sender(message)
@@ -210,7 +222,7 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _relation_for(self, kind: str) -> str:
         cfg = self.config.owner
-        if not cfg.enabled or not cfg.relationship_enabled or not normalize_qq(cfg.qq):
+        if not self.config.plugin.enabled or not cfg.enabled or not cfg.relationship_enabled or not normalize_qq(cfg.qq):
             return ""
         return relationship_note(
             cfg.relationship_mode, kind, cfg.private_template, cfg.group_template
@@ -218,7 +230,7 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _owner_prompt_for(self, kwargs: dict[str, Any]) -> str:
         cfg = self.config.owner
-        if not cfg.enabled or not normalize_qq(cfg.qq):
+        if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
             return ""
         # 不从提示词猜测，不使用跨聊天流全局兜底。
         sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
@@ -267,6 +279,7 @@ class MaiLivingWorld(MaiBotPlugin):
     async def status(self) -> dict[str,Any]:
         return {
             "enabled": self.config.general.enabled,
+            "plugin_enabled": self.config.plugin.enabled,
             "dry_run": self.config.general.dry_run,
             "explore_enabled": self.config.explorer.enabled,
             "storage_backend": self.config.storage.backend,
@@ -284,7 +297,7 @@ class MaiLivingWorld(MaiBotPlugin):
     @Tool("get_living_discoveries", description="查看最近从B站热门或可信RSS读到的公开资讯标题、简介和链接；只有元信息，不能声称看完整视频", parameters=[])
     async def get_living_discoveries(self, **kwargs: Any) -> dict[str, Any]:
         del kwargs
-        if not self.config.general.enabled or not self.config.explorer.enabled or not self._store:
+        if not self.config.plugin.enabled or not self.config.general.enabled or not self.config.explorer.enabled or not self._store:
             return {"success":False,"error":"外部探索未启用"}
         rows=self._store.recent(6)
         return {"success":True,"notice":"仅获取公开标题与简介元信息，没有看完整视频或验证正文", "items":rows}
@@ -294,7 +307,7 @@ class MaiLivingWorld(MaiBotPlugin):
             await asyncio.sleep(self.config.general.startup_delay_seconds)
             while True:
                 await asyncio.sleep(self.config.general.tick_seconds)
-                if not self.config.general.enabled or not self._store:
+                if not self.config.plugin.enabled or not self.config.general.enabled or not self._store:
                     continue
                 async with self._lock:
                     now=time.time()

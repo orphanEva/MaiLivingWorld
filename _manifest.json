@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "name": "MaiLivingWorld · 麦麦的小世界",
   "description": "统一主动聊天、B站与RSS只读探索、A_Memorix、SQLite/MySQL去重、QQ主人识别及专属关系风格模板；默认演练模式。",
   "author": {
