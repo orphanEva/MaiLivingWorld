@@ -1,10 +1,10 @@
-# MaiLivingWorld · 麦麦的小世界 v0.5.0（主人专属关系模板）
+# MaiLivingWorld · 麦麦的小世界 v0.5.1（可信记忆与反思闭环）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
 ## 功能与边界
 
-| 能力 | v0.5.0 状态 |
+| 能力 | v0.5.1 状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
@@ -316,3 +316,34 @@ note_limit = 20
 
 启用后在插件日志搜索 `[MaiLivingWorld][MIND]`。如果配置已生效而长期没出现日志，请核对是否存在主人既有私聊会话、至少 8 条有效私聊消息以及反思模型任务是否可用。该模块不会替代现有 A_Memorix 检索。
 
+
+## v0.5.1 · 有来源的主人私聊反思、冲突审核、版本回滚
+
+- 反思仅使用 MaiBot Host 提供了真实 `session_id`、`message_id`、`message_info.user_info.user_id` 的结构化 QQ 私聊消息；不获取群消息或陌生人发言。没有足够可信消息时保守跳过。
+- 每条候选观察都要引用当前确实存在的 `evidence_ids`；SQLite 中只存结构化观察、证据哈希和索引，不存完整聊天正文。
+- 相同私聊消息在多次反思中重复出现也只计算一次证据；模型自称的置信度不是事实保证。
+- 模型提出的旧记忆矛盾先进入待审核队列，旧笔记暂停注入。只有显式审核才决定否定旧观察或恢复旧观察。
+- 写入、审核及清空之前生成结构化版本快照，支持回滚。
+- 升级到 0.5.1 之后，旧版没有消息来源关联的 v0.5.0 笔记保留为 `legacy`，不再自动注入；不删旧数据。
+- 新增 `mode`，默认 `observe`（观察，不改变聊天内容）。人工检查候选、冲突后可以手动切换到 `active`（仅对绑定主人的私聊注入有来源的有效笔记）。群聊始终不注入私聊笔记。
+
+```toml
+[mind]
+enabled = true
+auto_reflect = true
+mode = "observe"  # 推荐先观察；确认后才改为 active
+interval_hours = 12
+history_limit = 40
+min_history_messages = 8
+min_confidence = 0.8
+note_limit = 20
+```
+
+内部管理 API（`public=False`，不要暴露给普通 QQ 用户；含隐私笔记的状态不应截图公开）：
+
+- `living_world_mind_status()`：查询观察、待审核项目、快照。
+- `living_world_mind_review(review_id, decision, confirm="CONFIRM_MIND_REVIEW")`：`approve`=确认旧笔记已过时，`reject`=否定冲突并恢复旧笔记。
+- `living_world_mind_restore(snapshot_id, confirm="CONFIRM_MIND_RESTORE")`：还原结构化笔记，不改动 A_Memorix。
+- `living_world_mind_clear(confirm="CLEAR_OWNER_MIND")`：清空当前绑定主人的笔记，操作前保留恢复快照。
+
+**边界**：模型不能被证明百分之百理解真实意图；其提供的证据关联仍可能错误，所以请先检查观察模式结果，确认后再应用。长期运行建议备份 `mind.sqlite3`。

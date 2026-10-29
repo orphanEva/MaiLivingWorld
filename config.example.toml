@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.5.0 · 全字段中文注释配置模板
+# MaiLivingWorld v0.5.1 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -154,6 +154,8 @@ proactive_priority = "low"
 enabled = false
 # 是否定期调用模型反思最近与绑定主人的私聊；打开后会消耗模型Token。
 auto_reflect = false
+# observe=只记录和审查、不影响实际回复；active=只注入有可信消息来源的有效笔记。
+mode = "observe"
 # 同一主人最少隔多少小时才再次反思（1～168），没有新聊天内容则跳过。
 interval_hours = 12
 # 每次取最近多少条私聊消息做复盘（8～80）；不读取群聊。
@@ -175,5 +177,5 @@ backend = "off"
 webui_port = 8001
 # 每条记忆导入任务等待完成的最长秒数；超时不算成功。
 import_max_wait_seconds = 45
-# 旧版兼容字段；v0.5.0 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
+# 旧版兼容字段；v0.5.1 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
 chat_id = "living_world_explore"

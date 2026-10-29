@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "主动聊天、公开世界探索、A_Memorix记忆桥与可审计的主人私聊反思成长；默认关闭反思。",
+  "description": "主动聊天、公开探索、A_Memorix长期记忆与可核验证据的主人私聊反思；冲突审核和版本回滚；默认仅观察。",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"

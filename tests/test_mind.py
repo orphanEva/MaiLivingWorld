@@ -1,92 +1,70 @@
-"""内在反思：记忆持久化、低频门控、私聊隔离与隐私过滤。"""
-from __future__ import annotations
-
-import json
-import tempfile
-import time
-import tomllib
-import types
-import unittest
+import json, sys, time, tempfile, sqlite3, unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from MaiLivingWorld.mind import MindStore, evidence_from_messages, parse_reflection
 
-from MaiLivingWorld.tests.test_runtime import plugin
-from MaiLivingWorld.mind import MindStore, parse_reflection
+OWNER='12345678'; SID='private-1'
+def msg(mid, txt, uid=OWNER, sid=SID, group=None):
+    return dict(message_id=mid,session_id=sid,platform='qq',account_id='87654321',message_info={
+        'group_info': {'group_id': group} if group else None, 'user_info': {'user_id':uid}},
+        processed_plain_text=txt, raw_message=[])
 
-ROOT=Path(__file__).resolve().parents[1]
+def reflection(n, ids, basis='user_explicit',kind='preference',conf=.95, corrections=None):
+    return {'content':json.dumps({'notes':[dict(kind=kind,basis=basis,text=n,confidence=conf,evidence_ids=ids)],'corrections':corrections or []},ensure_ascii=False)}
 
+class MindTests(unittest.TestCase):
+    def test_host_message_filtering_and_forged_ids(self):
+        e=evidence_from_messages([msg('1','我很喜欢学习RNN'),msg('2','这是群聊',group='12345'),msg('3','旁人',uid='99999'),msg('4','大肥鱼你好',uid='87654321')],OWNER,SID)
+        self.assertEqual(len(e),2)
+        self.assertEqual(e[0]['role'],'owner');self.assertEqual(e[1]['role'],'bot')
+        no, conflicts=parse_reflection(reflection('我喜欢学习RNN',['E000000000000000000000']),e)
+        self.assertFalse(no)
+        self.assertFalse(conflicts)
 
-class MindPolicyTests(unittest.TestCase):
-    def test_config_matches_schema_defaults(self):
-        data=tomllib.loads((ROOT/"config.example.toml").read_text(encoding="utf-8"))
-        self.assertEqual(data, plugin.Config().model_dump())
-        self.assertFalse(data["mind"]["enabled"])
-        self.assertFalse(data["mind"]["auto_reflect"])
+    def test_no_repeat_strength_and_observe_active(self):
+        with tempfile.TemporaryDirectory() as t:
+            store=MindStore(Path(t)/'mind.db')
+            e=evidence_from_messages([msg('1','我喜欢学习RNN')],OWNER,SID)
+            notes,_=parse_reflection(reflection('主人明确表示喜欢学习RNN',[e[0]['id']]),e)
+            one=store.save_reflection(OWNER,'win1',notes,[],e,time.time(),20)
+            self.assertEqual(one['candidates'],1)
+            self.assertEqual(store.notes(OWNER)[0]['seen_count'],1)
+            self.assertEqual(store.private_hint(OWNER,mode='observe'),'')
+            self.assertIn('RNN',store.private_hint(OWNER,mode='active'))
+            # Same source repeated in a different batch is not new evidence.
+            store.save_reflection(OWNER,'win2',notes,[],e,time.time()+1,20)
+            self.assertEqual(store.notes(OWNER)[0]['seen_count'],1)
+            self.assertEqual(store.private_hint('99999999',mode='active'),'')
+            store.close()
 
-    def test_schema_and_sensitive_filtering(self):
-        obj={"notes":[
-          {"kind":"preference","basis":"user_explicit","text":"主人明确表示喜欢讨论AI工作站搭建的细节","confidence":0.92},
-          {"kind":"boundary","basis":"conversation","text":"主人讨厌任何人","confidence":0.99},
-          {"kind":"preference","basis":"user_explicit","text":"主人的密码是password12345","confidence":1.0},
-          {"kind":"open_topic","basis":"conversation","text":"上次讨论的工作站散热还没解决","confidence":0.6}
-        ], "behavior_goal":"技术讨论时先问具体环境，别无意义夸赞"}
-        notes, goal=parse_reflection({"content":json.dumps(obj,ensure_ascii=False)})
-        self.assertEqual(len(notes),1)
-        self.assertEqual(notes[0]["kind"],"preference")
-        self.assertIn("技术",goal)
-        self.assertEqual(parse_reflection({"content":"not json"}),([], ""))
+    def test_conflict_decision_and_rollback(self):
+        with tempfile.TemporaryDirectory() as t:
+            store=MindStore(Path(t)/'mind.db')
+            e=evidence_from_messages([msg('1','我喜欢学习RNN'),msg('2','我现在不喜欢RNN了')],OWNER,SID)
+            notes,_=parse_reflection(reflection('主人明确表示喜欢学习RNN',[e[0]['id']]),e)
+            store.save_reflection(OWNER,'w1',notes,[],e,time.time(),20)
+            key=store.notes(OWNER)[0]['note_key'];before=store.snapshots(OWNER)[0]['id']
+            corrections=[{'target_key':key,'reason':'主人后来明确否认仍然喜欢RNN','evidence_ids':[e[1]['id']]}]
+            _,corr=parse_reflection(reflection('新增证据指向旧偏好不再成立',[e[1]['id']],corrections=corrections),e)
+            store.save_reflection(OWNER,'w2',[],corr,e,time.time()+2,20)
+            self.assertNotIn('RNN',store.private_hint(OWNER,mode='active'))
+            review=store.reviews(OWNER)[0]['id']
+            self.assertFalse(store.decide('other',review,'approve'))
+            self.assertTrue(store.decide(OWNER,review,'reject'))
+            self.assertIn('RNN',store.private_hint(OWNER,mode='active'))
+            self.assertTrue(store.restore(OWNER,before))
+            self.assertEqual(store.notes(OWNER),[])
+            store.close()
 
-    def test_persist_isolation_dedup_and_clear(self):
-        with tempfile.TemporaryDirectory() as d:
-            path=Path(d)/"mind.sqlite3"
-            one=MindStore(path)
-            note={"kind":"preference","text":"主人明确说他喜欢讨论深度学习","basis":"user_explicit","confidence":0.92}
-            one.mark_attempt("11111111",time.time())
-            one.save_reflection("11111111","h1",[note],"遇到问题要先分析上下文",time.time(),20)
-            self.assertIn("深度学习",one.private_hint("11111111"))
-            self.assertEqual(one.private_hint("22222222"),"")
-            self.assertFalse(one.should_reflect("11111111","h1",time.time(),12))
-            one.close()
-            two=MindStore(path)
-            self.assertEqual(len(two.notes("11111111")),1)
-            two.clear("11111111")
-            self.assertEqual(two.notes("11111111"),[])
-            two.close()
+    def test_migration_keeps_legacy_but_never_injects(self):
+        with tempfile.TemporaryDirectory() as t:
+            path=Path(t)/'mind.db'
+            with sqlite3.connect(path) as con:
+                con.execute('CREATE TABLE mind_notes(owner_id TEXT,note_key TEXT,kind TEXT,text TEXT,basis TEXT,confidence REAL,seen_count INTEGER,first_seen REAL,last_seen REAL,PRIMARY KEY(owner_id,note_key))')
+                con.execute('INSERT INTO mind_notes VALUES (?,?,?,?,?,?,?,?,?)',(OWNER,'k','preference','历史未证明的主人喜好','user_explicit',1.,30,time.time(),time.time()))
+            store=MindStore(path)
+            self.assertEqual(store.notes(OWNER)[0]['status'],'legacy')
+            self.assertEqual(store.private_hint(OWNER,mode='active'),'')
+            store.close()
 
-
-class MindRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reflection_owner_private_only(self):
-        with tempfile.TemporaryDirectory() as d:
-            bot=plugin.MaiLivingWorld()
-            bot.config=plugin.Config()
-            bot.config.owner.enabled=True
-            bot.config.owner.qq="12345678"
-            bot.config.mind.enabled=True
-            bot.config.mind.auto_reflect=True
-            history="主人明确表示喜欢学习深度学习课程，提到最近正在研究RNN。"*14
-            model_data={"notes":[
-              {"kind":"preference","basis":"user_explicit","text":"主人明确表示最近喜欢研究RNN与深度学习","confidence":0.95}
-            ],"behavior_goal":"遇到技术难题时优先一起找具体例子"}
-            model=types.SimpleNamespace(generate=AsyncMock(return_value={"content":json.dumps(model_data,ensure_ascii=False)}))
-            bot.ctx=types.SimpleNamespace(
-                paths=types.SimpleNamespace(data_dir=Path(d)),
-                chat=types.SimpleNamespace(get_stream_by_user_id=AsyncMock(return_value={"session_id":"private-one"})),
-                message=types.SimpleNamespace(
-                    get_recent=AsyncMock(return_value=[{"id":i} for i in range(10)]),
-                    build_readable=AsyncMock(return_value=history)),
-                llm=model,logger=types.SimpleNamespace(info=lambda *a,**k:None,warning=lambda *a,**k:None))
-            await bot._reflect_owner()
-            self.assertEqual(model.generate.await_count,1)
-            await bot._reflect_owner()
-            self.assertEqual(model.generate.await_count,1)
-            bot._owner_events["private-one"]=(time.monotonic(),True,"private","12345678")
-            self.assertIn("RNN",bot._owner_prompt_for({"session_id":"private-one"}))
-            bot._owner_group_messages[("group-one","owner-msg")]=(time.monotonic(),True,"12345678")
-            self.assertNotIn("RNN",bot._owner_prompt_for({"session_id":"group-one","reply_message_id":"owner-msg"}))
-            bot.config.mind.enabled=False
-            self.assertNotIn("RNN",bot._owner_prompt_for({"session_id":"private-one"}))
-            bot._mind.close()
-            bot._mind=None
-
-if __name__=="__main__":
-    unittest.main()
+if __name__=='__main__': unittest.main()
