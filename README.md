@@ -1,10 +1,10 @@
-# MaiLivingWorld · 麦麦的小世界 v0.5.2（可信记忆与反思闭环）
+# MaiLivingWorld · 麦麦的小世界 v0.6.0（可信记忆与反思闭环）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
 ## 功能与边界
 
-| 能力 | v0.5.2 状态 |
+| 能力 | v0.6.0 状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
@@ -317,7 +317,7 @@ note_limit = 20
 启用后在插件日志搜索 `[MaiLivingWorld][MIND]`。如果配置已生效而长期没出现日志，请核对是否存在主人既有私聊会话、至少 8 条有效私聊消息以及反思模型任务是否可用。该模块不会替代现有 A_Memorix 检索。
 
 
-## v0.5.2 · 有来源的主人私聊反思、冲突审核、版本回滚
+## v0.6.0 · 有来源的主人私聊反思、冲突审核、版本回滚
 
 - 反思仅使用 MaiBot Host 提供了真实 `session_id`、`message_id`、`message_info.user_info.user_id` 的结构化 QQ 私聊消息；不获取群消息或陌生人发言。没有足够可信消息时保守跳过。
 - 每条候选观察都要引用当前确实存在的 `evidence_ids`；SQLite 中只存结构化观察、证据哈希和索引，不存完整聊天正文。
@@ -348,7 +348,7 @@ note_limit = 20
 
 **边界**：模型不能被证明百分之百理解真实意图；其提供的证据关联仍可能错误，所以请先检查观察模式结果，确认后再应用。长期运行建议备份 `mind.sqlite3`。
 
-## v0.5.2 · 主动聊天 Planner 回执和沉默退避
+## v0.6.0 · 主动聊天 Planner 回执和沉默退避
 
 针对插件主动唤醒后 Planner 连续 `stop`，没有发 QQ 消息却用完每日额度的问题，
 新增独立的 `proactive_feedback.sqlite3`（与 `mind.sqlite3` 和外部资讯库隔离）。
@@ -377,3 +377,56 @@ stop_backoff_max_minutes = 240
 **迁移说明**：旧版 `attempts` 表继续累计当天唤醒尝试，升级后不会把旧尝试补记成确认发送。升级当天配额统计可能有断层。无需迁移旧 SQLite/MySQL 资讯库，反馈账本不保存私聊文本。
 
 日志搜索 `[MaiLivingWorld][PROACTIVE]`：可见 `Planner选择stop`、`Planner选择reply`、`send_confirmed`、`send_failed` 和 `跳过 ... reason=...`。内部 `living_world_status` API 的 `proactive_feedback` 提供每个目标的今日结果计数及退避信息。
+
+## v0.6.0 · 有限自主认知（公开资讯试验版）
+
+这一版在 v0.5.2 的主人识别、私聊证据反思、A_Memorix 和主动聊天基础上，
+**独立增加** `[cognition]`（默认关闭）。不动已有数据表；公开认知存储于
+`cognition.sqlite3`，与私人 `mind.sqlite3`、公开资讯库分离。
+
+工作机制：仅分析保存的 B 站/RSS 标题、简介和来源 → 提出最多 2 个待验证问题
+→ 标注观察与未知 → 等待新的公开来源 → 更新问题状态与证据引用 → 人工审核完成/废弃。
+每个来源有唯一 key，已经分析过的来源不会重复当新证据。模型输出只作为候选，严格校验
+来源 key、问题 ID 和允许的下一步动作。
+
+### 安全边界
+
+- `enabled=false` + `auto_think=false` 是升级默认值；原功能不变。
+- 需要 `general.enabled=true` 与 `explorer.enabled=true`，且已经采集到新公开资讯才会调用模型。
+- `mode=observe` 只写公共观察笔记，不影响 QQ 聊天或主人私人反思。
+- `mode=active` **仅让公开关注的主题成为外部资讯选题的弱偏好**；不能自动发QQ、执行工具、搜索网页、修改人格、访问私人聊天或授权消息。
+- `next_action` 只能是 `wait_for_update`（等新资料）、`compare_public_sources`（比较来源）、`ask_when_relevant`（合适时可提出问题的计划），但 **只存计划，不执行**。
+- 标题和简介不等于已核实内容；即使更新了多条来源，也不能让模型自行把问题标记为完成。
+- 每日尝试次数与最小间隔由 SQLite 跨重启保留，失败也计入调用预算，避免反复烧 Token。
+- 原有 `[mind]` 私聊反思仍建议保持 `mode="observe"`，两个模块相互独立。
+
+### 开启方式
+
+```toml
+[cognition]
+enabled = true
+auto_think = true
+mode = "observe"
+interval_hours = 6
+max_daily_cycles = 2
+max_public_candidates = 6
+max_open_questions = 8
+max_new_per_cycle = 2
+```
+
+日志搜索 `[MaiLivingWorld][COGNITION]`，正常时格式：
+
+```text
+[MaiLivingWorld][COGNITION] 处理公开素材=6 新增关注=2 更新关注=0 mode=observe
+```
+
+仅供插件内部/管理员调用的 API：
+
+- `living_world_cognition_status`：只读查看问题及近期预算。
+- `living_world_cognition_evidence(goal_id)`：查看公开标题、原始链接和问题更新事件。
+- `living_world_cognition_review(goal_id, decision, confirm="REVIEW_COGNITION")`：
+  `decision` 只接受 `resolved / discarded / reopen`，**只改变问题状态**，不执行计划。
+
+本阶段还没有可视化问题管理页面，不支持自动网页浏览和真正的后台行动。
+从观察中提出一个问题不等于产生意识，也不等于已经证实信息。
+

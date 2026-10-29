@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.5.2 · 全字段中文注释配置模板
+# MaiLivingWorld v0.6.0 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.5.2"
+config_version = "0.6.0"
 
 # ====================================================================
 # 07 / 数据持久化（SQLite 或 MySQL）
@@ -176,6 +176,27 @@ min_confidence = 0.8
 note_limit = 20
 
 
+# ====================================================================
+# 07 / 有限自主认知（只处理公开资讯）
+# ====================================================================
+[cognition]
+# 是否启用独立的公开认知账本 cognition.sqlite3；默认关闭，不读取QQ私聊。
+enabled = false
+# 是否定期用当前 brain.model_task 模型整理公开标题、简介；会消耗模型Token。
+auto_think = false
+# observe=只做观察记录；active=公开关注主题作为选题弱偏好，不增加主动聊天次数。
+mode = "observe"
+# 两次思考尝试最小间隔小时数（1～168），模型失败时也会限频。
+interval_hours = 6
+# 每天最多调用几次公开认知模型（0～12），0表示禁止调用。
+max_daily_cycles = 2
+# 一轮最多分析多少条未处理的公开资讯（1～20），仅标题和简介。
+max_public_candidates = 6
+# 最多同时维护多少个未完成的公开问题（1～30），达到上限后停止新增。
+max_open_questions = 8
+# 每轮最多创建多少个待核验的新问题（1～5），可以为0个。
+max_new_per_cycle = 2
+
 [memory]
 # 是否允许提交公共外部见闻到记忆桥；还需将 backend 改成 webui_import。
 enabled = false
@@ -185,5 +206,5 @@ backend = "off"
 webui_port = 8001
 # 每条记忆导入任务等待完成的最长秒数；超时不算成功。
 import_max_wait_seconds = 45
-# 旧版兼容字段；v0.5.2 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
+# 旧版兼容字段；v0.6.0 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
 chat_id = "living_world_explore"
