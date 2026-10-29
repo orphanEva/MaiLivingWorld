@@ -30,7 +30,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.4.2",
+        default="0.4.3",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -153,6 +153,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._scan_errors: dict[str, str] = {}
         self._last_decision: dict[tuple[str,bool],float] = {}
         self._owner_events: dict[str, tuple[float, bool, str, str]] = {}
+        self._owner_group_messages: dict[tuple[str, str], tuple[float, bool, str]] = {}
 
     async def on_load(self):
         storage = self.config.storage
@@ -173,13 +174,14 @@ class MaiLivingWorld(MaiBotPlugin):
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.2；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.3；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         # 配置更新后旧身份缓存立即失效。
         self._owner_events.clear()
+        self._owner_group_messages.clear()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
     async def _owner_session_id(self, sender):
@@ -203,6 +205,7 @@ class MaiLivingWorld(MaiBotPlugin):
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
             self._owner_events.clear()
+            self._owner_group_messages.clear()
             return {"action": "continue"}
         sender = extract_sender(message)
         if not sender:
@@ -214,10 +217,16 @@ class MaiLivingWorld(MaiBotPlugin):
             cfg.recognize_in_groups if sender.kind == "group" else cfg.recognize_in_private
         )
         now = time.monotonic()
-        # 每条新消息覆盖同会话状态，非主人群友消息会清除识别结果。
-        self._owner_events[sid] = (now, verified, sender.kind, normalize_qq(cfg.qq))
-        if len(self._owner_events) > 200:
-            self._owner_events = {k:v for k,v in self._owner_events.items() if now-v[0] < 90}
+        if sender.kind == "private":
+            self._owner_events[sid] = (now, verified, sender.kind, normalize_qq(cfg.qq))
+            if len(self._owner_events) > 200:
+                self._owner_events = {k:v for k,v in self._owner_events.items() if now-v[0] < 90}
+        elif sender.message_id:
+            self._owner_group_messages[(sid, sender.message_id)] = (now, verified, normalize_qq(cfg.qq))
+            if len(self._owner_group_messages) > 500:
+                self._owner_group_messages = {
+                    key: val for key, val in self._owner_group_messages.items() if now - val[0] < 90
+                }
         return {"action": "continue"}
 
     def _relation_for(self, kind: str) -> str:
@@ -236,10 +245,21 @@ class MaiLivingWorld(MaiBotPlugin):
         sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
         if not sid:
             return ""
+        target_mid = str(kwargs.get("reply_message_id") or "").strip()
+        if target_mid:
+            group_hit = self._owner_group_messages.get((sid, target_mid))
+            if group_hit is not None:
+                when, verified, configured_qq = group_hit
+                if verified and configured_qq == normalize_qq(cfg.qq) and time.monotonic() - when <= 90:
+                    return owner_hint(cfg.title, "group", self._relation_for("group"))
+                return ""
+        # 群聊 Planner 没有目标消息 ID，禁止回退到最近一位群发言者。
         hit = self._owner_events.get(sid)
-        if not hit or not hit[1] or hit[3] != normalize_qq(cfg.qq) or time.monotonic()-hit[0] > 90:
+        if not hit or hit[2] != "private" or not hit[1]:
             return ""
-        return owner_hint(cfg.title, hit[2], self._relation_for(hit[2]))
+        if hit[3] != normalize_qq(cfg.qq) or time.monotonic() - hit[0] > 90:
+            return ""
+        return owner_hint(cfg.title, "private", self._relation_for("private"))
 
     @HookHandler(
         "maisaka.planner.before_request", name="living_world_owner_planner",
@@ -249,6 +269,8 @@ class MaiLivingWorld(MaiBotPlugin):
     async def owner_planner_prompt(self, **kwargs):
         prompt = self._owner_prompt_for(kwargs)
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
+        if updated is not None:
+            self.ctx.logger.info("[MaiLivingWorld][OWNER] 私聊 Planner 主人提示注入成功")
         return {"action":"continue", "modified_kwargs":updated} if updated is not None else {"action":"continue"}
 
     @HookHandler(
@@ -259,6 +281,9 @@ class MaiLivingWorld(MaiBotPlugin):
     async def owner_reply_prompt(self, **kwargs):
         prompt = self._owner_prompt_for(kwargs)
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
+        if updated is not None:
+            scope = "group" if "群聊" in prompt else "private"
+            self.ctx.logger.info("[MaiLivingWorld][OWNER] Replyer 主人提示注入成功 scope=%s", scope)
         return {"action":"continue", "modified_kwargs":updated} if updated is not None else {"action":"continue"}
 
     async def on_unload(self):
@@ -271,6 +296,7 @@ class MaiLivingWorld(MaiBotPlugin):
             except asyncio.CancelledError:
                 pass
         self._owner_events.clear()
+        self._owner_group_messages.clear()
         if self._store:
             self._store.close()
             self._store=None

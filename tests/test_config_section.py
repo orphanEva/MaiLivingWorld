@@ -15,12 +15,12 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.4.2")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.4.3")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
     def test_minimal_toml_style_config_can_validate(self):
-        cfg = plugin.Config.model_validate({"plugin": {"enabled": True, "config_version": "0.4.2"}})
+        cfg = plugin.Config.model_validate({"plugin": {"enabled": True, "config_version": "0.4.3"}})
         self.assertTrue(cfg.plugin.enabled)
         self.assertFalse(cfg.general.enabled)
         self.assertEqual(cfg.storage.backend, "sqlite")

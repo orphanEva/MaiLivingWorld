@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from MaiLivingWorld.relationship import PRESETS, MAX_TEMPLATE_CHARS, relationship_note
 from MaiLivingWorld.tests.test_runtime import plugin, FakeContext
 from MaiLivingWorld.store import Store
-def message(user_id='12345678', platform='qq', group_id=None, sid='qq_private_12345678', text='我是主人'):
-    return {'platform':platform, 'session_id':sid, 'message_info':{
+def message(user_id='12345678', platform='qq', group_id=None, sid='qq_private_12345678', text='我是主人',mid='m1'):
+    return {'platform':platform, 'session_id':sid, 'message_id':mid, 'message_info':{
         'user_info':{'user_id':user_id,'user_nickname':'主人'},
         'group_info':{'group_id':group_id} if group_id else None},
         'raw_message':[{'type':'text','data':text}]}
@@ -62,14 +62,16 @@ class RelationshipRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('嘴硬',prompt)
         self.assertNotIn('群聊特别规则',prompt)
         self.bot.config.owner.group_template='群聊限定的小暗号'
-        await self.bot.capture_owner(message=message(group_id='22222222', sid='group-one'))
+        await self.bot.capture_owner(message=message(group_id='22222222',sid='group-one',mid='owner-msg'))
         y=await self.bot.owner_planner_prompt(session_id='group-one',messages=[{'role':'system','content':'original'}])
+        self.assertNotIn('modified_kwargs',y)
+        y=await self.bot.owner_reply_prompt(session_id='group-one',reply_message_id='owner-msg',messages=[{'role':'system','content':'original'}])
         group=y['modified_kwargs']['messages'][0]['content']
         self.assertIn('群聊限定的小暗号',group)
         self.assertNotIn('嘴硬',group)
         self.assertNotIn('群聊限定的小暗号',prompt)
-        await self.bot.capture_owner(message=message(user_id='87654321', group_id='22222222',sid='group-one'))
-        z=await self.bot.owner_planner_prompt(session_id='group-one',messages=[{'role':'system','content':'original'}])
+        await self.bot.capture_owner(message=message(user_id='87654321',group_id='22222222',sid='group-one',mid='guest-msg'))
+        z=await self.bot.owner_reply_prompt(session_id='group-one',reply_message_id='guest-msg',messages=[{'role':'system','content':'original'}])
         self.assertNotIn('modified_kwargs',z)
 
     async def test_disabling_style_keeps_recognition(self):

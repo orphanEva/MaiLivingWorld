@@ -9,8 +9,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from MaiLivingWorld.owner import MARKER, normalize_qq, extract_sender, is_owner, owner_hint, inject_owner_prompt
 from MaiLivingWorld.tests.test_runtime import plugin
 
-def message(uid="12345678",sid="qq_private_12345678",group=None,platform="qq",text="我是主人"):
-    return {"platform":platform,"session_id":sid,"message_info":{
+def message(uid="12345678",sid="qq_private_12345678",group=None,platform="qq",text="我是主人",mid="m1"):
+    return {"platform":platform,"session_id":sid,"message_id":mid,"message_info":{
         "user_info":{"user_id":uid,"user_nickname":"主人"},
         "group_info":{"group_id":group} if group else None},
         "raw_message":[{"type":"text","data":text}]}
@@ -52,12 +52,18 @@ class OwnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("modified_kwargs",await self.bot.owner_reply_prompt(session_id="other",messages=[]))
         self.bot.config.owner.qq="87654321"
         self.assertNotIn("modified_kwargs",await self.bot.owner_reply_prompt(**kwargs))
-    async def test_group_friend_clears(self):
-        kwargs={"session_id":"qq_group_22222222","messages":[{"role":"system","content":"old"}]}
-        await self.bot.capture_owner(message=message(group="22222222",sid="qq_group_22222222"))
-        self.assertIn("modified_kwargs",await self.bot.owner_planner_prompt(**kwargs))
-        await self.bot.capture_owner(message=message(uid="87654321",group="22222222",sid="qq_group_22222222"))
-        self.assertNotIn("modified_kwargs",await self.bot.owner_planner_prompt(**kwargs))
+    async def test_group_reply_requires_exact_message(self):
+        sid="qq_group_22222222"
+        kw={"session_id":sid,"messages":[{"role":"system","content":"old"}]}
+        await self.bot.capture_owner(message=message(group="22222222",sid=sid,mid="owner-1"))
+        self.assertNotIn("modified_kwargs",await self.bot.owner_planner_prompt(**kw))
+        self.assertIn("modified_kwargs",await self.bot.owner_reply_prompt(**{**kw,"reply_message_id":"owner-1"}))
+        await self.bot.capture_owner(message=message(uid="87654321",group="22222222",sid=sid,mid="guest-1"))
+        self.assertNotIn("modified_kwargs",await self.bot.owner_reply_prompt(**{**kw,"reply_message_id":"guest-1"}))
+        self.assertNotIn("modified_kwargs",await self.bot.owner_reply_prompt(**kw))
+        self.assertIn("modified_kwargs",await self.bot.owner_reply_prompt(**{**kw,"reply_message_id":"owner-1"}))
+        self.bot._owner_group_messages[(sid,"owner-1")]=(time.monotonic()-100,True,"12345678")
+        self.assertNotIn("modified_kwargs",await self.bot.owner_reply_prompt(**{**kw,"reply_message_id":"owner-1"}))
     async def test_missing_session_and_expired(self):
         await self.bot.capture_owner(message=message())
         self.assertNotIn("modified_kwargs",await self.bot.owner_planner_prompt(messages=[]))
@@ -65,6 +71,7 @@ class OwnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("modified_kwargs",await self.bot.owner_planner_prompt(session_id="qq_private_12345678",messages=[{"role":"system","content":"x"}]))
         await self.bot.on_config_update("self",{},"test")
         self.assertFalse(self.bot._owner_events)
+        self.assertFalse(self.bot._owner_group_messages)
     async def test_optional_owner_private_target(self):
         self.bot.config.owner.add_to_private_targets=True
         self.bot.config.audience.quiet_start="00:00"
