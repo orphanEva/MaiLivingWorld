@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from .store import Store
 from .mysql_store import MySQLStore
 from .owner import extract_sender, is_owner, normalize_qq, owner_hint, inject_owner_prompt
 from .relationship import relationship_note
+from .memory_bridge import MemoryBridgeError, WebUIMemoryBridge
 
 
 class PluginSection(PluginConfigBase):
@@ -30,7 +32,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.4.3",
+        default="0.4.4",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -99,8 +101,11 @@ class Brain(PluginConfigBase):
 
 class Memory(PluginConfigBase):
     __ui_label__ = "06 / 长期经历（A_Memorix）"
-    enabled: bool = Field(default=True, description="正式模式选中资讯后尝试写入A_Memorix；若记忆能力未安装则跳过")
-    chat_id: str = Field(default="living_world_explore", description="外部经历独立记忆作用域；避免误写入私密聊天流")
+    enabled: bool = Field(default=False, description="仅在正式模式下自动保存外部公开见闻；需要主动配置 WebUI 导入桥")
+    backend: Literal["off", "webui_import"] = Field(default="off", description="off=关闭；webui_import=通过官方 WebUI 的导入任务写入长期记忆")
+    webui_port: int = Field(default=8001, ge=1, le=65535, description="MaiBot 主进程 WebUI 在本容器监听的端口；只允许连接 127.0.0.1")
+    import_max_wait_seconds: int = Field(default=45, ge=5, le=120, description="最长等待导入任务完成的秒数；超时不标记成功")
+    chat_id: str = Field(default="living_world_explore", description="旧版兼容字段：WebUI 导入模式使用全局公共素材，不使用此虚拟聊天 ID")
 
 
 class Storage(PluginConfigBase):
@@ -154,6 +159,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._last_decision: dict[tuple[str,bool],float] = {}
         self._owner_events: dict[str, tuple[float, bool, str, str]] = {}
         self._owner_group_messages: dict[tuple[str, str], tuple[float, bool, str]] = {}
+        self._memory_jobs: set[asyncio.Task] = set()
+        self._memory_inflight_keys: set[str] = set()
 
     async def on_load(self):
         storage = self.config.storage
@@ -174,7 +181,7 @@ class MaiLivingWorld(MaiBotPlugin):
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.3；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.4.4；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
 
@@ -297,6 +304,12 @@ class MaiLivingWorld(MaiBotPlugin):
                 pass
         self._owner_events.clear()
         self._owner_group_messages.clear()
+        for job in tuple(self._memory_jobs):
+            job.cancel()
+        if self._memory_jobs:
+            await asyncio.gather(*self._memory_jobs, return_exceptions=True)
+        self._memory_jobs.clear()
+        self._memory_inflight_keys.clear()
         if self._store:
             self._store.close()
             self._store=None
@@ -307,6 +320,9 @@ class MaiLivingWorld(MaiBotPlugin):
             "enabled": self.config.general.enabled,
             "plugin_enabled": self.config.plugin.enabled,
             "dry_run": self.config.general.dry_run,
+            "memory_enabled": self.config.memory.enabled,
+            "memory_backend": self.config.memory.backend,
+            "memory_inflight": len(self._memory_jobs),
             "explore_enabled": self.config.explorer.enabled,
             "storage_backend": self.config.storage.backend,
             "private_targets": len(_clean_ids(self.config.audience.private_users)),
@@ -531,31 +547,54 @@ class MaiLivingWorld(MaiBotPlugin):
             self.ctx.logger.warning("[MaiLivingWorld] 历史选题模型失败，跳过：%s",str(exc)[:180])
             return None
 
-    async def _remember(self,story: dict[str,Any]):
-        if not self._store or story.get('memory_saved'):
+    async def _remember(self, story: dict[str, Any]):
+        """只安排公开素材的记忆导入；不阻塞 QQ 主动回复，也不谎报写入成功。"""
+        cfg = self.config.memory
+        if not self._store or story.get("memory_saved") or not cfg.enabled:
             return
-        # 只记录来源信息，不把新闻当已确认的事实，不记录用户私聊内容。
-        text=("[外部浏览见闻/只读元信息] 在 " + story['source'] + " 看到标题《" +story['title']+"》。"
-              +" 简介："+story['summary'][:320]+"。链接："+story['url']
-              +"。仅抓取标题/简介，并未完整观看或核验。")
+        if cfg.backend != "webui_import":
+            self.ctx.logger.warning("[MaiLivingWorld] 记忆已勾选，但后端是 off；跳过")
+            return
+        token = os.environ.get("MLW_WEBUI_TOKEN", "")
+        if not token:
+            self.ctx.logger.warning("[MaiLivingWorld] 缺少 MLW_WEBUI_TOKEN，未尝试 WebUI 记忆导入")
+            return
+        key = str(story.get("key") or "")
+        if not key or key in self._memory_inflight_keys:
+            return
+        text = (
+            "[MaiLivingWorld外部公开见闻，仅标题和简介] "
+            f"信息源：{story['source']}。标题：《{story['title']}》。"
+            f"简介：{story['summary'][:320]}。链接：{story['url']}。"
+            "仅从公开来源读取标题与简介，未播放视频，未核验正文。"
+        )
+        self._memory_inflight_keys.add(key)
+        task = asyncio.create_task(
+            self._complete_memory_import(key, text, token, cfg.webui_port, cfg.import_max_wait_seconds),
+            name="mai-living-world-memory-import",
+        )
+        self._memory_jobs.add(task)
+        task.add_done_callback(self._memory_jobs.discard)
+
+    async def _complete_memory_import(self, key: str, text: str, token: str,
+                                      port: int, max_wait: int):
         try:
-            result=await self.ctx.call_capability(
-                "memory.ingest_summary",text=text,chat_id=self.config.memory.chat_id,
-                external_id="mai-living-world:"+story['key'],
-                tags=["MaiLivingWorld","外部探索",story['source']],
-                metadata={"url":story['url'],"source":story['source'],"evidence":"title_description_only"},
-                respect_filter=True,
+            bridge = WebUIMemoryBridge(port=port, token=token)
+            result = await asyncio.to_thread(
+                bridge.import_public_story,
+                key=key, text=text, max_wait_seconds=max_wait,
             )
-            ok=(result.get('success') is True) if isinstance(result,dict) else bool(result)
-            if ok:
-                self._store.mark_memory_saved(story['key'])
-                self.ctx.logger.info("[MaiLivingWorld] 已写入 A_Memorix: %s",story['title'][:90])
-            else:
-                self.ctx.logger.warning("[MaiLivingWorld] A_Memorix 未接受写入，跳过本次：%s",str(result)[:180])
+            if result.get("success") is True and self._store is not None:
+                self._store.mark_memory_saved(key)
+                self.ctx.logger.info("[MaiLivingWorld] A_Memorix WebUI 导入已完成，key=%s", key[:24])
         except asyncio.CancelledError:
             raise
+        except MemoryBridgeError as exc:
+            self.ctx.logger.warning("[MaiLivingWorld] A_Memorix WebUI 导入失败：%s", exc)
         except Exception as exc:
-            self.ctx.logger.warning("[MaiLivingWorld] 无法写入 A_Memorix（不影响主动聊天）：%s",str(exc)[:180])
+            self.ctx.logger.warning("[MaiLivingWorld] 记忆导入异常类型：%s", type(exc).__name__)
+        finally:
+            self._memory_inflight_keys.discard(key)
 
 
 def create_plugin() -> MaiLivingWorld:

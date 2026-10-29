@@ -1,16 +1,16 @@
-# MaiLivingWorld · 麦麦的小世界 v0.4.3（主人专属关系模板）
+# MaiLivingWorld · 麦麦的小世界 v0.4.4（主人专属关系模板）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
 ## 功能与边界
 
-| 能力 | v0.4.3 状态 |
+| 能力 | v0.4.4 状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
 | 小黑盒或其他信息源 | ✅ RSS / Atom，默认示例 RSSHub 小黑盒新闻；必须能在你的 NAS 网络访问 |
 | 筛选有趣素材 | ✅ 调用 MaiBot `utils` 任务选择一个话题，也允许拒绝 |
-| 记住外部探索 | ✅ 可选写入 A_Memorix `memory.ingest_summary`（单独 chat_id） |
+| 记住外部探索 | 🔧 可选启用 WebUI 文本导入桥（本机管理凭证，默认关闭） |
 | SQLite / MySQL 去重存储 | ✅ WebUI 配置切换；MySQL 需可达的服务与专用数据库 |
 | QQ 主人识别 | ✅ 经适配器提供的真实 QQ ID 验证，群聊/私聊临时身份提示；不授予管理员权限 |
 | 现有 QQ 表情包 | ✅ 不覆盖、不接管。Planner 可继续调用你已安装的表情选择插件 |
@@ -21,7 +21,7 @@
 | 自动充值 Token / 访问支付 | ❌ 不支持 |
 | 人格长期成长、日程/睡眠模拟 | ❌ 尚未实现，暂不复制其他项目的模拟成长逻辑 |
 
-## 标准 [plugin] 配置节（v0.4.3 修复）
+## 标准 [plugin] 配置节（v0.4.4 修复）
 
 SDK Runner 校验插件配置时必须存在 `[plugin]`，其中要有 `config_version`。
 本版通过 `config_model` 的标准 `PluginSection` 自动生成：
@@ -44,7 +44,7 @@ dry_run = true
 
 1. 确保 MaiBot `>=1.3.10`，插件 SDK `>=2.12.0`。
 2. 打开 MaiBot WebUI：**插件扩展 → 更多操作 → 从 ZIP 安装插件**。
-3. 选择 `MaiLivingWorld-v0.4.3-WebUI.zip`（不需要手工解压）。
+3. 选择 `MaiLivingWorld-v0.4.4-WebUI.zip`（不需要手工解压）。
 4. 安装完成后到插件管理打开 **MaiLivingWorld · 麦麦的小世界**，在 WebUI 插件设置里调整配置。
 5. **如果之前安装了 `MaiProactive` 或其他会主动唤醒的插件，先禁用它们的主动发送功能。** 否则不同插件的频率限制互不知晓，可能重复打扰。
 6. ZIP 安装不会覆盖同 ID 已安装插件。升级本插件前先在 WebUI 备份配置和数据并按官方方式卸载或发布新版；勿直接覆盖数据库记录。
@@ -52,7 +52,7 @@ dry_run = true
 ZIP 内部是单一 `MaiLivingWorld/` 文件夹，直接包含 `_manifest.json` 和 `plugin.py`，符合官方 ZIP 结构要求。
 
 
-## QQ 主人识别与关系模板（v0.4.3）
+## QQ 主人识别与关系模板（v0.4.4）
 
 在插件 WebUI 配置面板中找到 **03 / 主人识别**：
 
@@ -189,10 +189,11 @@ QQ 群聊需先在原 MaiBot / NapCat / 适配器里确保群消息可以正常�
 
 ## A_Memorix 与长期记忆
 
-- 正式模式里，如果模型选中一条真实素材，插件尝试通过 `memory.ingest_summary` 写入 A_Memorix，并在 当前配置的存储后端中标识成功。
-- 记忆使用 `chat_id = "living_world_explore"`，避免把外部新闻直接混成 QQ 私聊里的用户事实。
-- **不保证** 该记忆会自动从任意私聊中被召回；跨作用域检索仍受你现有 A_Memorix 权限、召回和共享策略限制。
-- 读取不到 A_Memorix 时跳过记忆，不影响 QQ 主动唤醒。
+- v0.4.4 只有显式启用 `memory.backend="webui_import"` 并提供 `MLW_WEBUI_TOKEN` 后，才通过官方 WebUI 导入接口写入 A_Memorix。
+- 为防止使用虚构的聊天流 ID，WebUI 模式只导入公开素材到 **global 全局作用域**；不包含 QQ 私聊内容。
+- 任务完成 `completed` 才标记成功；提交排队、失败或超时都不能冒充写入成功。
+- 不保证自动在任意私聊中召回；是否检索取决于 A_Memorix 的召回设置。
+- 未开启桥接或 WebUI 不可用时，跳过记忆而不影响主动聊天。
 - 记录明确包含“只读取标题/简介，并未完整观看或核验”的来源限制。真正读字幕/评论要等下一阶段。
 
 ## 技术与稳定性
@@ -240,6 +241,30 @@ QQ 群聊需先在原 MaiBot / NapCat / 适配器里确保群消息可以正常�
 - 增加日程感与兴趣逐渐变化机制，但不得伪称现实生活里的身体经历；外部行动需用户单独授权。
 - 进一步检查 MaiBot 1.3.x 实机 Runner 兼容性，增加真实网络源和 NapCat 端到端验收。
 
-## 群聊关系归属修复 (v0.4.3)
+## 群聊关系归属修复 (v0.4.4)
 
 群聊主人提示必须同时匹配入站消息的可信 QQ 发送者、session_id 和消息 ID。Replyer 的 reply_message_id 匹配该消息才会注入主人关系。Planner 缺少目标消息 ID，群聊不注入主人提示；目标 ID 缺失时宁可跳过。成功注入时会出现 `[MaiLivingWorld][OWNER]` 日志。
+
+## v0.4.4 · A_Memorix WebUI 兼容导入桥（显式开启）
+
+社区 maibot-bilibili-mcp 采用未注册的 memory.ingest_summary 能力；
+Mai_Forever_memories 使用已迁移的旧 LPMM 内部接口，均不可直接照搬。
+本版仅使用官方 WebUI 记忆文本导入任务 API，不直接访问 A_Memorix 内部库。
+
+**默认关闭，需要明确开启。** WebUI Token 拥有管理权限；不要把 Token 写进仓库或插件 TOML。
+在 MaiBot **所在容器**的环境变量设置 MLW_WEBUI_TOKEN（WebUI 正式登录 Token），
+重建容器让插件 Runner 继承该变量。
+
+```toml
+[memory]
+enabled = true
+backend = "webui_import"
+webui_port = 8001
+import_max_wait_seconds = 45
+chat_id = "living_world_explore" # 旧字段，本桥接不使用
+```
+
+仅连接本容器 127.0.0.1:8001；不支持指定远程 URL。WebUI 必须在同一网络命名空间内可达。
+只导入公开 B 站/RSS 标题、简介和来源，采用 global 公共记忆作用域，绝不导入 QQ 私聊。
+异步导入任务状态达到 completed 才标记 memory_saved=1；失败、超时或排队不算成功。
+采用内容哈希去重；超时可到 A_Memorix「导入任务」页面查询。

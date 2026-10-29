@@ -72,8 +72,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             bot.config.general.dry_run=False
             await bot._try_target("private","123",now)
             self.assertEqual(bot.ctx.maisaka.proactive.trigger.await_count,1)
-            self.assertEqual(bot.ctx.call_capability.await_count,1)
-            self.assertEqual(bot._store.statistics(),{"stories":1,"wake_attempts":1,"memory_saved":1})
+            self.assertEqual(bot.ctx.call_capability.await_count,0)
+            self.assertEqual(bot._store.statistics(),{"stories":1,"wake_attempts":1,"memory_saved":0})
             await bot._try_target("private","123",now)
             self.assertEqual(bot.ctx.maisaka.proactive.trigger.await_count,1)
             self.assertEqual(bot._store.statistics()["wake_attempts"],1)
