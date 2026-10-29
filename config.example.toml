@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.5.1 · 全字段中文注释配置模板
+# MaiLivingWorld v0.5.2 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.5.1"
+config_version = "0.5.2"
 
 # ====================================================================
 # 07 / 数据持久化（SQLite 或 MySQL）
@@ -67,10 +67,18 @@ group_min_idle_minutes = 35
 check_interval_minutes = 25
 # 相同目标两次选题决策最少间隔分钟数，允许5～1440；不能填1。
 min_decision_gap_minutes = 120
-# 同一目标两次真实主动唤醒尝试的最小间隔小时数，与上面的选题间隔不同。
+# 同一目标两次确认发送之间的最小间隔小时数（0～168）；stop 不算发送。
 min_gap_hours = 6.0
-# 每个目标每天最多提交多少次主动唤醒请求；提交不代表QQ真正送达，0代表不发送。
+# 每目标每天最多多少轮确认发送（0～30）；Planner 选择 stop 不消耗额度。
 max_daily_per_target = 2
+# 两次主动唤醒尝试的最短间隔分钟数（5～1440），控制 Planner 调用频率。
+min_attempt_gap_minutes = 30
+# 每目标每天最多唤醒尝试数（0～40），包括 stop/失败，防止反复刷模型 Token。
+max_daily_attempts_per_target = 8
+# 第一次 stop 后退避分钟数（5～1440）；连续 stop 翻倍。
+stop_backoff_base_minutes = 45
+# 连续 stop 退避上限（15～10080），实际不会短于基础值。
+stop_backoff_max_minutes = 240
 # 免打扰开始，例如 23:00
 quiet_start = "23:00"
 # 免打扰结束时间，24小时制；与 quiet_start 相同表示禁用免打扰。
@@ -177,5 +185,5 @@ backend = "off"
 webui_port = 8001
 # 每条记忆导入任务等待完成的最长秒数；超时不算成功。
 import_max_wait_seconds = 45
-# 旧版兼容字段；v0.5.1 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
+# 旧版兼容字段；v0.5.2 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
 chat_id = "living_world_explore"

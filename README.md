@@ -1,10 +1,10 @@
-# MaiLivingWorld · 麦麦的小世界 v0.5.1（可信记忆与反思闭环）
+# MaiLivingWorld · 麦麦的小世界 v0.5.2（可信记忆与反思闭环）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
 ## 功能与边界
 
-| 能力 | v0.5.1 状态 |
+| 能力 | v0.5.2 状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
@@ -317,7 +317,7 @@ note_limit = 20
 启用后在插件日志搜索 `[MaiLivingWorld][MIND]`。如果配置已生效而长期没出现日志，请核对是否存在主人既有私聊会话、至少 8 条有效私聊消息以及反思模型任务是否可用。该模块不会替代现有 A_Memorix 检索。
 
 
-## v0.5.1 · 有来源的主人私聊反思、冲突审核、版本回滚
+## v0.5.2 · 有来源的主人私聊反思、冲突审核、版本回滚
 
 - 反思仅使用 MaiBot Host 提供了真实 `session_id`、`message_id`、`message_info.user_info.user_id` 的结构化 QQ 私聊消息；不获取群消息或陌生人发言。没有足够可信消息时保守跳过。
 - 每条候选观察都要引用当前确实存在的 `evidence_ids`；SQLite 中只存结构化观察、证据哈希和索引，不存完整聊天正文。
@@ -347,3 +347,33 @@ note_limit = 20
 - `living_world_mind_clear(confirm="CLEAR_OWNER_MIND")`：清空当前绑定主人的笔记，操作前保留恢复快照。
 
 **边界**：模型不能被证明百分之百理解真实意图；其提供的证据关联仍可能错误，所以请先检查观察模式结果，确认后再应用。长期运行建议备份 `mind.sqlite3`。
+
+## v0.5.2 · 主动聊天 Planner 回执和沉默退避
+
+针对插件主动唤醒后 Planner 连续 `stop`，没有发 QQ 消息却用完每日额度的问题，
+新增独立的 `proactive_feedback.sqlite3`（与 `mind.sqlite3` 和外部资讯库隔离）。
+通过官方 `maisaka.planner.after_response` 观察模型选择 `reply/stop`，
+通过 `send_service.after_send` 观察 Host 的真实发送回执；不控制 Planner 决策。
+
+**注意**：发送回执确认该会话确有出站发送成功。如果其他插件在同一会话、同一时间窗口发送消息，仅凭现有 Hook 仍有归因歧义。收到新的用户消息会中止任务归因。
+
+- `audience.max_daily_per_target`：每天最多确认发送的主动轮次；Planner `stop` 不占这项额度。
+- `audience.max_daily_attempts_per_target`：每天最多主动唤醒尝试次数，包含 stop，防止刷模型 Token。
+- `audience.min_gap_hours`：两次确认发送的最小间隔小时数。
+- `audience.min_attempt_gap_minutes`：两次主动尝试之间最少间隔分钟数。
+- `audience.stop_backoff_base_minutes`：首次 stop 的退避，后续连续 stop 翻倍。
+- `audience.stop_backoff_max_minutes`：退避上限。
+
+```toml
+[audience]
+min_gap_hours = 6.0
+max_daily_per_target = 2
+min_attempt_gap_minutes = 30
+max_daily_attempts_per_target = 8
+stop_backoff_base_minutes = 45
+stop_backoff_max_minutes = 240
+```
+
+**迁移说明**：旧版 `attempts` 表继续累计当天唤醒尝试，升级后不会把旧尝试补记成确认发送。升级当天配额统计可能有断层。无需迁移旧 SQLite/MySQL 资讯库，反馈账本不保存私聊文本。
+
+日志搜索 `[MaiLivingWorld][PROACTIVE]`：可见 `Planner选择stop`、`Planner选择reply`、`send_confirmed`、`send_failed` 和 `跳过 ... reason=...`。内部 `living_world_status` API 的 `proactive_feedback` 提供每个目标的今日结果计数及退避信息。
