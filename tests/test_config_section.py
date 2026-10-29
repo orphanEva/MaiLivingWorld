@@ -25,6 +25,20 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertFalse(cfg.general.enabled)
         self.assertEqual(cfg.storage.backend, "sqlite")
 
+    def test_comment_example_has_every_config_field_and_same_defaults(self):
+        import tomllib
+        example_path = ROOT / "config.example.toml"
+        content = example_path.read_text(encoding="utf-8")
+        parsed = tomllib.loads(content)
+        defaults = plugin.Config().model_dump()
+        self.assertEqual(set(parsed), set(defaults))
+        self.assertEqual(parsed, defaults)
+        total_fields = sum(len(fields) for fields in defaults.values())
+        self.assertEqual(total_fields, 56)
+        import re
+        comments = re.findall(r"^# [^\\n]+\\n[a-z_][a-z_0-9]*\\s*=", content, flags=re.M)
+        self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
+
     def test_manifest_version_consistent(self):
         manifest = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], plugin.Config().plugin.config_version)

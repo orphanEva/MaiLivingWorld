@@ -29,7 +29,7 @@ SDK Runner 校验插件配置时必须存在 `[plugin]`，其中要有 `config_v
 ```toml
 [plugin]
 enabled = true
-config_version = "0.4.2"
+config_version = "0.4.4"
 
 [general]
 enabled = false
@@ -39,6 +39,27 @@ dry_run = true
 - `plugin.enabled` 是插件总开关；`general.enabled` 仅控制外部探索和主动聊天，默认关闭。启用 `owner.enabled` 后可单独测试主人识别。
 - Runner 会自动生成 `config.toml`；发行 ZIP 不包含本地配置，避免覆盖主人 QQ 或数据库密码。
 - 已安装旧版并提示缺少 `[plugin]` 时，请先备份原始配置；可以在 WebUI 的原始 TOML 顶部补上上述 `[plugin]` 节，再安装修复版。不要删除插件数据目录中的 SQLite 数据库。
+
+## 中文注释版配置模板（v0.4.4）
+
+仓库根目录的 `config.example.toml` 包含 **8 个分组、56 个变量**，每个变量都附有中文用途、限制和注意事项。WebUI ZIP 也附带这份示例文件作为本地备忘。
+
+**不要直接覆盖现有 `config.toml`。** MaiBot Runner 根据 `Config(PluginConfigBase)` 自动生成运行时配置，示例模板并不会自动加载。已经调通的配置（包括主人 QQ、私聊白名单、数据库、dry_run）应该先备份，并在 WebUI「原始 TOML」中对照添加中文注释即可。
+
+下面给出其中的部分注释：
+
+```toml
+[audience]
+# 同一目标两次决策的最小间隔为 5 分钟，不能设置成 1 分钟
+min_decision_gap_minutes = 120
+
+[memory]
+# 开启记忆桥后还必须选 webui_import 并在容器环境变量中配置 MLW_WEBUI_TOKEN
+enabled = false
+backend = "off"
+```
+
+这只是参数说明与注释维护更新，**不改变插件运行逻辑**，不需要重新配置主人识别或主动聊天。
 
 ## 安装：WebUI 一键导入 ZIP
 

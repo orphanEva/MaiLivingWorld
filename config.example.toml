@@ -1,0 +1,159 @@
+# MaiLivingWorld v0.4.4 · 全字段中文注释配置模板
+# 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
+# MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
+# 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
+# plugin.enabled 是整个插件开关，general.enabled 只控制探索/主动聊天。
+# 记忆桥开启时需要容器环境变量 MLW_WEBUI_TOKEN，切勿在 TOML 中直接填写 WebUI 管理密钥。
+
+
+# ====================================================================
+# 00 / 插件设置
+# ====================================================================
+[plugin]
+# 插件全局总开关：false 会连主人识别一并关闭。
+enabled = true
+# 当前插件配置版本；必须与安装版本一致，不要随意修改。
+config_version = "0.4.4"
+
+# ====================================================================
+# 07 / 数据持久化（SQLite 或 MySQL）
+# ====================================================================
+[storage]
+# sqlite=独立本地文件；mysql=专用数据库；切换后要重载，不自动迁移旧数据。
+backend = "sqlite"
+# MySQL 主机名/IP；同一个 Docker 网络可填容器服务名
+mysql_host = "mysql"
+# MySQL 连接端口
+mysql_port = 3306
+# MySQL 用户，建议仅授予专用数据库权限
+mysql_user = "mai_living_world"
+# MySQL密码，仅在MySQL模式生效；不要提交GitHub，不要放公开日志。
+mysql_password = ""
+# MySQL 数据库（需先创建）；数据表由插件自动初始化
+mysql_database = "mai_living_world"
+# MySQL表名前缀，避免和其他业务数据表冲突。
+mysql_table_prefix = "mlw_"
+# MySQL 连接超时（秒）
+mysql_connect_timeout = 5
+
+# ====================================================================
+# 01 / 基础与安全
+# ====================================================================
+[general]
+# 探索和主动聊天调度开关，关闭后不影响单独开启的主人识别。
+enabled = false
+# true=只模拟选题并记录日志，不发送主动QQ消息、不写外部记忆；false=正式主动唤醒。
+dry_run = true
+# 免打扰与日配额时区
+timezone = "Asia/Shanghai"
+# 内部检查频率，不是主动聊天频率
+tick_seconds = 60
+# 容器刚启动时等待宿主完成加载
+startup_delay_seconds = 25
+
+# ====================================================================
+# 02 / 允许联系的 QQ
+# ====================================================================
+[audience]
+# 允许主动私聊的QQ号，如 ['12345678']；必须有既存私聊会话
+private_users = []
+# 允许主动发言的群号，空列表表示不向任何群主动发言
+group_ids = []
+# 私聊静默至少多久才考虑发起
+private_min_idle_minutes = 90
+# 群聊静默至少多久才考虑带话题出来
+group_min_idle_minutes = 35
+# 每隔多少分钟检查活跃度，不代表每次都调用模型
+check_interval_minutes = 25
+# 相同目标两次选题决策最少间隔分钟数，允许5～1440；不能填1。
+min_decision_gap_minutes = 120
+# 同一目标两次真实主动唤醒尝试的最小间隔小时数，与上面的选题间隔不同。
+min_gap_hours = 6.0
+# 每个目标每天最多提交多少次主动唤醒请求；提交不代表QQ真正送达，0代表不发送。
+max_daily_per_target = 2
+# 免打扰开始，例如 23:00
+quiet_start = "23:00"
+# 免打扰结束时间，24小时制；与 quiet_start 相同表示禁用免打扰。
+quiet_end = "09:00"
+# 没有值得分享的真实见闻时，允许模型判断是否延续旧话题
+history_gate = true
+# 只读取当前聊天流的最近消息；不跨群/私聊混用
+recent_message_limit = 25
+
+# ====================================================================
+# 03 / 主人识别（QQ 可信身份）
+# ====================================================================
+[owner]
+# 仅靠平台提供的真实发送者QQ号识别主人；不增加管理员或命令权限。
+enabled = false
+# 主人真实QQ号，必须是数字字符串；不要提交到GitHub公开仓库。
+qq = ""
+# 聊天时使用的关系称呼
+title = "主人"
+# 群聊中主人本人发消息时注入本轮身份提示
+recognize_in_groups = true
+# 在与主人 QQ 的私聊中注入本轮身份提示
+recognize_in_private = true
+# 可选：将主人加入主动私聊白名单；默认不自动联系主人
+add_to_private_targets = false
+# 主人专属关系风格；关闭后仍识别主人，但不添加亲疏表达指引
+relationship_enabled = true
+# banter=损友亲近 / gentle=温柔偏心 / tsundere=嘴硬心软 / custom=自定义。
+relationship_mode = "banter"
+# 主人的私聊自定义风格；非空时覆盖对应预设，最多使用前1600字。
+private_template = ""
+# 主人的群聊自定义风格；非空时覆盖对应预设，禁止填写私聊秘密。
+group_template = ""
+
+# ====================================================================
+# 04 / 外部世界（只读）
+# ====================================================================
+[explorer]
+# 外部探索开关：只有打开后才联网抓取
+enabled = false
+# 外部资料抓取间隔；与主动联系检查周期分开
+scan_interval_minutes = 90
+# 读取B站公开热门视频标题/简介，不需要账号，也不观看视频
+bilibili_popular_enabled = true
+# RSS/Atom订阅URL数组；设置为 [] 可禁用RSS，网络不可达时建议先关闭。
+rss_feed_urls = ["https://rsshub.app/xiaoheihe/news"]
+# 仅允许访问白名单HTTPS主机，不接受重定向
+rss_allowed_hosts = ["rsshub.app"]
+# 资讯兴趣关键词，只是弱偏好，不是严格白名单。
+interests = ["游戏", "动漫", "科技", "AI"]
+# 禁止主动分享的关键词；在标题和摘要中匹配
+blocked_words = []
+# 此项为内部参数，请参阅源码
+max_items_per_source = 20
+# 过旧资讯不主动分享
+max_age_hours = 168
+# 此项为内部参数，请参阅源码
+candidate_count = 8
+# 此项为内部参数，请参阅源码
+request_timeout_seconds = 12
+
+# ====================================================================
+# 05 / 自主决策
+# ====================================================================
+[brain]
+# 模型任务名，使用你已经配置的MaiBot模型
+model_task = "utils"
+# true由模型选择素材；false按兴趣排序，不代表强制发送。
+use_llm_selection = true
+# 唤醒优先级 low / normal / high；建议保持 low
+proactive_priority = "low"
+
+# ====================================================================
+# 06 / 长期经历（A_Memorix）
+# ====================================================================
+[memory]
+# 是否允许提交公共外部见闻到记忆桥；还需将 backend 改成 webui_import。
+enabled = false
+# off=关闭；webui_import=通过MaiBot WebUI导入任务写入A_Memorix，需要管理员Token环境变量。
+backend = "off"
+# MaiBot WebUI在本机的端口；仅访问127.0.0.1，必须能与插件共享网络命名空间。
+webui_port = 8001
+# 每条记忆导入任务等待完成的最长秒数；超时不算成功。
+import_max_wait_seconds = 45
+# 旧版兼容字段；v0.4.4 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
+chat_id = "living_world_explore"
