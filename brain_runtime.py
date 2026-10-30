@@ -49,11 +49,20 @@ def evidence_from_qq(messages: Any, scope: str, sid: str, limit: int = 30) -> li
         if not isinstance(raw,str):
             continue
         content = " ".join(raw.split())[:320]
-        if not 5<=len(content)<=320 or UNSAFE.search(content) or PRIVATE.search(content):
+        if not 2<=len(content)<=320 or UNSAFE.search(content) or PRIVATE.search(content):
             continue
         digest = hashlib.sha256((scope+"\0"+sid+"\0"+mid+"\0"+uid+"\0"+content).encode()).hexdigest()
-        stamp = msg.get("timestamp")
-        timestamp = float(stamp) if type(stamp) in (int,float) and 0 < stamp < time.time()+86400 else time.time()
+        # Host 的消息时间有版本差异。没有可靠时间时用 0 表示未知，绝不伪装成反思时间。
+        info_stamp = info.get("timestamp") or info.get("time") or info.get("message_time")
+        stamp = msg.get("timestamp") or msg.get("message_time") or msg.get("time") or info_stamp
+        try:
+            timestamp = float(stamp) if stamp is not None else 0.0
+            if timestamp > 1e12:  # 毫秒时间戳
+                timestamp /= 1000.0
+            if not 0 < timestamp < time.time() + 86400:
+                timestamp = 0.0
+        except (TypeError, ValueError, OverflowError):
+            timestamp = 0.0
         ref = "E"+digest[:22]
         selected[ref]={"id":ref,"digest":digest,"actor_id":uid,"text":content,"timestamp":timestamp}
     return list(selected.values())[-max(4,min(limit,80)):]
@@ -112,8 +121,12 @@ def build_prompt(scope: str, evidence: list[dict[str,Any]], existing: dict[str,A
         "不要把每次聊天都当作一个值得记录的重大事件；没有有意义内容时输出空数组。"
         "每个条目必须引用本轮真实 evidence_ids；subject_id/actor_id/owner_id 只能填写对应消息 speaker 的 ID。"
         "不要推断群里 A 的发言是 B 的事实，群聊记忆永远不能出现在任意私人范围中。"
+        "事实允许随时间变化：新的本人表态可以重新支持旧值，但冲突时必须给出依据，不要自行宣布真相。"
+        "用户明确陈述偏好、完成事项等可成为候选事实；不得从寒暄、玩笑或机器人自己的推测推导事实。"
         "同一属性的新事实与旧值冲突，保留冲突供管理员审查；不要私自声称旧知识一定错误。"
-        "目标只能是用户亲口提及的具体待办；完成时必须有属于目标发起者的明确新证据。"
+        "目标只能是用户亲口提及的具体待办；如果是已存在目标的新阶段，优先输出 progress 而不要换标题创建重复目标。"
+        "对于阶段目标（比如选定款式），若本人明确说已选好，即可完成这个阶段，不必等到最终购买。"
+        "完成时必须有属于目标发起者的明确新证据；购买与选款是不同完成条件。"
         "next_action 只允许 wait/follow_up/compare_evidence/review，只是一条内部计划，绝不执行外部动作。"
         "reflection 仅写一条简短的、可检验的自我复盘；不输出隐藏推理过程。"
         '只输出严格JSON对象：{"events":[{"actor_id":"QQ用户ID","kind":"experience|achievement|difficulty|preference|correction",'
