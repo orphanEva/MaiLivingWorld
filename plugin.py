@@ -39,7 +39,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.8.0",
+        default="0.9.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -151,6 +151,8 @@ class BrainMemory(PluginConfigBase):
     enabled: bool = Field(default=False, description="所有新认知模块的总开关，默认关闭")
     mode: Literal["observe", "active"] = Field(default="observe", description="observe=只记录，active=在对应会话注入已核实记忆及目标")
     auto_reflect: bool = Field(default=False, description="定时整理可信 QQ 文字证据，消耗少量模型 Token")
+    quick_update: bool = Field(default=True, description="脑记忆启用自动反思后，额外进行低频快速事实/目标进展更新，不改变主动聊天频率")
+    quick_interval_minutes: int = Field(default=5, ge=1, le=60, description="轻量更新最小间隔（分钟）；深度元认知仍按 interval_hours")
     include_owner: bool = Field(default=True, description="允许已绑定 QQ 主人的私聊建立独立记忆（还需 owner.enabled）")
     private_users: list[str] = Field(default_factory=list, description="额外允许记忆的私聊 QQ 用户白名单；不会自动私聊")
     group_ids: list[str] = Field(default_factory=list, description="允许产生群公共记忆的 QQ 群白名单；默认空，不读其他群")
@@ -242,6 +244,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._experience: ExperienceLoop | None = None
         self._brain: BrainBook | None = None
         self._last_brain_check = 0.0
+        self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
         self._brain_recent_private: dict[str,tuple[str,float]] = {}
         self._brain_recent_group: dict[tuple[str,str],tuple[str,float]] = {}
@@ -280,7 +283,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.brain_memory.enabled:
             self._ensure_brain()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.8.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.9.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -745,6 +748,19 @@ class MaiLivingWorld(MaiBotPlugin):
         db=self._ensure_brain()
         return {"success":bool(db and db.decide_goal(scope,goal_id,decision))}
 
+    @API("living_world_brain_quick_reflect",description="管理员显式触发一次轻量反思（限频、不发QQ消息）",public=False)
+    async def brain_quick_reflect(self, scope: str = "", confirm: str = "") -> dict[str,Any]:
+        if confirm != "RUN_BRAIN_QUICK" or not valid_scope(scope):
+            return {"success":False,"reason":"需要确认标记和合法作用域"}
+        if not self.config.plugin.enabled or not self.config.brain_memory.enabled:
+            return {"success":False,"reason":"脑记忆未开启"}
+        if self._lock.locked():
+            return {"success":False,"reason":"后台任务忙碌"}
+        async with self._lock:
+            count=await self._reflect_brain(quick=True,only_scope=scope,force=True)
+        return {"success":count>0,"processed":count,
+                "reason":"已执行" if count else "未满足有效消息或最短安全限频（至少60秒）"}
+
     @API("living_world_brain_clear",description="管理员按明确作用域清空此版新记忆，其他系统不变",public=False)
     async def brain_clear(self, scope: str = "", confirm: str = "") -> dict[str,Any]:
         if confirm != "CLEAR_BRAIN_SCOPE":
@@ -886,6 +902,16 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.exception("[MaiLivingWorld][BRAIN] 自主认知循环失败，其他功能不受影响")
+                    if (self.config.brain_memory.enabled and self.config.brain_memory.auto_reflect
+                            and self.config.brain_memory.quick_update
+                            and now-self._last_brain_quick_check>=60):
+                        self._last_brain_quick_check=now
+                        try:
+                            await self._reflect_brain(quick=True)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.exception("[MaiLivingWorld][BRAIN-QUICK] 快速记忆更新失败")
                     if self.config.mind.enabled and self.config.mind.auto_reflect and now-self._last_reflection_check >= 600:
                         self._last_reflection_check = now
                         try:
@@ -1066,14 +1092,17 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning("[MaiLivingWorld][MIND] 模型反思失败：%s", type(exc).__name__)
 
-    async def _reflect_brain(self) -> None:
-        """限频、限作用域的事件整理—事实合并—目标进展—元认知闭环。"""
+    async def _reflect_brain(self, *, quick: bool = False, only_scope: str = "",
+                             force: bool = False) -> int:
+        """轻量更新与深度反思共用证据过滤，限频独立；均不主动发 QQ 消息。"""
         cfg=self.config.brain_memory
-        if not (self.config.plugin.enabled and cfg.enabled and cfg.auto_reflect):
-            return
+        if not (self.config.plugin.enabled and cfg.enabled and (cfg.auto_reflect or force)):
+            return 0
+        if quick and not any((cfg.enable_events,cfg.enable_facts,cfg.enable_goals,cfg.enable_progress)):
+            return 0
         db=self._ensure_brain()
         if not db:
-            return
+            return 0
         scopes: list[tuple[str,str]]=[]
         private_ids=_clean_ids(cfg.private_users)
         if cfg.include_owner and self.config.owner.enabled:
@@ -1088,8 +1117,11 @@ class MaiLivingWorld(MaiBotPlugin):
             session=await self.ctx.chat.get_stream_by_group_id(gid)
             sid=_stream_id(session)
             if sid: scopes.append(("group:"+gid,sid))
+        if only_scope:
+            scopes=[(scope,sid) for scope,sid in scopes if scope==only_scope]
         if not scopes:
-            return
+            return 0
+        processed=0
         # 轮询遍历：多个群不能永远因为列表排在后面而得不到反思。
         offset=self._brain_cursor%len(scopes)
         ordered=scopes[offset:]+scopes[:offset]
@@ -1099,12 +1131,27 @@ class MaiLivingWorld(MaiBotPlugin):
                 raw=await self.ctx.message.get_recent(sid,limit=cfg.history_limit)
                 evidence=evidence_from_qq(raw,scope,sid,limit=cfg.history_limit)
                 if len(evidence)<cfg.min_messages:
+                    self.ctx.logger.debug("[MaiLivingWorld][BRAIN] %s跳过 scope=%s 可信证据不足=%d/%d",
+                                          "quick" if quick else "deep",scope,len(evidence),cfg.min_messages)
                     continue
                 signature=hashlib.sha256("|".join(e["digest"] for e in evidence).encode()).hexdigest()
                 now=time.time()
-                if not db.due(scope,signature,now=now,interval_hours=cfg.interval_hours):
-                    continue
-                db.mark_attempt(scope,now)
+                if quick:
+                    due, reason=db.quick_due(scope,signature,now=now,
+                                            interval_minutes=cfg.quick_interval_minutes)
+                    if force and not due:
+                        row=db.con.execute("SELECT quick_last_attempt FROM brain_runs WHERE scope=?",(scope,)).fetchone()
+                        due=not row or now-row["quick_last_attempt"]>=60
+                        reason="manual" if due else reason
+                    if not due:
+                        self.ctx.logger.debug("[MaiLivingWorld][BRAIN-QUICK] 跳过 scope=%s reason=%s",scope,reason)
+                        continue
+                    db.mark_quick_attempt(scope,now)
+                else:
+                    if not db.due(scope,signature,now=now,interval_hours=cfg.interval_hours):
+                        self.ctx.logger.debug("[MaiLivingWorld][BRAIN] 深度反思未到期或内容未变化 scope=%s",scope)
+                        continue
+                    db.mark_attempt(scope,now)
                 existing=db.recall(scope,limit=8)
                 prompt=build_prompt(scope,evidence,existing)
                 response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
@@ -1116,15 +1163,20 @@ class MaiLivingWorld(MaiBotPlugin):
                 for name,enabled in (("events",cfg.enable_events),("facts",cfg.enable_facts),
                                      ("goals",cfg.enable_goals),("progress",cfg.enable_progress)):
                     if not enabled: proposal[name]=[]
-                if not cfg.enable_metacognition:
+                if quick or not cfg.enable_metacognition:
                     proposal["reflection"]=""
-                stats=db.apply(scope,signature,evidence,proposal,now=time.time(),event_limit=cfg.event_limit)
-                self.ctx.logger.info("[MaiLivingWorld][BRAIN] scope=%s 事件=%d 事实=%d 目标=%d 进展=%d",
-                                     scope,stats["events"],stats["facts"],stats["goals"],stats["progress"])
+                stats=db.apply(scope,signature,evidence,proposal,now=time.time(),
+                               event_limit=cfg.event_limit,quick=quick)
+                processed+=1
+                self.ctx.logger.info("[MaiLivingWorld][%s] scope=%s 证据=%d 无时间=%d 事件=%d 事实=%d 目标=%d 进展=%d",
+                                     "BRAIN-QUICK" if quick else "BRAIN",scope,len(evidence),
+                                     sum(x["timestamp"]==0 for x in evidence),
+                                     stats["events"],stats["facts"],stats["goals"],stats["progress"])
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.ctx.logger.exception("[MaiLivingWorld][BRAIN] 单会话反思失败 scope=%s",scope)
+        return processed
 
     async def _scan(self):
         cfg=self.config.explorer

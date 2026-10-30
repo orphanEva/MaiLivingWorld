@@ -1,4 +1,4 @@
-"""v0.8.0 事件、事实、冲突、目标、隔离、有限反思与可控注入回归。"""
+"""v0.9.0 事实复核、快速周期、目标去重、隔离与可控注入回归。"""
 from __future__ import annotations
 
 import json
@@ -135,6 +135,90 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(self.db.status(GROUP_SCOPE)["facts"],0)
         self.assertEqual(self.db.status(GROUP_SCOPE)["goals"],0)
 
+    def test_existing_v08_archived_fact_does_not_reuse_old_evidence(self):
+        import sqlite3
+        old_path=Path(self.tmp.name)/"existing_v08.sqlite3"
+        legacy=sqlite3.connect(old_path)
+        legacy.execute("""CREATE TABLE brain_facts (
+            id TEXT PRIMARY KEY, scope TEXT NOT NULL, subject_id TEXT NOT NULL,
+            attribute TEXT NOT NULL, value TEXT NOT NULL, confidence REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', seen_count INTEGER NOT NULL DEFAULT 0,
+            created REAL NOT NULL, updated REAL NOT NULL, valid_until REAL)""")
+        legacy.execute("""INSERT INTO brain_facts VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            ("Flegacy",PRIVATE,OWNER,"偏好","蓝色",.93,"superseded",2,self.now,self.now,self.now))
+        legacy.commit()
+        legacy.close()
+        migrated=BrainBook(old_path)
+        row=migrated.con.execute(
+            "SELECT status,seen_count,reviewed_count FROM brain_facts WHERE id='Flegacy'"
+        ).fetchone()
+        self.assertEqual((row["status"],row["seen_count"],row["reviewed_count"]),
+                         ("superseded",2,2))
+        migrated.close()
+
+    def test_quick_update_has_independent_cooldown(self):
+        self.assertEqual(self.db.quick_due(PRIVATE,"quick-a",now=self.now), (True,"ready"))
+        self.db.mark_quick_attempt(PRIVATE,self.now)
+        self.assertEqual(self.db.quick_due(PRIVATE,"quick-b",now=self.now+50)[1],"cooldown")
+        self.assertEqual(self.db.quick_due(PRIVATE,"quick-b",now=self.now+310), (True,"ready"))
+        self.db.apply(PRIVATE,"quick-b",[entry("E1")],{},now=self.now+310,quick=True)
+        self.assertFalse(self.db.quick_due(PRIVATE,"quick-b",now=self.now+620)[0])
+        self.assertTrue(self.db.due(PRIVATE,"quick-b",now=self.now+620,interval_hours=1))
+        cycles=self.db.recall(PRIVATE)["reflections"]
+        self.assertEqual(cycles[0]["cycle_kind"],"quick")
+
+    def test_short_chinese_fact_fields_are_not_dropped(self):
+        rows=[entry("E1"),entry("E2")]
+        stats=self.db.apply(PRIVATE,"short-attr",rows,{"facts":[{
+            "subject_id":OWNER,"attribute":"颜色","value":"蓝色",
+            "confidence":.97,"evidence_ids":["E1","E2"]}]},now=self.now)
+        self.assertEqual(stats["facts"],1)
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["status"],"active")
+        self.assertIn("颜色＝蓝色",self.db.hint(PRIVATE))
+
+    def test_fact_can_reopen_when_new_independent_evidence_arrives(self):
+        def p(value, prefix):
+            return {"facts":[{"subject_id":OWNER,"attribute":"preferred_color",
+                              "value":value,"confidence":.96,
+                              "evidence_ids":[prefix+"1",prefix+"2"]}]}
+        self.db.apply(PRIVATE,"a",[entry("A1"),entry("A2")],
+                      p("喜欢蓝色裙子","A"),now=self.now)
+        self.db.apply(PRIVATE,"b",[entry("B1"),entry("B2")],
+                      p("喜欢黑色裙子","B"),now=self.now+10)
+        other=next(f for f in self.db.recall(PRIVATE)["facts"] if "黑色" in f["value"])
+        self.assertTrue(self.db.review_fact(PRIVATE,other["id"],"approve"))
+        self.db.apply(PRIVATE,"c",[entry("C1")],{"facts":[{
+            "subject_id":OWNER,"attribute":"preferred_color","value":"喜欢蓝色裙子",
+            "confidence":.98,"evidence_ids":["C1"]}]},now=self.now+30)
+        blue=next(f for f in self.db.recall(PRIVATE)["facts"] if "蓝色" in f["value"])
+        self.assertEqual(blue["status"],"superseded")
+        self.db.apply(PRIVATE,"d",[entry("D1")],{"facts":[{
+            "subject_id":OWNER,"attribute":"preferred_color","value":"喜欢蓝色裙子",
+            "confidence":.98,"evidence_ids":["D1"]}]},now=self.now+40)
+        self.assertEqual({f["status"] for f in self.db.recall(PRIVATE)["facts"]},{"disputed"})
+        history=self.db.con.execute("SELECT COUNT(*) FROM brain_fact_revisions WHERE scope=?",(PRIVATE,)).fetchone()[0]
+        self.assertGreaterEqual(history,4)
+        self.assertEqual(self.db.hint(PRIVATE),"")
+
+    def test_goal_alias_dedup_does_not_merge_recurring(self):
+        def goal(title,prefix):
+            return {"goals":[{"owner_id":OWNER,"title":title,"criterion":"确认款式并付款",
+                              "next_action":"follow_up","evidence_ids":[prefix]}]}
+        self.db.apply(PRIVATE,"g1",[entry("E1")],goal("给朋友买条裙子","E1"),now=self.now)
+        self.db.apply(PRIVATE,"g2",[entry("E2")],goal("购买朋友想要的裙子","E2"),now=self.now+10)
+        self.assertEqual(len(self.db.recall(PRIVATE)["goals"]),1)
+        self.db.apply(PRIVATE,"g3",[entry("E3")],goal("每年给朋友买条裙子","E3"),now=self.now+20)
+        self.assertEqual(len(self.db.recall(PRIVATE)["goals"]),2)
+
+    def test_legacy_database_schema_is_migrated(self):
+        # 新字段及事实状态审计表应能够在旧 SQLite 上无损创建。
+        columns={x["name"] for x in self.db.con.execute("PRAGMA table_info(brain_runs)")}
+        self.assertIn("quick_hash",columns)
+        self.assertIn("quick_last_attempt",columns)
+        columns={x["name"] for x in self.db.con.execute("PRAGMA table_info(brain_facts)")}
+        self.assertIn("reviewed_count",columns)
+        self.assertEqual(self.db.con.execute("SELECT COUNT(*) FROM brain_fact_revisions").fetchone()[0],0)
+
     def test_failed_reflection_is_rate_limited_and_idempotent(self):
         self.assertTrue(self.db.due(PRIVATE,"h1",now=self.now,interval_hours=1))
         self.db.mark_attempt(PRIVATE,self.now)
@@ -157,6 +241,18 @@ class EvidenceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(grp),2)
         self.assertEqual({e["actor_id"] for e in grp},{OWNER,OTHER})
         self.assertFalse(evidence_from_qq(msgs,PRIVATE,"group-one"))
+
+    def test_short_correction_and_missing_host_timestamp(self):
+        msg=host_msg("short-1",text="选好了")
+        evidence=evidence_from_qq([msg],PRIVATE,"private-one")
+        self.assertEqual(len(evidence),1)
+        self.assertEqual(evidence[0]["timestamp"],0.0)
+        msg["timestamp"]=1234567
+        evidence=evidence_from_qq([msg],PRIVATE,"private-one")
+        self.assertEqual(evidence[0]["timestamp"],1234567.0)
+        msg["timestamp"]=1234567000000
+        evidence=evidence_from_qq([msg],PRIVATE,"private-one")
+        self.assertEqual(evidence[0]["timestamp"],1234567000.0)
 
     def test_parser_rejects_forged_reference_and_sensitive_content(self):
         ev=[entry("E1")]
@@ -209,6 +305,22 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot._brain.status(PRIVATE)["facts"],0)
         await self.bot._reflect_brain()
         self.assertEqual(self.bot.ctx.llm.generate.await_count,1)
+
+    async def test_quick_reflection_persists_without_deep_cycle(self):
+        messages=[host_msg(f"quick-{i}",text=f"今天第{i}次练习RNN") for i in range(1,5)]
+        self.bot.ctx.message.get_recent.return_value=messages
+        proof=evidence_from_qq(messages,PRIVATE,"private-one")
+        self.bot.ctx.llm.generate.return_value={"content":json.dumps({
+            "events":[{"actor_id":OWNER,"kind":"experience","summary":"连续练习RNN循环网络",
+                       "importance":2,"evidence_ids":[proof[0]["id"]]}],
+            "reflection":"这轮不应保存元认知"
+        },ensure_ascii=False)}
+        self.assertEqual(await self.bot._reflect_brain(quick=True),1)
+        self.assertEqual(self.bot._brain.recall(PRIVATE)["reflections"][0]["cycle_kind"],"quick")
+        self.assertEqual(self.bot._brain.recall(PRIVATE)["reflections"][0]["reflection"],"")
+        self.assertEqual(await self.bot._reflect_brain(quick=True),0)
+        self.assertEqual(self.bot.ctx.llm.generate.await_count,1)
+        self.assertTrue(self.bot._brain.due(PRIVATE,"new-history",now=time.time()+3601,interval_hours=1))
 
     async def test_group_memory_injection_only_for_exact_reply_id(self):
         self.bot.config.brain_memory.group_ids=[GROUP]
