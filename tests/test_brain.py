@@ -146,6 +146,15 @@ class BrainBookTests(unittest.TestCase):
         cycles=self.db.recall(PRIVATE)["reflections"]
         self.assertEqual(cycles[0]["cycle_kind"],"quick")
 
+    def test_short_chinese_fact_fields_are_not_dropped(self):
+        rows=[entry("E1"),entry("E2")]
+        stats=self.db.apply(PRIVATE,"short-attr",rows,{"facts":[{
+            "subject_id":OWNER,"attribute":"颜色","value":"蓝色",
+            "confidence":.97,"evidence_ids":["E1","E2"]}]},now=self.now)
+        self.assertEqual(stats["facts"],1)
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["status"],"active")
+        self.assertIn("颜色＝蓝色",self.db.hint(PRIVATE))
+
     def test_fact_can_reopen_when_new_independent_evidence_arrives(self):
         def p(value, prefix):
             return {"facts":[{"subject_id":OWNER,"attribute":"preferred_color",
