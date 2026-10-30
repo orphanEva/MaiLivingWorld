@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "有限自主认知：公开问题、来源、未知与复盘；保留主动聊天反馈、私人反思及A_Memorix桥接",
+  "description": "主人私聊的经验反馈闭环：主动行为、真实回执、明确评价和受限策略优化；保留原有记忆/认知模块",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"

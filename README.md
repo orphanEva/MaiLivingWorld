@@ -1,6 +1,35 @@
-# MaiLivingWorld · 麦麦的小世界 v0.6.0（可信记忆与反思闭环）
+# MaiLivingWorld · 麦麦的小世界 v0.7.0（可信记忆与反思闭环）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+
+## v0.7.0 · 事件→行动→回执→明确评价→策略调整（最小闭环）
+
+在既有主动聊天回执链上添加只记录元数据的 `experience_loop.sqlite3`：
+
+1. 主动联系绑定主人 QQ 私聊时保存 event_id、会话、话题哈希和类型（公开资讯/历史话题）。
+2. 同步 Planner stop/reply、Host 真实发送结果；**只有 send_confirmed 才会等待反馈**。
+3. 只读取同会话、结构化 QQ ID 与主人一致且带真实 message_id 的新私聊纯文本，不保存聊天原文。
+4. 普通回复只表示 `reply_only`，并不代表满意；没有回复也不代表不满。只接受有限的明确评价。
+5. `mode="active"` 下，明确不喜欢某类话题才会暂缓该类型的主动联系，且绝不突破原先的白名单、静默期和配额。
+6. 主人明确要求“别再主动联系我”后暂停所有主动联系；只有管理员显式解除才恢复。
+
+不会保存聊天原文、昵称、媒体；不会自动改写 A_Memorix、核心人格和主人可信长期观察；群聊和其他 QQ 成员暂不接入。
+
+```toml
+[owner]
+enabled = true
+qq = "绑定主人的QQ号"
+
+[experience]
+enabled = true
+mode = "observe"  # 先观察，确认后再主动调整
+feedback_hours = 24
+negative_pause_hours = 12
+```
+
+新增仅管理员可调用的内部 API：`living_world_experience_status()` 查看状态，`living_world_experience_resume(confirm="RESUME_OWNER_PROACTIVE")` 解除主人拒绝主动联系。
+
+**边界**：这是可运行的主动联系行为反馈**小闭环**，不是完整自主认知。长期目标规划、跨人物记忆、开放式反馈语义判断及事实观点修正尚待后续。MaiBot 现有 Hook 没有端到端 task_id/message_id 强关联，复杂并发下仍不能保证百分百归因。该数据库固定为本地 SQLite，切换资讯存储为 MySQL 时仍需备份。
 
 ## 功能与边界
 

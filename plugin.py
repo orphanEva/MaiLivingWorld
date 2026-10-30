@@ -29,6 +29,7 @@ from .memory_bridge import MemoryBridgeError, WebUIMemoryBridge
 from .proactive_feedback import ProactiveFeedback, decision_from_items
 from .cognition import CognitiveStore, parse_cognition
 from .mind import MindStore, parse_reflection, evidence_from_messages
+from .experience_loop import ExperienceLoop
 
 
 class PluginSection(PluginConfigBase):
@@ -36,7 +37,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.6.0",
+        default="0.7.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -133,6 +134,15 @@ class Cognition(PluginConfigBase):
     max_new_per_cycle: int = Field(default=2, ge=1, le=5, description="每轮最多新增多少个问题")
 
 
+class Experience(PluginConfigBase):
+    """仅针对真实主人私聊的事件→主动行动→回执→反馈闭环。"""
+    __ui_label__ = "08 / 经验与行为反馈闭环"
+    enabled: bool = Field(default=False, description="记录主动联系及主人反馈；不保存聊天原文，默认关闭")
+    mode: Literal["observe", "active"] = Field(default="observe", description="observe=仅记录；active=明确负反馈暂缓同类主动话题")
+    feedback_hours: int = Field(default=24, ge=1, le=168, description="只关联确认发送后指定时间内的主人私聊回复")
+    negative_pause_hours: int = Field(default=12, ge=1, le=72, description="active 下明确不感兴趣时暂停同类选题的小时数")
+
+
 class Memory(PluginConfigBase):
     __ui_label__ = "06 / 长期经历（A_Memorix）"
     enabled: bool = Field(default=False, description="仅在正式模式下自动保存外部公开见闻；需要主动配置 WebUI 导入桥")
@@ -164,6 +174,7 @@ class Config(PluginConfigBase):
     brain: Brain = Field(default_factory=Brain)
     mind: Mind = Field(default_factory=Mind)
     cognition: Cognition = Field(default_factory=Cognition)
+    experience: Experience = Field(default_factory=Experience)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -204,6 +215,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._last_cognition_check = 0.0
         self._memory_inflight_keys: set[str] = set()
         self._feedback: ProactiveFeedback | None = None
+        self._experience: ExperienceLoop | None = None
         # 仅关联一次已提交的主动任务与当前会话，绝不跨聊天流归因。
         self._pending_proactive: dict[str, tuple[int, float, str]] = {}
         # 公开见闻仅在主动消息得到成功发送回执后写入记忆。
@@ -234,8 +246,10 @@ class MaiLivingWorld(MaiBotPlugin):
             self._ensure_cognition()
         self._feedback = ProactiveFeedback(Path(self.ctx.paths.data_dir) / "proactive_feedback.sqlite3")
         self._feedback.expire_unfinished()
+        if self.config.experience.enabled:
+            self._ensure_experience()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.6.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.7.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -316,7 +330,38 @@ class MaiLivingWorld(MaiBotPlugin):
             event_id, _, target = self._pending_proactive.pop(sid)
             self._pending_memory.pop(event_id, None)
             self._feedback.finish(event_id, "interrupted")
+            if self._experience:
+                self._experience.mark(event_id, "interrupted")
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] 已收到用户新消息，主动任务归因终止 target=%s", target)
+        return {"action": "continue"}
+
+    @HookHandler(
+        "chat.receive.after_process", name="living_world_owner_experience_feedback",
+        description="可信 QQ 主人私聊对已确认主动消息的直接反馈，不保存正文",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def capture_experience_feedback(self, message: Any = None, **kwargs):
+        del kwargs
+        cfg = self.config.experience
+        if not (self.config.plugin.enabled and cfg.enabled and self.config.owner.enabled):
+            return {"action": "continue"}
+        sender = extract_sender(message)
+        owner = normalize_qq(self.config.owner.qq)
+        if not sender or sender.kind != "private" or not is_owner(sender, owner) or not sender.message_id:
+            return {"action": "continue"}
+        sid = await self._owner_session_id(sender)
+        if not sid or sid != sender.stream_id or not isinstance(message, dict):
+            return {"action": "continue"}
+        plaintext = message.get("processed_plain_text")
+        if not isinstance(plaintext, str) or not plaintext.strip():
+            return {"action": "continue"}
+        loop = self._ensure_experience()
+        if loop:
+            result = loop.observe(owner, sid, sender.message_id, plaintext,
+                                  feedback_hours=cfg.feedback_hours, active=cfg.mode == "active",
+                                  negative_pause_hours=cfg.negative_pause_hours)
+            if result:
+                self.ctx.logger.info("[MaiLivingWorld][EXPERIENCE] 主人回复反馈=%s；不保留原文", result)
         return {"action": "continue"}
 
     @HookHandler(
@@ -332,6 +377,8 @@ class MaiLivingWorld(MaiBotPlugin):
         event_id, created_at, target = pending
         if time.time() - created_at > 240:
             self._feedback.finish(event_id, "unknown")
+            if self._experience:
+                self._experience.mark(event_id, "unknown")
             self._pending_proactive.pop(sid, None)
             self._pending_memory.pop(event_id, None)
             return {"action": "continue"}
@@ -341,11 +388,15 @@ class MaiLivingWorld(MaiBotPlugin):
             if self._feedback.finish(event_id, "planner_stop",
                 base_backoff_minutes=cfg.stop_backoff_base_minutes,
                 max_backoff_minutes=max(cfg.stop_backoff_base_minutes, cfg.stop_backoff_max_minutes)):
+                if self._experience:
+                    self._experience.mark(event_id, "planner_stop")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择stop，未发送，已进入退避 target=%s", target)
             self._pending_proactive.pop(sid, None)
             self._pending_memory.pop(event_id, None)
         elif outcome == "reply_planned":
             if self._feedback.finish(event_id, "reply_planned"):
+                if self._experience:
+                    self._experience.mark(event_id, "reply_planned")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择reply，等待发送回执 target=%s", target)
         return {"action": "continue"}
 
@@ -376,6 +427,8 @@ class MaiLivingWorld(MaiBotPlugin):
         is_sent = kwargs.get("sent") is True
         status = "send_confirmed" if is_sent else "send_failed"
         if self._feedback.finish(event_id, status):
+            if self._experience:
+                self._experience.mark(event_id, status)
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] %s target=%s", status, target)
             story = self._pending_memory.pop(event_id, None)
             if is_sent and story:
@@ -467,6 +520,9 @@ class MaiLivingWorld(MaiBotPlugin):
             await asyncio.gather(*self._memory_jobs, return_exceptions=True)
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
+        if self._experience:
+            self._experience.close()
+            self._experience = None
         if self._feedback:
             self._feedback.close()
             self._feedback = None
@@ -503,6 +559,9 @@ class MaiLivingWorld(MaiBotPlugin):
             "cognition_enabled": self.config.cognition.enabled,
             "cognition_mode": self.config.cognition.mode,
             "cognition_auto_think": self.config.cognition.auto_think,
+            "experience_enabled": self.config.experience.enabled,
+            "experience_mode": self.config.experience.mode,
+            "experience_summary": self._experience.status(normalize_qq(self.config.owner.qq)) if self._experience and normalize_qq(self.config.owner.qq) else {},
             "cognition_summary": self._cognition.summary() if self._cognition and self.config.cognition.enabled else {},
             "mind_note_count": len(self._mind.notes(normalize_qq(self.config.owner.qq))) if self._mind and normalize_qq(self.config.owner.qq) else 0,
         }
@@ -522,6 +581,29 @@ class MaiLivingWorld(MaiBotPlugin):
                 ids.append(owner)
         targets = ["qq:private:"+x for x in ids] + ["qq:group:"+x for x in _clean_ids(self.config.audience.group_ids)]
         return {"ready": True, "targets": [self._feedback.status(t, day_start=day_start) for t in targets[:30]]}
+
+    def _ensure_experience(self) -> ExperienceLoop | None:
+        if not (self.config.plugin.enabled and self.config.experience.enabled):
+            return None
+        if self._experience is None:
+            self._experience = ExperienceLoop(Path(self.ctx.paths.data_dir) / "experience_loop.sqlite3")
+        return self._experience
+
+    @API("living_world_experience_status",
+         description="仅管理员查看主人主动联系的行动结果及评价，不包含聊天正文", public=False)
+    async def experience_status(self) -> dict[str, Any]:
+        owner = normalize_qq(self.config.owner.qq)
+        loop = self._ensure_experience() if owner else None
+        return loop.status(owner) if loop else {"ready": False}
+
+    @API("living_world_experience_resume",
+         description="仅管理员显式恢复绑定主人已经拒绝的主动联系", public=False)
+    async def experience_resume(self, confirm: str = "") -> dict[str, Any]:
+        if confirm != "RESUME_OWNER_PROACTIVE":
+            return {"success": False, "reason": "需要管理员确认"}
+        owner = normalize_qq(self.config.owner.qq)
+        loop = self._ensure_experience() if owner else None
+        return {"success": bool(loop and loop.resume(owner))}
 
     @API("living_world_mind_status", description="仅管理员查看主人私聊反思状态及结构化观察，不包含完整聊天正文", public=False)
     async def mind_status(self) -> dict[str, Any]:
@@ -620,6 +702,8 @@ class MaiLivingWorld(MaiBotPlugin):
                         self._feedback.expire_unfinished(now=now)
                         for sid, (eid, started, _) in list(self._pending_proactive.items()):
                             if now - started > 240:
+                                if self._experience:
+                                    self._experience.mark(eid, "unknown", now=now)
                                 self._pending_proactive.pop(sid, None)
                                 self._pending_memory.pop(eid, None)
                     if self.config.mind.enabled and self.config.mind.auto_reflect and now-self._last_reflection_check >= 600:
@@ -868,6 +952,11 @@ class MaiLivingWorld(MaiBotPlugin):
         if allowed and feedback:
             allowed,reason = feedback.check(target, now, _day_start(now_dt),
                                             cfg.min_gap_hours*3600, cfg.max_daily_per_target)
+        # QQ 主人显式拒绝主动联系时，即使处于 observe 也必须尊重。
+        is_owner_private = kind == "private" and self.config.owner.enabled and normalize_qq(self.config.owner.qq) == ident
+        experience = self._ensure_experience() if is_owner_private else None
+        if allowed and experience:
+            allowed, reason = experience.allow(ident, "history", active=False)
         if not allowed:
             # 默认 INFO 只在新的原因/目标首次出现或隔 30 分钟再次出现，方便现场排障。
             k=(target,reason)
@@ -912,6 +1001,9 @@ class MaiLivingWorld(MaiBotPlugin):
         # 仅模型决策限频，不能替代SQLite已落盘的发送配额；重启后由发送配额继续保护。
         self._last_decision[decision_key]=now
         story=await self._choose_story(target)
+        if story and experience and not experience.allow(
+                ident, "explore", active=self.config.experience.mode == "active")[0]:
+            story = None
         if story:
             intent=(
                 "这是一次主动发起聊天的机会，你可以选择沉默。你刚刚从公开信息源看到一条真实内容。"
@@ -923,6 +1015,9 @@ class MaiLivingWorld(MaiBotPlugin):
             )
         else:
             if not cfg.history_gate:
+                return
+            if experience and not experience.allow(
+                    ident, "history", active=self.config.experience.mode == "active")[0]:
                 return
             topic=await self._history_gate(history[-4400:])
             if not topic:
@@ -953,6 +1048,9 @@ class MaiLivingWorld(MaiBotPlugin):
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None
         if event_id is not None:
+            if experience:
+                experience.begin(event_id, ident, sid, "explore" if story else "history",
+                                 str(story["key"] if story else topic), now=now)
             self._pending_proactive[sid] = (event_id, now, target)
             if story and self.config.memory.enabled:
                 self._pending_memory[event_id] = story
@@ -964,12 +1062,16 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._experience:
+                    self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)
                 self._pending_memory.pop(event_id,None)
             raise
         if isinstance(result,dict) and result.get('success') is False:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._experience:
+                    self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)
                 self._pending_memory.pop(event_id,None)
             self.ctx.logger.warning("[MaiLivingWorld] 主动请求未成功：%s",str(result)[:200])
