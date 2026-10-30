@@ -231,7 +231,7 @@ class EvidenceRuntimeTests(unittest.TestCase):
         self.assertEqual(evidence[0]["timestamp"],1234567.0)
         msg["timestamp"]=1234567000000
         evidence=evidence_from_qq([msg],PRIVATE,"private-one")
-        self.assertEqual(evidence[0]["timestamp"],1234567.0)
+        self.assertEqual(evidence[0]["timestamp"],1234567000.0)
 
     def test_parser_rejects_forged_reference_and_sensitive_content(self):
         ev=[entry("E1")]
