@@ -36,7 +36,7 @@ enabled = false
 dry_run = true
 ```
 
-- `plugin.enabled` 是插件总开关；`general.enabled` 仅控制外部探索和主动聊天，默认关闭。启用 `owner.enabled` 后可单独测试主人识别。
+- `plugin.enabled` 是插件总开关；`general.enabled` 只控制主动聊天，默认关闭。外部探索由 `explorer.enabled` 控制，公开认知还需 `cognition.enabled=true` 与 `auto_think=true`；主人身份识别由 `owner.enabled` 单独控制。
 - Runner 会自动生成 `config.toml`；发行 ZIP 不包含本地配置，避免覆盖主人 QQ 或数据库密码。
 - 已安装旧版并提示缺少 `[plugin]` 时，请先备份原始配置；可以在 WebUI 的原始 TOML 顶部补上上述 `[plugin]` 节，再安装修复版。不要删除插件数据目录中的 SQLite 数据库。
 
@@ -120,7 +120,9 @@ group_template = ""                # 留空使用预设
 - `story_attempts`：同一资讯对同一个私聊/群的**分享尝试**；避免反复推送相同资讯。
 - `attempts`：每个聊天流的**主动唤醒尝试**，用于冷却和每日上限。**记录唤醒尝试不等于 QQ 消息发送成功**。
 
-SQLite 和 MySQL 实现相同接口；SQLite 零配置单机更简单，MySQL 方便与已有数据库集中维护，但**不提升语言模型的理解能力**。
+SQLite 和 MySQL 实现相同的资讯与尝试记录接口；SQLite 零配置单机更简单，MySQL 方便与已有数据库集中维护，但**不提升语言模型的理解能力**。
+
+**备份注意：MySQL 并未覆盖所有状态。** 即便设为 `storage.backend="mysql"`，`mind.sqlite3`（主人观察）、`cognition.sqlite3`（公开认知）和 `proactive_feedback.sqlite3`（发送反馈/退避）仍位于插件 `data_dir`。备份、迁移时必须同时保留这些文件（建议停止插件后备份 SQLite WAL 数据）和 MySQL 数据，否则可能丢失记忆审核状态或重置冷却。
 
 ### 如何切换到 MySQL
 
@@ -205,6 +207,10 @@ docker logs --since 30m maibot 2>&1 | grep -i 'MaiLivingWorld'
 | 群聊白名单 | 空，默认**不主动发群** |
 
 插件通过 `ctx.maisaka.proactive.trigger()` 唤醒 MaiBot 原生 Planner；麦麦自己决定开口还是沉默。因此日志显示“主动唤醒请求已提交”**不等于** QQ 实际发送成功。
+
+最近消息默认只查 24 小时；不足两条时插件会回查该会话数据库中更早的持久化消息（有条数上限），不会只因一天没聊天就放弃。宿主删掉全部历史、没有既存会话或没有合适的话题时，仍不会强行发消息。
+
+主动发送回执现校验平台账号和发送者，但目前 Host Hook 没有完整的主动任务↔单条发送的关联 ID，并发情况下仍无法做到绝对精确。公开见闻会等到符合条件的发送成功回执后才提交 A_Memorix，Planner 选择 stop、发送失败或中断时不提前写入。
 
 QQ 群聊需先在原 MaiBot / NapCat / 适配器里确保群消息可以正常收取；本插件不会替你加群或改变接收规则。
 

@@ -10,6 +10,11 @@ from MaiLivingWorld.tests.test_runtime import plugin, FakeContext
 from MaiLivingWorld.proactive_feedback import ProactiveFeedback, decision_from_items
 
 
+def outgoing(session_id: str, sender_id: str = "999", account_id: str = "999") -> dict:
+    return {"platform": "qq", "session_id": session_id, "account_id": account_id,
+            "message_info": {"user_info": {"user_id": sender_id}}}
+
+
 def tool(name: str) -> list[dict]:
     return [{"item_type":"FunctionCallItem","tool_call":{"func_name":name,"call_id":"test-call","args":{}}}]
 
@@ -73,7 +78,7 @@ class ProactiveFeedbackHookTests(unittest.IsolatedAsyncioTestCase):
         event = self.bot._feedback.begin("qq:private:123", "private-one", time.time())
         self.bot._pending_proactive["private-one"] = (event, time.time(), "qq:private:123")
         await self.bot.proactive_planner_feedback(session_id="private-one", output_items=tool("stop"))
-        await self.bot.proactive_send_feedback(message={"platform":"qq","session_id":"private-one"}, sent=True)
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"), sent=True)
         self.assertEqual(self.bot._feedback.outcome(event), "planner_stop")
         self.assertFalse(self.bot._pending_proactive)
 
@@ -81,11 +86,20 @@ class ProactiveFeedbackHookTests(unittest.IsolatedAsyncioTestCase):
         event = self.bot._feedback.begin("qq:private:123", "private-one", time.time())
         self.bot._pending_proactive["private-one"] = (event, time.time(), "qq:private:123")
         await self.bot.proactive_planner_feedback(session_id="private-one", output_items=tool("reply"))
-        await self.bot.proactive_send_feedback(message={"platform":"qq","session_id":"wrong"},sent=True)
+        await self.bot.proactive_send_feedback(message=outgoing("wrong"),sent=True)
         self.assertEqual(self.bot._feedback.outcome(event),"reply_planned")
-        await self.bot.proactive_send_feedback(message={"platform":"qq","session_id":"private-one"},sent=True)
-        await self.bot.proactive_send_feedback(message={"platform":"qq","session_id":"private-one"},sent=True)
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"),sent=True)
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"),sent=True)
         self.assertEqual(self.bot._feedback.outcome(event),"send_confirmed")
+
+    async def test_other_sender_cannot_confirm_send(self):
+        event = self.bot._feedback.begin("qq:private:123", "private-one", time.time())
+        self.bot._pending_proactive["private-one"] = (event, time.time(), "qq:private:123")
+        await self.bot.proactive_planner_feedback(session_id="private-one", output_items=tool("reply"))
+        await self.bot.proactive_send_feedback(message=outgoing("private-one", sender_id="888"), sent=True)
+        self.assertEqual(self.bot._feedback.outcome(event), "reply_planned")
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"), sent=True)
+        self.assertEqual(self.bot._feedback.outcome(event), "send_confirmed")
 
     async def test_incoming_private_message_interrupts_attribution(self):
         event = self.bot._feedback.begin("qq:private:123","private-one",time.time())
@@ -95,7 +109,7 @@ class ProactiveFeedbackHookTests(unittest.IsolatedAsyncioTestCase):
             "platform":"qq","session_id":"private-one","account_id":"999",
             "message_info":{"user_info":{"user_id":"123"}}
         })
-        await self.bot.proactive_send_feedback(message={"platform":"qq","session_id":"private-one"},sent=True)
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"),sent=True)
         self.assertEqual(self.bot._feedback.outcome(event),"interrupted")
 
 
