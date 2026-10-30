@@ -44,7 +44,7 @@ class PluginSection(PluginConfigBase):
 
 class General(PluginConfigBase):
     __ui_label__ = "01 / 基础与安全"
-    enabled: bool = Field(default=False, description="总开关。首次安装保持关闭；确认配置后手动启用")
+    enabled: bool = Field(default=False, description="主动聊天开关；外部探索、公开认知和主人识别由各自开关控制")
     dry_run: bool = Field(default=True, description="安全演练：抓取并调用模型，但绝不唤醒发消息，也不写长期记忆")
     timezone: str = Field(default="Asia/Shanghai", description="免打扰与日配额时区")
     tick_seconds: int = Field(default=60, ge=30, le=600, description="内部检查频率，不是主动聊天频率")

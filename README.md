@@ -36,7 +36,7 @@ enabled = false
 dry_run = true
 ```
 
-- `plugin.enabled` 是插件总开关；`general.enabled` 仅控制外部探索和主动聊天，默认关闭。启用 `owner.enabled` 后可单独测试主人识别。
+- `plugin.enabled` 是插件总开关；`general.enabled` 只控制主动聊天，默认关闭。外部探索由 `explorer.enabled` 控制，公开认知还需 `cognition.enabled=true` 与 `auto_think=true`；主人身份识别由 `owner.enabled` 单独控制。
 - Runner 会自动生成 `config.toml`；发行 ZIP 不包含本地配置，避免覆盖主人 QQ 或数据库密码。
 - 已安装旧版并提示缺少 `[plugin]` 时，请先备份原始配置；可以在 WebUI 的原始 TOML 顶部补上上述 `[plugin]` 节，再安装修复版。不要删除插件数据目录中的 SQLite 数据库。
 

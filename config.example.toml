@@ -2,7 +2,7 @@
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
-# plugin.enabled 是整个插件开关，general.enabled 只控制探索/主动聊天。
+# plugin.enabled 是整个插件开关；general.enabled 只控制主动聊天。
 # 记忆桥开启时需要容器环境变量 MLW_WEBUI_TOKEN，切勿在 TOML 中直接填写 WebUI 管理密钥。
 
 
@@ -40,7 +40,7 @@ mysql_connect_timeout = 5
 # 01 / 基础与安全
 # ====================================================================
 [general]
-# 探索和主动聊天调度开关，关闭后不影响单独开启的主人识别。
+# 主动聊天调度开关；探索、公开认知和主人识别由各自 enabled 控制。
 enabled = false
 # true=只模拟选题并记录日志，不发送主动QQ消息、不写外部记忆；false=正式主动唤醒。
 dry_run = true
