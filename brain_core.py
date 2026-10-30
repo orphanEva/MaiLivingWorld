@@ -135,6 +135,9 @@ class BrainBook:
         fact_columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_facts)")}
         if "reviewed_count" not in fact_columns:
             self.con.execute("ALTER TABLE brain_facts ADD COLUMN reviewed_count INTEGER NOT NULL DEFAULT 0")
+            # 旧版已经被否决的事实：升级之前的全部证据都不能重新计数。
+            self.con.execute("""UPDATE brain_facts SET reviewed_count=seen_count
+                WHERE status IN ('superseded','rejected')""")
         cycle_columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_cycles)")}
         if "cycle_kind" not in cycle_columns:
             self.con.execute("ALTER TABLE brain_cycles ADD COLUMN cycle_kind TEXT NOT NULL DEFAULT 'deep'")
