@@ -154,9 +154,9 @@ class BrainBook:
         if not valid_scope(scope) or not digest:
             return False, "invalid_scope_or_empty"
         row = self.con.execute(
-            "SELECT quick_hash,quick_last_attempt FROM brain_runs WHERE scope=?", (scope,)
+            "SELECT quick_hash,history_hash,quick_last_attempt FROM brain_runs WHERE scope=?", (scope,)
         ).fetchone()
-        if row and row["quick_hash"] == digest:
+        if row and (row["quick_hash"] == digest or row["history_hash"] == digest):
             return False, "unchanged"
         if row and now-row["quick_last_attempt"] < max(1,interval_minutes)*60:
             return False, "cooldown"
