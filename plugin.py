@@ -962,7 +962,7 @@ class MaiLivingWorld(MaiBotPlugin):
         )
         try:
             result = await self.ctx.llm.generate(
-                prompt, task_name=self.config.brain_memory.model_task, temperature=0.2, max_tokens=1000)
+                prompt, task_name=self.config.brain.model_task, temperature=0.2, max_tokens=1000)
             parsed = parse_cognition(result, sources, existing, new_limit=cfg.max_new_per_cycle)
             if parsed is None:
                 store.failed(cycle)
@@ -1034,7 +1034,7 @@ class MaiLivingWorld(MaiBotPlugin):
             + "\n<引用的私聊消息>\n" + labeled[-10000:] + "\n</引用的私聊消息>"
         )
         try:
-            result = await self.ctx.llm.generate(prompt, task_name=self.config.brain_memory.model_task,
+            result = await self.ctx.llm.generate(prompt, task_name=self.config.brain.model_task,
                                                  temperature=0.2, max_tokens=900)
             raw = extract_text(result).strip()
             if not raw.startswith("{") or not raw.endswith("}"):
@@ -1091,7 +1091,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 db.mark_attempt(scope,now)
                 existing=db.recall(scope,limit=8)
                 prompt=build_prompt(scope,evidence,existing)
-                response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,
+                response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
                                                     temperature=0.2,max_tokens=1300)
                 proposal=parse_proposal(response,evidence)
                 if proposal is None:
@@ -1339,7 +1339,7 @@ class MaiLivingWorld(MaiBotPlugin):
             json.dumps([{"key":x['key'],"source":x['source'],"title":x['title'],"summary":x['summary'][:180]} for x in raw],ensure_ascii=False)
         )
         try:
-            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,temperature=0.3,max_tokens=180)
+            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,temperature=0.3,max_tokens=180)
             chosen=choose_story(response,[Story(x['key'],x['source'],x['title'],x['url'],x['summary'],x['published_at']) for x in raw])
             if not chosen:
                 return None
@@ -1359,7 +1359,7 @@ class MaiLivingWorld(MaiBotPlugin):
             '同意 {"reach_out":true,"topic":"50字以内的具体话题"}。\n'+history
         )
         try:
-            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,temperature=0.2,max_tokens=180)
+            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,temperature=0.2,max_tokens=180)
             yes,topic=parse_decision(response)
             return topic if yes else None
         except asyncio.CancelledError:
