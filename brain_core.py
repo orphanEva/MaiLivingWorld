@@ -95,7 +95,9 @@ class BrainBook:
         );
         CREATE TABLE IF NOT EXISTS brain_decisions (
           id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, goal_id TEXT,
-          action TEXT NOT NULL, reason TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'planned',
+          feedback_event_id INTEGER UNIQUE, action TEXT NOT NULL,
+          reason TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'submitted',
+          user_feedback TEXT NOT NULL DEFAULT 'unrated',
           recorded REAL NOT NULL, finished REAL
         );
         CREATE TABLE IF NOT EXISTS brain_cycles (
@@ -105,6 +107,12 @@ class BrainBook:
           reflection TEXT NOT NULL, created REAL NOT NULL
         );
         """)
+        columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_decisions)")}
+        if "feedback_event_id" not in columns:
+            self.con.execute("ALTER TABLE brain_decisions ADD COLUMN feedback_event_id INTEGER")
+            self.con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_decision_feedback ON brain_decisions(feedback_event_id)")
+        if "user_feedback" not in columns:
+            self.con.execute("ALTER TABLE brain_decisions ADD COLUMN user_feedback TEXT NOT NULL DEFAULT 'unrated'")
         self.con.commit()
 
     def close(self) -> None:
@@ -270,12 +278,54 @@ class BrainBook:
                (scope,scope,max(20,min(event_limit,2000))))
         return output
 
+    def record_action(self, scope: str, feedback_event_id: int, kind: str, *, now: float | None = None) -> bool:
+        """将已经受白名单保护的主动尝试关联到认知账本，不额外赋予发送权限。"""
+        if not valid_scope(scope) or type(feedback_event_id) is not int or feedback_event_id<=0 or kind not in {"explore","history"}:
+            return False
+        t=time.time() if now is None else now
+        with self.con:
+            cur=self.con.execute("""INSERT OR IGNORE INTO brain_decisions
+                (scope,feedback_event_id,action,reason,recorded)
+                VALUES (?,?,?,?,?)""",(scope,feedback_event_id,"proactive",kind,t))
+            return bool(cur.rowcount)
+
+    def record_result(self, feedback_event_id: int, outcome: str, *, now: float | None = None) -> bool:
+        """仅确认受 Host/Planner 回执约束的状态转移。"""
+        if type(feedback_event_id) is not int or outcome not in {
+            "reply_planned","planner_stop","send_confirmed","send_failed","interrupted","rejected","unknown"}:
+            return False
+        t=time.time() if now is None else now
+        with self.con:
+            row=self.con.execute("SELECT outcome FROM brain_decisions WHERE feedback_event_id=?",
+                                 (feedback_event_id,)).fetchone()
+            if not row:
+                return False
+            old=row["outcome"]
+            allowed=((old=="submitted" and outcome in {"reply_planned","planner_stop","interrupted","rejected","unknown"})
+                     or (old=="reply_planned" and outcome in {"send_confirmed","send_failed","interrupted","unknown"}))
+            if not allowed:
+                return False
+            self.con.execute("""UPDATE brain_decisions SET outcome=?,finished=?
+                WHERE feedback_event_id=?""",(outcome,t,feedback_event_id))
+            return True
+
+    def record_user_feedback(self, feedback_event_id: int, signal: str) -> bool:
+        """由已核验的 v0.7 主人私聊反馈更新行动结论，模型不能直接调用。"""
+        if type(feedback_event_id) is not int or signal not in {
+            "positive","negative","reply_only","mixed","opt_out"}:
+            return False
+        with self.con:
+            cur=self.con.execute("""UPDATE brain_decisions SET user_feedback=?
+                WHERE feedback_event_id=? AND outcome='send_confirmed'""",
+                (signal,feedback_event_id))
+            return bool(cur.rowcount)
+
     def status(self, scope: str) -> dict[str,Any]:
         if not valid_scope(scope):
             return {"ready":False}
         stats={}
         for table,key in [("brain_events","events"),("brain_facts","facts"),
-                          ("brain_goals","goals"),("brain_cycles","cycles")]:
+                          ("brain_goals","goals"),("brain_cycles","cycles"),("brain_decisions","decisions")]:
             stats[key]=self.con.execute(f"SELECT COUNT(*) FROM {table} WHERE scope=?",(scope,)).fetchone()[0]
         stats["disputed"]=self.con.execute("""SELECT COUNT(*) FROM brain_facts
             WHERE scope=? AND status='disputed'""",(scope,)).fetchone()[0]
@@ -292,7 +342,9 @@ class BrainBook:
         return {"scope":scope,
             "events":rows("SELECT id,actor_id,kind,summary,importance,happened FROM brain_events WHERE scope=? ORDER BY happened DESC LIMIT ?"),
             "facts":rows("SELECT id,subject_id,attribute,value,confidence,status,seen_count,updated FROM brain_facts WHERE scope=? ORDER BY updated DESC LIMIT ?"),
-            "goals":rows("SELECT id,owner_id,title,criterion,next_action,status,revision FROM brain_goals WHERE scope=? ORDER BY updated DESC LIMIT ?")}
+            "goals":rows("SELECT id,owner_id,title,criterion,next_action,status,revision FROM brain_goals WHERE scope=? ORDER BY updated DESC LIMIT ?"),
+            "actions":rows("SELECT feedback_event_id,action,reason,outcome,user_feedback,recorded,finished FROM brain_decisions WHERE scope=? ORDER BY id DESC LIMIT ?"),
+            "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
 
     def hint(self, scope: str, *, limit: int = 5) -> str:
         """只有当前作用域的已生效事实和待办；拒绝外部范围的召回。"""

@@ -98,6 +98,8 @@ def parse_proposal(result: Any, evidence: list[dict[str, Any]]) -> dict[str, Any
 def build_prompt(scope: str, evidence: list[dict[str,Any]], existing: dict[str,Any]) -> str:
     data=[{"id":e["id"],"speaker":e["actor_id"],"text":e["text"][:240]} for e in evidence[-24:]]
     known={
+        "actions":[{"kind":a["reason"],"outcome":a["outcome"],"user_feedback":a["user_feedback"]}
+                   for a in existing.get("actions",[])[:6]],
         "facts":[{"id":f["id"],"subject_id":f["subject_id"],"attribute":f["attribute"],
                   "value":f["value"],"status":f["status"]} for f in existing.get("facts",[])[:8]],
         "goals":[{"id":g["id"],"owner_id":g["owner_id"],"title":g["title"],

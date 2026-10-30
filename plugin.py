@@ -363,6 +363,8 @@ class MaiLivingWorld(MaiBotPlugin):
             event_id, _, target = self._pending_proactive.pop(sid)
             self._pending_memory.pop(event_id, None)
             self._feedback.finish(event_id, "interrupted")
+            if self._brain:
+                self._brain.record_result(event_id, "interrupted")
             if self._experience:
                 self._experience.mark(event_id, "interrupted")
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] 已收到用户新消息，主动任务归因终止 target=%s", target)
@@ -430,6 +432,10 @@ class MaiLivingWorld(MaiBotPlugin):
                                   feedback_hours=cfg.feedback_hours, active=cfg.mode == "active",
                                   negative_pause_hours=cfg.negative_pause_hours)
             if result:
+                if self._brain and self.config.brain_memory.enabled:
+                    matched=loop.latest_sent_event(owner,sid,feedback_hours=cfg.feedback_hours)
+                    if matched:
+                        self._brain.record_user_feedback(matched,result)
                 self.ctx.logger.info("[MaiLivingWorld][EXPERIENCE] 主人回复反馈=%s；不保留原文", result)
         return {"action": "continue"}
 
@@ -446,6 +452,8 @@ class MaiLivingWorld(MaiBotPlugin):
         event_id, created_at, target = pending
         if time.time() - created_at > 240:
             self._feedback.finish(event_id, "unknown")
+            if self._brain:
+                self._brain.record_result(event_id, "unknown")
             if self._experience:
                 self._experience.mark(event_id, "unknown")
             self._pending_proactive.pop(sid, None)
@@ -457,6 +465,8 @@ class MaiLivingWorld(MaiBotPlugin):
             if self._feedback.finish(event_id, "planner_stop",
                 base_backoff_minutes=cfg.stop_backoff_base_minutes,
                 max_backoff_minutes=max(cfg.stop_backoff_base_minutes, cfg.stop_backoff_max_minutes)):
+                if self._brain:
+                    self._brain.record_result(event_id, "planner_stop")
                 if self._experience:
                     self._experience.mark(event_id, "planner_stop")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择stop，未发送，已进入退避 target=%s", target)
@@ -464,6 +474,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._pending_memory.pop(event_id, None)
         elif outcome == "reply_planned":
             if self._feedback.finish(event_id, "reply_planned"):
+                if self._brain:
+                    self._brain.record_result(event_id, "reply_planned")
                 if self._experience:
                     self._experience.mark(event_id, "reply_planned")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择reply，等待发送回执 target=%s", target)
@@ -496,6 +508,8 @@ class MaiLivingWorld(MaiBotPlugin):
         is_sent = kwargs.get("sent") is True
         status = "send_confirmed" if is_sent else "send_failed"
         if self._feedback.finish(event_id, status):
+            if self._brain:
+                self._brain.record_result(event_id, status)
             if self._experience:
                 self._experience.mark(event_id, status)
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] %s target=%s", status, target)
@@ -858,6 +872,8 @@ class MaiLivingWorld(MaiBotPlugin):
                         self._feedback.expire_unfinished(now=now)
                         for sid, (eid, started, _) in list(self._pending_proactive.items()):
                             if now - started > 240:
+                                if self._brain:
+                                    self._brain.record_result(eid, "unknown", now=now)
                                 if self._experience:
                                     self._experience.mark(eid, "unknown", now=now)
                                 self._pending_proactive.pop(sid, None)
@@ -1277,6 +1293,13 @@ class MaiLivingWorld(MaiBotPlugin):
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None
         if event_id is not None:
+            if self._brain and self.config.brain_memory.enabled:
+                bcfg=self.config.brain_memory
+                memory_scope=("private:"+ident) if kind=="private" else ("group:"+ident)
+                private_allowed=(ident in _clean_ids(bcfg.private_users) or (
+                    bcfg.include_owner and self.config.owner.enabled and ident==normalize_qq(self.config.owner.qq)))
+                if (kind=="private" and private_allowed) or (kind=="group" and ident in _clean_ids(bcfg.group_ids)):
+                    self._brain.record_action(memory_scope,event_id,"explore" if story else "history",now=now)
             if experience:
                 experience.begin(event_id, ident, sid, "explore" if story else "history",
                                  str(story["key"] if story else topic), now=now)
@@ -1291,6 +1314,8 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._brain:
+                    self._brain.record_result(event_id, "rejected")
                 if self._experience:
                     self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)
@@ -1299,6 +1324,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if isinstance(result,dict) and result.get('success') is False:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._brain:
+                    self._brain.record_result(event_id, "rejected")
                 if self._experience:
                     self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)

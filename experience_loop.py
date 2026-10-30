@@ -194,6 +194,17 @@ class ExperienceLoop:
                 return False, "explicit_negative_cooldown"
         return True, "ok"
 
+    def latest_sent_event(self, owner_id: str, session_id: str, *, now: float | None = None,
+                          feedback_hours: int = 24) -> int | None:
+        """复用反馈模块同样的时间窗口，仅暴露内部关联的行动ID。"""
+        stamp=time.time() if now is None else now
+        row=self.con.execute("""SELECT event_id FROM experience_actions
+            WHERE owner_id=? AND session_id=? AND outcome='send_confirmed'
+              AND sent_at<=? AND sent_at>=?
+            ORDER BY sent_at DESC,event_id DESC LIMIT 1""",
+            (owner_id,session_id,stamp,stamp-max(1,min(feedback_hours,168))*3600)).fetchone()
+        return int(row[0]) if row else None
+
     def resume(self, owner_id: str) -> bool:
         """需要上层管理员显式确认；QQ 文本不能自动解除 opt-out。"""
         if not owner_id:

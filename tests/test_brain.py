@@ -44,6 +44,20 @@ class BrainBookTests(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
+    def test_action_result_and_explicit_feedback(self):
+        self.assertTrue(self.db.record_action(PRIVATE,42,"history",now=self.now))
+        self.assertFalse(self.db.record_action(PRIVATE,42,"history",now=self.now))
+        self.assertFalse(self.db.record_result(42,"send_confirmed",now=self.now+1))
+        self.assertTrue(self.db.record_result(42,"reply_planned",now=self.now+2))
+        self.assertTrue(self.db.record_result(42,"send_confirmed",now=self.now+3))
+        self.assertFalse(self.db.record_result(42,"planner_stop",now=self.now+4))
+        self.assertTrue(self.db.record_user_feedback(42,"negative"))
+        self.assertFalse(self.db.record_user_feedback(43,"positive"))
+        action=self.db.recall(PRIVATE)["actions"][0]
+        self.assertEqual(action["outcome"],"send_confirmed")
+        self.assertEqual(action["user_feedback"],"negative")
+        self.assertEqual(self.db.recall(GROUP_SCOPE)["actions"],[])
+
     def test_scope_validation(self):
         self.assertTrue(valid_scope(PRIVATE))
         self.assertTrue(valid_scope(GROUP_SCOPE))
@@ -77,6 +91,7 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(counts["progress"],1)
         self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"],"done")
         self.assertEqual(self.db.status(PRIVATE)["cycles"],2)
+        self.assertTrue(isinstance(self.db.recall(PRIVATE)["reflections"],list))
         self.assertEqual(self.db.status(GROUP_SCOPE)["events"],0)
 
     def test_conflict_requires_explicit_review(self):

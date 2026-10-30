@@ -77,6 +77,8 @@ event_limit = 200
 - `living_world_brain_decide_goal(scope,goal_id,decision="done|abandoned|reopen",confirm="REVIEW_BRAIN_GOAL")`
 - `living_world_brain_clear(scope,confirm="CLEAR_BRAIN_SCOPE")`
 
+**行为闭环联动**：若同时打开 `experience.enabled=true`，新账本按真实主动反馈事件 ID 关联行动、Planner/Host 结果与主人经验证的明确评价。后续反思能参考当前私聊范围的这些行动结果。未经确认发送的尝试不能拥有用户反馈；普通回复不代表好评。
+
 **局限**：LLM 给出证据 ID 只能证明对应消息存在，不能证明总结语义完全准确，先用 `observe` 人工检查；没做完整的跨群授权分享、自动网页验证、无限规划或底模微调。它在系统层面提供有限的记忆/认知循环，而不是人类意识。SQLite 文件需独立备份；若启用 MySQL 资讯后端仍不会转移此账本。
 
 ## 功能与边界
