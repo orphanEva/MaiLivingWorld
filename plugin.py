@@ -30,6 +30,8 @@ from .proactive_feedback import ProactiveFeedback, decision_from_items
 from .cognition import CognitiveStore, parse_cognition
 from .mind import MindStore, parse_reflection, evidence_from_messages
 from .experience_loop import ExperienceLoop
+from .brain_core import BrainBook, valid_scope
+from .brain_runtime import evidence_from_qq, parse_proposal, build_prompt, inject_brain_prompt
 
 
 class PluginSection(PluginConfigBase):
@@ -37,7 +39,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.7.0",
+        default="0.8.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -143,6 +145,27 @@ class Experience(PluginConfigBase):
     negative_pause_hours: int = Field(default=12, ge=1, le=72, description="active 下明确不感兴趣时暂停同类选题的小时数")
 
 
+class BrainMemory(PluginConfigBase):
+    """按 QQ 用户/群作用域隔离的情景记忆、事实、目标、反馈和元认知。"""
+    __ui_label__ = "09 / 可测试的记忆与认知闭环"
+    enabled: bool = Field(default=False, description="所有新认知模块的总开关，默认关闭")
+    mode: Literal["observe", "active"] = Field(default="observe", description="observe=只记录，active=在对应会话注入已核实记忆及目标")
+    auto_reflect: bool = Field(default=False, description="定时整理可信 QQ 文字证据，消耗少量模型 Token")
+    include_owner: bool = Field(default=True, description="允许已绑定 QQ 主人的私聊建立独立记忆（还需 owner.enabled）")
+    private_users: list[str] = Field(default_factory=list, description="额外允许记忆的私聊 QQ 用户白名单；不会自动私聊")
+    group_ids: list[str] = Field(default_factory=list, description="允许产生群公共记忆的 QQ 群白名单；默认空，不读其他群")
+    enable_events: bool = Field(default=False, description="模块一：生成带时间/来源的情景事件")
+    enable_facts: bool = Field(default=False, description="模块二：提炼、去重、审核并修正具体事实")
+    enable_goals: bool = Field(default=False, description="模块三：识别具体未完目标；不授予自动行动权限")
+    enable_progress: bool = Field(default=False, description="模块四：根据目标发起者的新证据更新目标完成状态")
+    enable_metacognition: bool = Field(default=False, description="模块五：记录短篇反思摘要，不保存思维链")
+    interval_hours: int = Field(default=12, ge=1, le=168, description="同作用域两次模型反思最短间隔")
+    min_messages: int = Field(default=4, ge=2, le=40, description="需有足够可信独立聊天证据后才反思")
+    history_limit: int = Field(default=40, ge=4, le=80, description="单次最多读取当前会话多少条消息")
+    max_scopes_per_check: int = Field(default=2, ge=1, le=10, description="每次后台检查最多处理几个作用域")
+    event_limit: int = Field(default=200, ge=20, le=2000, description="每作用域事件存储上限；不会因此删除事实和目标")
+
+
 class Memory(PluginConfigBase):
     __ui_label__ = "06 / 长期经历（A_Memorix）"
     enabled: bool = Field(default=False, description="仅在正式模式下自动保存外部公开见闻；需要主动配置 WebUI 导入桥")
@@ -175,6 +198,7 @@ class Config(PluginConfigBase):
     mind: Mind = Field(default_factory=Mind)
     cognition: Cognition = Field(default_factory=Cognition)
     experience: Experience = Field(default_factory=Experience)
+    brain_memory: BrainMemory = Field(default_factory=BrainMemory)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -216,6 +240,11 @@ class MaiLivingWorld(MaiBotPlugin):
         self._memory_inflight_keys: set[str] = set()
         self._feedback: ProactiveFeedback | None = None
         self._experience: ExperienceLoop | None = None
+        self._brain: BrainBook | None = None
+        self._last_brain_check = 0.0
+        self._brain_cursor = 0
+        self._brain_recent_private: dict[str,tuple[str,float]] = {}
+        self._brain_recent_group: dict[tuple[str,str],tuple[str,float]] = {}
         # 仅关联一次已提交的主动任务与当前会话，绝不跨聊天流归因。
         self._pending_proactive: dict[str, tuple[int, float, str]] = {}
         # 公开见闻仅在主动消息得到成功发送回执后写入记忆。
@@ -248,8 +277,10 @@ class MaiLivingWorld(MaiBotPlugin):
         self._feedback.expire_unfinished()
         if self.config.experience.enabled:
             self._ensure_experience()
+        if self.config.brain_memory.enabled:
+            self._ensure_brain()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.7.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.8.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -259,6 +290,8 @@ class MaiLivingWorld(MaiBotPlugin):
         # 新配置中的限频条件立即生效；旧任务不得误归因新发出的消息。
         self._pending_proactive.clear()
         self._pending_memory.clear()
+        self._brain_recent_private.clear()
+        self._brain_recent_group.clear()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
     async def _owner_session_id(self, sender):
@@ -330,10 +363,48 @@ class MaiLivingWorld(MaiBotPlugin):
             event_id, _, target = self._pending_proactive.pop(sid)
             self._pending_memory.pop(event_id, None)
             self._feedback.finish(event_id, "interrupted")
+            if self._brain:
+                self._brain.record_result(event_id, "interrupted")
             if self._experience:
                 self._experience.mark(event_id, "interrupted")
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] 已收到用户新消息，主动任务归因终止 target=%s", target)
         return {"action": "continue"}
+
+    def _brain_scope(self, sender: Any) -> str:
+        """来自真实 Host 结构化 QQ sender 的最小权限匹配。"""
+        cfg = self.config.brain_memory
+        if not self.config.plugin.enabled or not cfg.enabled or not sender or sender.platform != "qq":
+            return ""
+        if sender.kind == "group":
+            group_id = sender.target_id
+            return "group:" + group_id if group_id in _clean_ids(cfg.group_ids) else ""
+        owner = normalize_qq(self.config.owner.qq) if self.config.owner.enabled and cfg.include_owner else ""
+        uid = sender.user_id
+        if uid == owner or uid in _clean_ids(cfg.private_users):
+            return "private:" + uid
+        return ""
+
+    @HookHandler(
+        "chat.receive.after_process", name="living_world_brain_capture",
+        description="只记可信 QQ 会话作用域和消息ID，正文留在 Host 中供限频反思读取",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def capture_brain(self, message: Any = None, **kwargs):
+        del kwargs
+        sender = extract_sender(message)
+        scope = self._brain_scope(sender)
+        if not scope or not sender.message_id or not sender.stream_id:
+            return {"action":"continue"}
+        now = time.monotonic()
+        if sender.kind == "private":
+            self._brain_recent_private[sender.stream_id] = (scope,now)
+        else:
+            self._brain_recent_group[(sender.stream_id,sender.message_id)] = (scope,now)
+        if len(self._brain_recent_private)>200:
+            self._brain_recent_private = {k:v for k,v in self._brain_recent_private.items() if now-v[1]<120}
+        if len(self._brain_recent_group)>500:
+            self._brain_recent_group = {k:v for k,v in self._brain_recent_group.items() if now-v[1]<120}
+        return {"action":"continue"}
 
     @HookHandler(
         "chat.receive.after_process", name="living_world_owner_experience_feedback",
@@ -361,6 +432,10 @@ class MaiLivingWorld(MaiBotPlugin):
                                   feedback_hours=cfg.feedback_hours, active=cfg.mode == "active",
                                   negative_pause_hours=cfg.negative_pause_hours)
             if result:
+                if self._brain and self.config.brain_memory.enabled:
+                    matched=loop.latest_sent_event(owner,sid,feedback_hours=cfg.feedback_hours)
+                    if matched:
+                        self._brain.record_user_feedback(matched,result)
                 self.ctx.logger.info("[MaiLivingWorld][EXPERIENCE] 主人回复反馈=%s；不保留原文", result)
         return {"action": "continue"}
 
@@ -377,6 +452,8 @@ class MaiLivingWorld(MaiBotPlugin):
         event_id, created_at, target = pending
         if time.time() - created_at > 240:
             self._feedback.finish(event_id, "unknown")
+            if self._brain:
+                self._brain.record_result(event_id, "unknown")
             if self._experience:
                 self._experience.mark(event_id, "unknown")
             self._pending_proactive.pop(sid, None)
@@ -388,6 +465,8 @@ class MaiLivingWorld(MaiBotPlugin):
             if self._feedback.finish(event_id, "planner_stop",
                 base_backoff_minutes=cfg.stop_backoff_base_minutes,
                 max_backoff_minutes=max(cfg.stop_backoff_base_minutes, cfg.stop_backoff_max_minutes)):
+                if self._brain:
+                    self._brain.record_result(event_id, "planner_stop")
                 if self._experience:
                     self._experience.mark(event_id, "planner_stop")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择stop，未发送，已进入退避 target=%s", target)
@@ -395,6 +474,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._pending_memory.pop(event_id, None)
         elif outcome == "reply_planned":
             if self._feedback.finish(event_id, "reply_planned"):
+                if self._brain:
+                    self._brain.record_result(event_id, "reply_planned")
                 if self._experience:
                     self._experience.mark(event_id, "reply_planned")
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择reply，等待发送回执 target=%s", target)
@@ -427,6 +508,8 @@ class MaiLivingWorld(MaiBotPlugin):
         is_sent = kwargs.get("sent") is True
         status = "send_confirmed" if is_sent else "send_failed"
         if self._feedback.finish(event_id, status):
+            if self._brain:
+                self._brain.record_result(event_id, status)
             if self._experience:
                 self._experience.mark(event_id, status)
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] %s target=%s", status, target)
@@ -475,6 +558,48 @@ class MaiLivingWorld(MaiBotPlugin):
                 hint += "\n\n" + note
         return hint
 
+    def _brain_hint_for(self, kwargs: dict[str,Any]) -> str:
+        if not (self.config.plugin.enabled and self.config.brain_memory.enabled
+                and self.config.brain_memory.mode == "active" and self._brain):
+            return ""
+        sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        if not sid:
+            return ""
+        now = time.monotonic()
+        mid = str(kwargs.get("reply_message_id") or "").strip()
+        if mid:
+            hit = self._brain_recent_group.get((sid,mid))
+            if hit and now-hit[1]<=90:
+                return self._brain.hint(hit[0])
+            # 任意群消息不能通过最近一条私聊缓存获取记忆。
+            if (sid,mid) in self._brain_recent_group:
+                return ""
+        hit = self._brain_recent_private.get(sid)
+        return self._brain.hint(hit[0]) if hit and now-hit[1]<=90 else ""
+
+    @HookHandler(
+        "maisaka.planner.before_request", name="living_world_brain_planner_hint",
+        description="仅对近期验证过的私人会话注入独立范围的有效记忆",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def brain_planner_hint(self, **kwargs):
+        # Planner 只带 session_id；群聊必须有明确 reply_message_id，因此不在这里注入。
+        if kwargs.get("reply_message_id"):
+            return {"action":"continue"}
+        prompt = self._brain_hint_for(kwargs)
+        updated = inject_brain_prompt(kwargs,prompt) if prompt else None
+        return {"action":"continue","modified_kwargs":updated} if updated is not None else {"action":"continue"}
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request", name="living_world_brain_reply_hint",
+        description="只按同一条可核验的 QQ 群消息或私人会话检索已确认记忆",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def brain_reply_hint(self, **kwargs):
+        prompt = self._brain_hint_for(kwargs)
+        updated = inject_brain_prompt(kwargs,prompt) if prompt else None
+        return {"action":"continue","modified_kwargs":updated} if updated is not None else {"action":"continue"}
+
     @HookHandler(
         "maisaka.planner.before_request", name="living_world_owner_planner",
         description="仅对通过QQ身份核验的当前会话注入主人称呼提示",
@@ -511,6 +636,8 @@ class MaiLivingWorld(MaiBotPlugin):
                 pass
         self._owner_events.clear()
         self._owner_group_messages.clear()
+        self._brain_recent_private.clear()
+        self._brain_recent_group.clear()
         self._pending_proactive.clear()
         self._pending_memory.clear()
         # 退出后不能继续访问可能已关闭的 SQLite/MySQL 连接。
@@ -520,6 +647,9 @@ class MaiLivingWorld(MaiBotPlugin):
             await asyncio.gather(*self._memory_jobs, return_exceptions=True)
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
+        if self._brain:
+            self._brain.close()
+            self._brain = None
         if self._experience:
             self._experience.close()
             self._experience = None
@@ -561,6 +691,8 @@ class MaiLivingWorld(MaiBotPlugin):
             "cognition_auto_think": self.config.cognition.auto_think,
             "experience_enabled": self.config.experience.enabled,
             "experience_mode": self.config.experience.mode,
+            "brain_enabled": self.config.brain_memory.enabled,
+            "brain_mode": self.config.brain_memory.mode,
             "experience_summary": self._experience.status(normalize_qq(self.config.owner.qq)) if self._experience and normalize_qq(self.config.owner.qq) else {},
             "cognition_summary": self._cognition.summary() if self._cognition and self.config.cognition.enabled else {},
             "mind_note_count": len(self._mind.notes(normalize_qq(self.config.owner.qq))) if self._mind and normalize_qq(self.config.owner.qq) else 0,
@@ -581,6 +713,44 @@ class MaiLivingWorld(MaiBotPlugin):
                 ids.append(owner)
         targets = ["qq:private:"+x for x in ids] + ["qq:group:"+x for x in _clean_ids(self.config.audience.group_ids)]
         return {"ready": True, "targets": [self._feedback.status(t, day_start=day_start) for t in targets[:30]]}
+
+    def _ensure_brain(self) -> BrainBook | None:
+        if not (self.config.plugin.enabled and self.config.brain_memory.enabled):
+            return None
+        if self._brain is None:
+            self._brain = BrainBook(Path(self.ctx.paths.data_dir) / "brain_book.sqlite3")
+        return self._brain
+
+    @API("living_world_brain_status",description="管理员按明确作用域查看事件/事实/目标数量",public=False)
+    async def brain_status(self, scope: str = "") -> dict[str,Any]:
+        db=self._ensure_brain()
+        return db.status(scope) if db else {"ready":False}
+
+    @API("living_world_brain_recall",description="管理员按明确作用域查看证据摘要，绝不跨作用域",public=False)
+    async def brain_recall(self, scope: str = "") -> dict[str,Any]:
+        db=self._ensure_brain()
+        return db.recall(scope) if db else {"ready":False}
+
+    @API("living_world_brain_review_fact",description="管理员审核待确认或冲突事实",public=False)
+    async def brain_review_fact(self, scope: str = "", fact_id: str = "", decision: str = "", confirm: str = "") -> dict[str,Any]:
+        if confirm != "REVIEW_BRAIN_FACT":
+            return {"success":False,"reason":"需显式确认"}
+        db=self._ensure_brain()
+        return {"success":bool(db and db.review_fact(scope,fact_id,decision))}
+
+    @API("living_world_brain_decide_goal",description="管理员确认完成、取消或重开目标，不调用外部工具",public=False)
+    async def brain_decide_goal(self, scope: str = "", goal_id: str = "", decision: str = "", confirm: str = "") -> dict[str,Any]:
+        if confirm != "REVIEW_BRAIN_GOAL":
+            return {"success":False,"reason":"需显式确认"}
+        db=self._ensure_brain()
+        return {"success":bool(db and db.decide_goal(scope,goal_id,decision))}
+
+    @API("living_world_brain_clear",description="管理员按明确作用域清空此版新记忆，其他系统不变",public=False)
+    async def brain_clear(self, scope: str = "", confirm: str = "") -> dict[str,Any]:
+        if confirm != "CLEAR_BRAIN_SCOPE":
+            return {"success":False,"reason":"需显式确认"}
+        db=self._ensure_brain()
+        return {"success":bool(db and db.clear_scope(scope))}
 
     def _ensure_experience(self) -> ExperienceLoop | None:
         if not (self.config.plugin.enabled and self.config.experience.enabled):
@@ -702,10 +872,20 @@ class MaiLivingWorld(MaiBotPlugin):
                         self._feedback.expire_unfinished(now=now)
                         for sid, (eid, started, _) in list(self._pending_proactive.items()):
                             if now - started > 240:
+                                if self._brain:
+                                    self._brain.record_result(eid, "unknown", now=now)
                                 if self._experience:
                                     self._experience.mark(eid, "unknown", now=now)
                                 self._pending_proactive.pop(sid, None)
                                 self._pending_memory.pop(eid, None)
+                    if self.config.brain_memory.enabled and self.config.brain_memory.auto_reflect and now-self._last_brain_check >= 900:
+                        self._last_brain_check=now
+                        try:
+                            await self._reflect_brain()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.exception("[MaiLivingWorld][BRAIN] 自主认知循环失败，其他功能不受影响")
                     if self.config.mind.enabled and self.config.mind.auto_reflect and now-self._last_reflection_check >= 600:
                         self._last_reflection_check = now
                         try:
@@ -886,6 +1066,66 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning("[MaiLivingWorld][MIND] 模型反思失败：%s", type(exc).__name__)
 
+    async def _reflect_brain(self) -> None:
+        """限频、限作用域的事件整理—事实合并—目标进展—元认知闭环。"""
+        cfg=self.config.brain_memory
+        if not (self.config.plugin.enabled and cfg.enabled and cfg.auto_reflect):
+            return
+        db=self._ensure_brain()
+        if not db:
+            return
+        scopes: list[tuple[str,str]]=[]
+        private_ids=_clean_ids(cfg.private_users)
+        if cfg.include_owner and self.config.owner.enabled:
+            owner=normalize_qq(self.config.owner.qq)
+            if owner and owner not in private_ids:
+                private_ids.append(owner)
+        for uid in private_ids:
+            session=await self.ctx.chat.get_stream_by_user_id(uid, platform="qq")
+            sid=_stream_id(session)
+            if sid: scopes.append(("private:"+uid,sid))
+        for gid in _clean_ids(cfg.group_ids):
+            session=await self.ctx.chat.get_stream_by_group_id(gid)
+            sid=_stream_id(session)
+            if sid: scopes.append(("group:"+gid,sid))
+        if not scopes:
+            return
+        # 轮询遍历：多个群不能永远因为列表排在后面而得不到反思。
+        offset=self._brain_cursor%len(scopes)
+        ordered=scopes[offset:]+scopes[:offset]
+        self._brain_cursor=(offset+cfg.max_scopes_per_check)%len(scopes)
+        for scope,sid in ordered[:cfg.max_scopes_per_check]:
+            try:
+                raw=await self.ctx.message.get_recent(sid,limit=cfg.history_limit)
+                evidence=evidence_from_qq(raw,scope,sid,limit=cfg.history_limit)
+                if len(evidence)<cfg.min_messages:
+                    continue
+                signature=hashlib.sha256("|".join(e["digest"] for e in evidence).encode()).hexdigest()
+                now=time.time()
+                if not db.due(scope,signature,now=now,interval_hours=cfg.interval_hours):
+                    continue
+                db.mark_attempt(scope,now)
+                existing=db.recall(scope,limit=8)
+                prompt=build_prompt(scope,evidence,existing)
+                response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
+                                                    temperature=0.2,max_tokens=1300)
+                proposal=parse_proposal(response,evidence)
+                if proposal is None:
+                    self.ctx.logger.warning("[MaiLivingWorld][BRAIN] 反思JSON无效 scope=%s",scope)
+                    continue
+                for name,enabled in (("events",cfg.enable_events),("facts",cfg.enable_facts),
+                                     ("goals",cfg.enable_goals),("progress",cfg.enable_progress)):
+                    if not enabled: proposal[name]=[]
+                if not cfg.enable_metacognition:
+                    proposal["reflection"]=""
+                stats=db.apply(scope,signature,evidence,proposal,now=time.time(),event_limit=cfg.event_limit)
+                self.ctx.logger.info("[MaiLivingWorld][BRAIN] scope=%s 事件=%d 事实=%d 目标=%d 进展=%d",
+                                     scope,stats["events"],stats["facts"],stats["goals"],stats["progress"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.exception("[MaiLivingWorld][BRAIN] 单会话反思失败 scope=%s",scope)
+
     async def _scan(self):
         cfg=self.config.explorer
         if not self._store:
@@ -1041,6 +1281,11 @@ class MaiLivingWorld(MaiBotPlugin):
                     hint = mind.private_hint(ident, mode=self.config.mind.mode)
                     if hint:
                         intent += "\n\n" + hint
+        if (kind == "private" and self._brain and self.config.brain_memory.enabled
+                and self.config.brain_memory.mode == "active"):
+            hint=self._brain.hint("private:"+ident)
+            if hint:
+                intent += "\n\n" + hint
         if self.config.general.dry_run:
             self.ctx.logger.info("[MaiLivingWorld][DRY-RUN] 目标=%s 计划=%s 题目=%s",target,"explore" if story else "history",story['title'] if story else topic)
             return
@@ -1048,6 +1293,13 @@ class MaiLivingWorld(MaiBotPlugin):
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None
         if event_id is not None:
+            if self._brain and self.config.brain_memory.enabled:
+                bcfg=self.config.brain_memory
+                memory_scope=("private:"+ident) if kind=="private" else ("group:"+ident)
+                private_allowed=(ident in _clean_ids(bcfg.private_users) or (
+                    bcfg.include_owner and self.config.owner.enabled and ident==normalize_qq(self.config.owner.qq)))
+                if (kind=="private" and private_allowed) or (kind=="group" and ident in _clean_ids(bcfg.group_ids)):
+                    self._brain.record_action(memory_scope,event_id,"explore" if story else "history",now=now)
             if experience:
                 experience.begin(event_id, ident, sid, "explore" if story else "history",
                                  str(story["key"] if story else topic), now=now)
@@ -1062,6 +1314,8 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._brain:
+                    self._brain.record_result(event_id, "rejected")
                 if self._experience:
                     self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)
@@ -1070,6 +1324,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if isinstance(result,dict) and result.get('success') is False:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
+                if self._brain:
+                    self._brain.record_result(event_id, "rejected")
                 if self._experience:
                     self._experience.mark(event_id, "rejected")
                 self._pending_proactive.pop(sid,None)

@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "主人私聊的经验反馈闭环：主动行为、真实回执、明确评价和受限策略优化；保留原有记忆/认知模块",
+  "description": "带来源和作用域的情景记忆、事实巩固、目标管理、进展反馈与元认知；原有功能保持独立",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"
