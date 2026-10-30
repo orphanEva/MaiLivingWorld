@@ -154,7 +154,7 @@ class MindStore:
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL,
             target_key TEXT NOT NULL, reason TEXT NOT NULL,
             evidence_ids TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL, previous_status TEXT NOT NULL DEFAULT 'active'
           );
           CREATE TABLE IF NOT EXISTS mind_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL,
@@ -165,6 +165,9 @@ class MindStore:
         cols = {row[1] for row in self.con.execute('PRAGMA table_info(mind_notes)')}
         if 'status' not in cols:
             self.con.execute("ALTER TABLE mind_notes ADD COLUMN status TEXT NOT NULL DEFAULT 'legacy'")
+        review_cols = {row[1] for row in self.con.execute('PRAGMA table_info(mind_reviews)')}
+        if 'previous_status' not in review_cols:
+            self.con.execute("ALTER TABLE mind_reviews ADD COLUMN previous_status TEXT NOT NULL DEFAULT 'active'")
         self.con.commit()
 
     def close(self) -> None:
@@ -243,8 +246,8 @@ class MindStore:
                 exists=self.con.execute('SELECT 1 FROM mind_reviews WHERE owner_id=? AND target_key=? AND status="pending"',(owner,key)).fetchone()
                 if exists:
                     continue
-                self.con.execute('INSERT INTO mind_reviews(owner_id,target_key,reason,evidence_ids,status,created_at) VALUES(?,?,?,?,"pending",?)',
-                                 (owner,key,candidate['reason'],json.dumps(candidate['evidence_ids']),now))
+                self.con.execute('INSERT INTO mind_reviews(owner_id,target_key,reason,evidence_ids,status,created_at,previous_status) VALUES(?,?,?,?,"pending",?,?)',
+                                 (owner,key,candidate['reason'],json.dumps(candidate['evidence_ids']),now,hit[0]))
                 self.con.execute("UPDATE mind_notes SET status='disputed' WHERE owner_id=? AND note_key=?",(owner,key))
                 conflicts += 1
             self.con.execute('''DELETE FROM mind_notes WHERE owner_id=? AND note_key NOT IN
@@ -259,12 +262,14 @@ class MindStore:
         if decision not in ('approve','reject'):
             return False
         with self.con:
-            row=self.con.execute('SELECT target_key FROM mind_reviews WHERE owner_id=? AND id=? AND status="pending"',(owner,review_id)).fetchone()
+            row=self.con.execute('SELECT target_key,previous_status FROM mind_reviews WHERE owner_id=? AND id=? AND status="pending"',(owner,review_id)).fetchone()
             if row is None:
                 return False
-            key=row[0]
+            key, previous_status = row
             self._snapshot(owner,'review_'+decision,time.time())
-            status='rejected' if decision=='approve' else 'active'
+            # 拒绝冲突时仅恢复原状态，防止未验证的 pending 笔记绕过审核变为 active。
+            restored = previous_status if previous_status in ('active','pending') else 'pending'
+            status='rejected' if decision=='approve' else restored
             self.con.execute('UPDATE mind_notes SET status=? WHERE owner_id=? AND note_key=? AND status="disputed"',(status,owner,key))
             self.con.execute('UPDATE mind_reviews SET status=? WHERE id=? AND owner_id=?',(decision,review_id,owner))
         return True
