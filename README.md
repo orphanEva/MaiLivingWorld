@@ -1,6 +1,32 @@
-# MaiLivingWorld · 麦麦的小世界 v0.8.0（可信记忆与反思闭环）
+# MaiLivingWorld · 麦麦的小世界 v0.9.0（渐进记忆与动态认知）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+
+## v0.9.0 · 五分钟快速记忆、证据修正与目标进展
+
+在原有分作用域 SQLite 账本上进行**非破坏性迁移**：保留 v0.8.0 数据，无需清空 `brain_book.sqlite3`。
+
+- `brain_memory.quick_update = true` 开启额外的轻量周期，默认每五分钟只在当前作用域消息摘要变化后尝试一次；每分钟检查是否到期。**不会触发主动 QQ 发送**。
+- `brain_memory.interval_hours` 继续控制完整反思（含元认知）；两套模型限频独立，快速整理不会抢占小时级周期。
+- 明确事实的短中文字段（如「颜色＝蓝色」）、简短纠正消息现在能通过证据入口；已有事实仍须满足独立证据门槛。
+- 旧事实被否决或取代后，必须有至少两条新的本人证据才能重新成为待审核/冲突候选，管理员仍负责矛盾裁决；`brain_fact_revisions` 记录每次状态变化。
+- 对于内容相同、完成条件相同的一次性目标，防止仅仅改写标题造成重复条目；每年等周期目标独立维护。已存在的其他语义重复目标不会自动删除。
+- 事件读取 Host 提供的可信时间戳（含毫秒），缺少原始时间时保存 `happened=0` 表示未知，而不是错误地使用反思时间。
+- 管理端新增 `living_world_brain_quick_reflect(scope, confirm="RUN_BRAIN_QUICK")`，只允许已经授权的 QQ 会话、至少 60 秒冷却，不发送消息。
+- 日志按 `[BRAIN]`（深度）与 `[BRAIN-QUICK]`（快速）区分，记录有效证据数、未知时间条数和写入情况；调试日志展示跳过原因。
+
+**安全边界**：私人/群聊隔离、主人白名单、管理员复核、主动发送退避保持不变；这不是逐条消息立即推理，短期可能存在几分钟延迟。建议先在 `observe` 测试后切换 `active`。备份用户配置和独立 SQLite 数据再升级，尤其不要把真实 QQ 号提交至公共仓库。
+
+示例（其他开关沿用你的配置）：
+
+```toml
+[brain_memory]
+enabled = true
+auto_reflect = true
+quick_update = true
+quick_interval_minutes = 5
+interval_hours = 1
+```
 
 ## v0.7.0 · 事件→行动→回执→明确评价→策略调整（最小闭环）
 
@@ -108,7 +134,7 @@ SDK Runner 校验插件配置时必须存在 `[plugin]`，其中要有 `config_v
 ```toml
 [plugin]
 enabled = true
-config_version = "0.4.4"
+config_version = "0.9.0"
 
 [general]
 enabled = false
