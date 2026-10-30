@@ -32,11 +32,11 @@ def valid_scope(scope: str) -> bool:
     return prefix in {"private", "group", "public"} and ident.isascii() and ident.isdecimal() and 5 <= len(ident) <= 30
 
 
-def _short(value: Any, limit: int = MAX_TEXT) -> str:
+def _short(value: Any, limit: int = MAX_TEXT, *, min_length: int = 4) -> str:
     if not isinstance(value, str):
         return ""
     out = " ".join(value.split()).strip()
-    return out[:limit] if len(out) >= 4 else ""
+    return out[:limit] if len(out) >= min_length else ""
 
 
 class BrainBook:
@@ -215,8 +215,8 @@ class BrainBook:
     def _upsert_fact(self, scope: str, proposal: dict[str, Any],
                      evidence: dict[str, dict[str, Any]], now: float) -> bool:
         subject = str(proposal.get("subject_id") or "")
-        attr = _short(proposal.get("attribute"), 36)
-        value = _short(proposal.get("value"), 120)
+        attr = _short(proposal.get("attribute"), 36, min_length=1)
+        value = _short(proposal.get("value"), 120, min_length=1)
         ids = proposal.get("evidence_ids")
         confidence = proposal.get("confidence")
         if not attr or not value or not isinstance(ids,list) or type(confidence) not in (float,int):
@@ -266,8 +266,8 @@ class BrainBook:
 
     def _upsert_goal(self, scope: str, proposal: dict[str, Any],
                      evidence: dict[str, dict[str, Any]], now: float) -> bool:
-        title = _short(proposal.get("title"), 90)
-        criterion = _short(proposal.get("criterion"), 100)
+        title = _short(proposal.get("title"), 90, min_length=2)
+        criterion = _short(proposal.get("criterion"), 100, min_length=2)
         action = proposal.get("next_action")
         owner = str(proposal.get("owner_id") or "")
         ids = proposal.get("evidence_ids")
