@@ -145,7 +145,7 @@ class Experience(PluginConfigBase):
     negative_pause_hours: int = Field(default=12, ge=1, le=72, description="active 下明确不感兴趣时暂停同类选题的小时数")
 
 
-class Brain(PluginConfigBase):
+class BrainMemory(PluginConfigBase):
     """按 QQ 用户/群作用域隔离的情景记忆、事实、目标、反馈和元认知。"""
     __ui_label__ = "09 / 可测试的记忆与认知闭环"
     enabled: bool = Field(default=False, description="所有新认知模块的总开关，默认关闭")
@@ -198,7 +198,7 @@ class Config(PluginConfigBase):
     mind: Mind = Field(default_factory=Mind)
     cognition: Cognition = Field(default_factory=Cognition)
     experience: Experience = Field(default_factory=Experience)
-    brain: Brain = Field(default_factory=Brain)
+    brain_memory: BrainMemory = Field(default_factory=BrainMemory)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -277,7 +277,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._feedback.expire_unfinished()
         if self.config.experience.enabled:
             self._ensure_experience()
-        if self.config.brain.enabled:
+        if self.config.brain_memory.enabled:
             self._ensure_brain()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
         self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.8.0；storage=%s enabled=%s dry_run=%s",
@@ -370,7 +370,7 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _brain_scope(self, sender: Any) -> str:
         """来自真实 Host 结构化 QQ sender 的最小权限匹配。"""
-        cfg = self.config.brain
+        cfg = self.config.brain_memory
         if not self.config.plugin.enabled or not cfg.enabled or not sender or sender.platform != "qq":
             return ""
         if sender.kind == "group":
@@ -545,8 +545,8 @@ class MaiLivingWorld(MaiBotPlugin):
         return hint
 
     def _brain_hint_for(self, kwargs: dict[str,Any]) -> str:
-        if not (self.config.plugin.enabled and self.config.brain.enabled
-                and self.config.brain.mode == "active" and self._brain):
+        if not (self.config.plugin.enabled and self.config.brain_memory.enabled
+                and self.config.brain_memory.mode == "active" and self._brain):
             return ""
         sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
         if not sid:
@@ -677,8 +677,8 @@ class MaiLivingWorld(MaiBotPlugin):
             "cognition_auto_think": self.config.cognition.auto_think,
             "experience_enabled": self.config.experience.enabled,
             "experience_mode": self.config.experience.mode,
-            "brain_enabled": self.config.brain.enabled,
-            "brain_mode": self.config.brain.mode,
+            "brain_enabled": self.config.brain_memory.enabled,
+            "brain_mode": self.config.brain_memory.mode,
             "experience_summary": self._experience.status(normalize_qq(self.config.owner.qq)) if self._experience and normalize_qq(self.config.owner.qq) else {},
             "cognition_summary": self._cognition.summary() if self._cognition and self.config.cognition.enabled else {},
             "mind_note_count": len(self._mind.notes(normalize_qq(self.config.owner.qq))) if self._mind and normalize_qq(self.config.owner.qq) else 0,
@@ -701,7 +701,7 @@ class MaiLivingWorld(MaiBotPlugin):
         return {"ready": True, "targets": [self._feedback.status(t, day_start=day_start) for t in targets[:30]]}
 
     def _ensure_brain(self) -> BrainBook | None:
-        if not (self.config.plugin.enabled and self.config.brain.enabled):
+        if not (self.config.plugin.enabled and self.config.brain_memory.enabled):
             return None
         if self._brain is None:
             self._brain = BrainBook(Path(self.ctx.paths.data_dir) / "brain_book.sqlite3")
@@ -862,7 +862,7 @@ class MaiLivingWorld(MaiBotPlugin):
                                     self._experience.mark(eid, "unknown", now=now)
                                 self._pending_proactive.pop(sid, None)
                                 self._pending_memory.pop(eid, None)
-                    if self.config.brain.enabled and self.config.brain.auto_reflect and now-self._last_brain_check >= 900:
+                    if self.config.brain_memory.enabled and self.config.brain_memory.auto_reflect and now-self._last_brain_check >= 900:
                         self._last_brain_check=now
                         try:
                             await self._reflect_brain()
@@ -962,7 +962,7 @@ class MaiLivingWorld(MaiBotPlugin):
         )
         try:
             result = await self.ctx.llm.generate(
-                prompt, task_name=self.config.brain.model_task, temperature=0.2, max_tokens=1000)
+                prompt, task_name=self.config.brain_memory.model_task, temperature=0.2, max_tokens=1000)
             parsed = parse_cognition(result, sources, existing, new_limit=cfg.max_new_per_cycle)
             if parsed is None:
                 store.failed(cycle)
@@ -1034,7 +1034,7 @@ class MaiLivingWorld(MaiBotPlugin):
             + "\n<引用的私聊消息>\n" + labeled[-10000:] + "\n</引用的私聊消息>"
         )
         try:
-            result = await self.ctx.llm.generate(prompt, task_name=self.config.brain.model_task,
+            result = await self.ctx.llm.generate(prompt, task_name=self.config.brain_memory.model_task,
                                                  temperature=0.2, max_tokens=900)
             raw = extract_text(result).strip()
             if not raw.startswith("{") or not raw.endswith("}"):
@@ -1052,7 +1052,7 @@ class MaiLivingWorld(MaiBotPlugin):
 
     async def _reflect_brain(self) -> None:
         """限频、限作用域的事件整理—事实合并—目标进展—元认知闭环。"""
-        cfg=self.config.brain
+        cfg=self.config.brain_memory
         if not (self.config.plugin.enabled and cfg.enabled and cfg.auto_reflect):
             return
         db=self._ensure_brain()
@@ -1091,7 +1091,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 db.mark_attempt(scope,now)
                 existing=db.recall(scope,limit=8)
                 prompt=build_prompt(scope,evidence,existing)
-                response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
+                response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,
                                                     temperature=0.2,max_tokens=1300)
                 proposal=parse_proposal(response,evidence)
                 if proposal is None:
@@ -1265,8 +1265,8 @@ class MaiLivingWorld(MaiBotPlugin):
                     hint = mind.private_hint(ident, mode=self.config.mind.mode)
                     if hint:
                         intent += "\n\n" + hint
-        if (kind == "private" and self._brain and self.config.brain.enabled
-                and self.config.brain.mode == "active"):
+        if (kind == "private" and self._brain and self.config.brain_memory.enabled
+                and self.config.brain_memory.mode == "active"):
             hint=self._brain.hint("private:"+ident)
             if hint:
                 intent += "\n\n" + hint
@@ -1339,7 +1339,7 @@ class MaiLivingWorld(MaiBotPlugin):
             json.dumps([{"key":x['key'],"source":x['source'],"title":x['title'],"summary":x['summary'][:180]} for x in raw],ensure_ascii=False)
         )
         try:
-            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,temperature=0.3,max_tokens=180)
+            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,temperature=0.3,max_tokens=180)
             chosen=choose_story(response,[Story(x['key'],x['source'],x['title'],x['url'],x['summary'],x['published_at']) for x in raw])
             if not chosen:
                 return None
@@ -1359,7 +1359,7 @@ class MaiLivingWorld(MaiBotPlugin):
             '同意 {"reach_out":true,"topic":"50字以内的具体话题"}。\n'+history
         )
         try:
-            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,temperature=0.2,max_tokens=180)
+            response=await self.ctx.llm.generate(prompt,task_name=self.config.brain_memory.model_task,temperature=0.2,max_tokens=180)
             yes,topic=parse_decision(response)
             return topic if yes else None
         except asyncio.CancelledError:

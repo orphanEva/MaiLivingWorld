@@ -167,11 +167,11 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config=plugin.Config()
         self.bot.config.owner.enabled=True
         self.bot.config.owner.qq=OWNER
-        self.bot.config.brain.enabled=True
-        self.bot.config.brain.auto_reflect=True
-        self.bot.config.brain.enable_events=True
-        self.bot.config.brain.enable_facts=False
-        self.bot.config.brain.min_messages=4
+        self.bot.config.brain_memory.enabled=True
+        self.bot.config.brain_memory.auto_reflect=True
+        self.bot.config.brain_memory.enable_events=True
+        self.bot.config.brain_memory.enable_facts=False
+        self.bot.config.brain_memory.min_messages=4
 
     async def asyncTearDown(self):
         if self.bot._brain:
@@ -196,9 +196,9 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.ctx.llm.generate.await_count,1)
 
     async def test_group_memory_injection_only_for_exact_reply_id(self):
-        self.bot.config.brain.group_ids=[GROUP]
-        self.bot.config.brain.mode="active"
-        self.bot.config.brain.enable_facts=True
+        self.bot.config.brain_memory.group_ids=[GROUP]
+        self.bot.config.brain_memory.mode="active"
+        self.bot.config.brain_memory.enable_facts=True
         db=self.bot._ensure_brain()
         db.apply(GROUP_SCOPE,"grp-hash",[entry("E1",who=OTHER),entry("E2",who=OTHER)],{
             "facts":[{"subject_id":OTHER,"attribute":"preferred_learning_method",
@@ -219,13 +219,13 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_default_is_off(self):
         cfg=plugin.Config()
-        self.assertFalse(cfg.brain.enabled)
-        self.assertFalse(cfg.brain.auto_reflect)
-        self.assertFalse(cfg.brain.enable_events)
-        self.assertFalse(cfg.brain.enable_facts)
-        self.assertFalse(cfg.brain.enable_goals)
-        self.assertFalse(cfg.brain.enable_progress)
-        self.assertFalse(cfg.brain.enable_metacognition)
+        self.assertFalse(cfg.brain_memory.enabled)
+        self.assertFalse(cfg.brain_memory.auto_reflect)
+        self.assertFalse(cfg.brain_memory.enable_events)
+        self.assertFalse(cfg.brain_memory.enable_facts)
+        self.assertFalse(cfg.brain_memory.enable_goals)
+        self.assertFalse(cfg.brain_memory.enable_progress)
+        self.assertFalse(cfg.brain_memory.enable_metacognition)
 
 
 if __name__ == "__main__":
