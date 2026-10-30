@@ -53,7 +53,9 @@ class BrainBook:
         CREATE TABLE IF NOT EXISTS brain_runs (
           scope TEXT PRIMARY KEY, history_hash TEXT NOT NULL DEFAULT '',
           last_attempt REAL NOT NULL DEFAULT 0, last_success REAL NOT NULL DEFAULT 0,
-          cycle_count INTEGER NOT NULL DEFAULT 0
+          cycle_count INTEGER NOT NULL DEFAULT 0,
+          quick_hash TEXT NOT NULL DEFAULT '', quick_last_attempt REAL NOT NULL DEFAULT 0,
+          quick_last_success REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS brain_events (
           id TEXT PRIMARY KEY, scope TEXT NOT NULL, actor_id TEXT NOT NULL,
@@ -104,8 +106,17 @@ class BrainBook:
           id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
           source_count INTEGER NOT NULL, added_events INTEGER NOT NULL,
           added_facts INTEGER NOT NULL, updated_goals INTEGER NOT NULL,
-          reflection TEXT NOT NULL, created REAL NOT NULL
+          reflection TEXT NOT NULL, created REAL NOT NULL,
+          cycle_kind TEXT NOT NULL DEFAULT 'deep'
         );
+        CREATE TABLE IF NOT EXISTS brain_fact_revisions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, fact_id TEXT NOT NULL,
+          before_status TEXT NOT NULL, after_status TEXT NOT NULL,
+          reason TEXT NOT NULL, changed REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_brain_fact_revisions_scope
+          ON brain_fact_revisions(scope,fact_id,id DESC);
+        
         """)
         columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_decisions)")}
         if "feedback_event_id" not in columns:
@@ -113,6 +124,20 @@ class BrainBook:
             self.con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_decision_feedback ON brain_decisions(feedback_event_id)")
         if "user_feedback" not in columns:
             self.con.execute("ALTER TABLE brain_decisions ADD COLUMN user_feedback TEXT NOT NULL DEFAULT 'unrated'")
+        run_columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_runs)")}
+        for col, ddl in (
+            ("quick_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("quick_last_attempt", "REAL NOT NULL DEFAULT 0"),
+            ("quick_last_success", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if col not in run_columns:
+                self.con.execute(f"ALTER TABLE brain_runs ADD COLUMN {col} {ddl}")
+        fact_columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_facts)")}
+        if "reviewed_count" not in fact_columns:
+            self.con.execute("ALTER TABLE brain_facts ADD COLUMN reviewed_count INTEGER NOT NULL DEFAULT 0")
+        cycle_columns = {x["name"] for x in self.con.execute("PRAGMA table_info(brain_cycles)")}
+        if "cycle_kind" not in cycle_columns:
+            self.con.execute("ALTER TABLE brain_cycles ADD COLUMN cycle_kind TEXT NOT NULL DEFAULT 'deep'")
         self.con.commit()
 
     def close(self) -> None:
@@ -123,6 +148,33 @@ class BrainBook:
             return False
         row = self.con.execute("SELECT history_hash,last_attempt FROM brain_runs WHERE scope=?", (scope,)).fetchone()
         return not row or (row["history_hash"] != digest and now - row["last_attempt"] >= max(1, interval_hours) * 3600)
+
+    def quick_due(self, scope: str, digest: str, *, now: float, interval_minutes: int = 5) -> tuple[bool,str]:
+        """单独限频的轻量记忆更新，不影响深度反思的时间基准。"""
+        if not valid_scope(scope) or not digest:
+            return False, "invalid_scope_or_empty"
+        row = self.con.execute(
+            "SELECT quick_hash,quick_last_attempt FROM brain_runs WHERE scope=?", (scope,)
+        ).fetchone()
+        if row and row["quick_hash"] == digest:
+            return False, "unchanged"
+        if row and now-row["quick_last_attempt"] < max(1,interval_minutes)*60:
+            return False, "cooldown"
+        return True, "ready"
+
+    def mark_quick_attempt(self, scope: str, now: float) -> None:
+        if not valid_scope(scope):
+            return
+        with self.con:
+            self.con.execute("""INSERT INTO brain_runs(scope,quick_last_attempt) VALUES (?,?)
+                ON CONFLICT(scope) DO UPDATE SET quick_last_attempt=excluded.quick_last_attempt""",(scope,now))
+
+    def _fact_revision(self, scope: str, fact_id: str, before: str, after: str,
+                       reason: str, now: float) -> None:
+        if before != after:
+            self.con.execute("""INSERT INTO brain_fact_revisions
+                (scope,fact_id,before_status,after_status,reason,changed)
+                VALUES (?,?,?,?,?,?)""",(scope,fact_id,before,after,reason,now))
 
     def mark_attempt(self, scope: str, now: float) -> None:
         if not valid_scope(scope):
@@ -148,11 +200,14 @@ class BrainBook:
         if type(importance) is not int or not 1 <= importance <= 5:
             return False
         marker = sorted({x["digest"] for x in used})
+        # Host 未提供可信消息时间时保留 0（未知），不能错记成反思执行时间。
+        timestamps = [x["timestamp"] for x in used
+                      if isinstance(x.get("timestamp"),(int,float)) and x["timestamp"] > 0]
         eid = "E" + _hash(scope + "\0" + actor + "\0" + kind + "\0" + summary.casefold())[:24]
         cur = self.con.execute("""INSERT OR IGNORE INTO brain_events
           (id,scope,actor_id,kind,summary,importance,happened,created)
           VALUES (?,?,?,?,?,?,?,?)""",
-          (eid,scope,actor,kind,summary,importance,min(x["timestamp"] for x in used),now))
+          (eid,scope,actor,kind,summary,importance,min(timestamps) if timestamps else 0.0,now))
         for ref in marker:
             self.con.execute("INSERT OR IGNORE INTO brain_event_evidence VALUES (?,?)",(eid,ref))
         return bool(cur.rowcount)
@@ -181,20 +236,32 @@ class BrainBook:
             self.con.execute("INSERT OR IGNORE INTO brain_fact_evidence VALUES (?,?)",(fid,item["digest"]))
         count = self.con.execute("SELECT COUNT(*) FROM brain_fact_evidence WHERE fact_id=?",(fid,)).fetchone()[0]
         row = self.con.execute("SELECT status FROM brain_facts WHERE id=?",(fid,)).fetchone()
-        if row["status"] in {"superseded","rejected"}:
+        previous = row["status"]
+        archived = previous in {"superseded", "rejected"}
+        reviewed = self.con.execute("SELECT reviewed_count FROM brain_facts WHERE id=?",(fid,)).fetchone()[0]
+        # 已否决/被取代的结论可以凭两条*新增*本人证据重新申请复核；
+        # 旧有证据不算第二次支持，旧记录也不会被抹掉。
+        if archived and count - reviewed < 2:
+            self.con.execute("UPDATE brain_facts SET seen_count=? WHERE id=?",(count,fid))
             return False
         other = self.con.execute("""SELECT id FROM brain_facts WHERE scope=? AND subject_id=?
           AND attribute=? AND value!=? AND status='active' LIMIT 1""",
           (scope,subject,attr,value)).fetchone()
         # 两条独立用户消息支持才能自动升格；与已生效事实矛盾时双方冻结，人工裁决。
         state = "disputed" if other and count >= 2 else ("active" if count >= 2 and confidence >= .9 else "pending")
-        if row["status"] == "active" and state != "disputed":
+        if archived:
+            # 重新出现的旧意见先进入待审，不能悄悄取代当前有效意见。
+            state = "disputed" if other else "pending"
+        elif previous == "active" and state != "disputed":
             state = "active"
         self.con.execute("""UPDATE brain_facts SET status=?,confidence=MAX(confidence,?),
           seen_count=?,updated=? WHERE id=?""",
           (state,float(confidence),count,now,fid))
+        self._fact_revision(scope,fid,previous,state,"new_evidence",now)
         if state == "disputed" and other:
+            other_row=self.con.execute("SELECT status FROM brain_facts WHERE id=?",(other["id"],)).fetchone()
             self.con.execute("UPDATE brain_facts SET status='disputed' WHERE id=?",(other["id"],))
+            self._fact_revision(scope,other["id"],other_row["status"],"disputed","conflicting_evidence",now)
         return True
 
     def _upsert_goal(self, scope: str, proposal: dict[str, Any],
@@ -210,6 +277,16 @@ class BrainBook:
         if not owner or not used:
             return False
         gid = "G" + _hash(scope+"\0"+owner+"\0"+title.casefold())[:24]
+        # 标题改写但完成条件完全相同时去重；周期性承诺与一次性任务不能合并。
+        recurring = any(x in title for x in ("每年","每月","每周","每次","长期"))
+        for previous in self.con.execute(
+            "SELECT id,title,criterion FROM brain_goals WHERE scope=? AND owner_id=? AND status='open'",
+            (scope,owner)):
+            other_recurring=any(x in previous["title"] for x in ("每年","每月","每周","每次","长期"))
+            if (previous["criterion"].strip().casefold()==criterion.casefold()
+                    and recurring==other_recurring):
+                gid=previous["id"]
+                break
         cur = self.con.execute("""INSERT OR IGNORE INTO brain_goals
           (id,scope,owner_id,title,criterion,next_action,created,updated)
           VALUES (?,?,?,?,?,?,?,?)""",(gid,scope,owner,title,criterion,action,now,now))
@@ -244,7 +321,8 @@ class BrainBook:
         return True
 
     def apply(self, scope: str, history_hash: str, evidence: list[dict[str,Any]],
-              response: dict[str,Any], *, now: float, event_limit: int = 200) -> dict[str,int]:
+              response: dict[str,Any], *, now: float, event_limit: int = 200,
+              quick: bool = False) -> dict[str,int]:
         if not valid_scope(scope) or not isinstance(response,dict):
             return {"events":0,"facts":0,"goals":0,"progress":0}
         lookup={str(x["id"]):x for x in evidence if isinstance(x,dict) and
@@ -265,13 +343,20 @@ class BrainBook:
                     output["progress"]+=1
             reflection = _short(response.get("reflection"),200)
             self.con.execute("""INSERT INTO brain_cycles
-                (scope,source_count,added_events,added_facts,updated_goals,reflection,created)
-                VALUES (?,?,?,?,?,?,?)""",
-                (scope,len(lookup),output["events"],output["facts"],output["goals"]+output["progress"],reflection,now))
-            self.con.execute("""INSERT INTO brain_runs(scope,history_hash,last_attempt,last_success,cycle_count)
-                VALUES (?,?,?,?,1) ON CONFLICT(scope) DO UPDATE SET
-                history_hash=excluded.history_hash,last_success=excluded.last_success,
-                cycle_count=cycle_count+1""",(scope,history_hash,now,now))
+                (scope,source_count,added_events,added_facts,updated_goals,reflection,created,cycle_kind)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (scope,len(lookup),output["events"],output["facts"],output["goals"]+output["progress"],
+                 reflection,now,"quick" if quick else "deep"))
+            if quick:
+                self.con.execute("""INSERT INTO brain_runs(scope,quick_hash,quick_last_success)
+                    VALUES (?,?,?) ON CONFLICT(scope) DO UPDATE SET
+                    quick_hash=excluded.quick_hash,quick_last_success=excluded.quick_last_success""",
+                    (scope,history_hash,now))
+            else:
+                self.con.execute("""INSERT INTO brain_runs(scope,history_hash,last_attempt,last_success,cycle_count)
+                    VALUES (?,?,?,?,1) ON CONFLICT(scope) DO UPDATE SET
+                    history_hash=excluded.history_hash,last_success=excluded.last_success,
+                    cycle_count=cycle_count+1""",(scope,history_hash,now,now))
             # 限制每个作用域保留事件数量；事实和目标不会被此处误删。
             self.con.execute("""DELETE FROM brain_events WHERE scope=? AND id NOT IN
                (SELECT id FROM brain_events WHERE scope=? ORDER BY happened DESC LIMIT ?)""",
@@ -344,7 +429,7 @@ class BrainBook:
             "facts":rows("SELECT id,subject_id,attribute,value,confidence,status,seen_count,updated FROM brain_facts WHERE scope=? ORDER BY updated DESC LIMIT ?"),
             "goals":rows("SELECT id,owner_id,title,criterion,next_action,status,revision FROM brain_goals WHERE scope=? ORDER BY updated DESC LIMIT ?"),
             "actions":rows("SELECT feedback_event_id,action,reason,outcome,user_feedback,recorded,finished FROM brain_decisions WHERE scope=? ORDER BY id DESC LIMIT ?"),
-            "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
+            "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created,cycle_kind FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
 
     def hint(self, scope: str, *, limit: int = 5) -> str:
         """只有当前作用域的已生效事实和待办；拒绝外部范围的召回。"""
@@ -371,18 +456,28 @@ class BrainBook:
                                  (scope,fact_id)).fetchone()
             if row is None or row["status"] not in {"pending","disputed"}:
                 return False
+            now=time.time()
             if decision=="approve":
-                self.con.execute("""UPDATE brain_facts SET status='superseded',valid_until=?
+                others=self.con.execute("""SELECT id,status FROM brain_facts
                     WHERE scope=? AND subject_id=? AND attribute=? AND id!=?
                     AND status IN ('active','disputed')""",
-                    (time.time(),scope,row["subject_id"],row["attribute"],fact_id))
-                self.con.execute("UPDATE brain_facts SET status='active' WHERE id=?",(fact_id,))
+                    (scope,row["subject_id"],row["attribute"],fact_id)).fetchall()
+                for previous in others:
+                    self.con.execute("""UPDATE brain_facts SET status='superseded',valid_until=?,
+                        reviewed_count=seen_count WHERE id=?""",(now,previous["id"]))
+                    self._fact_revision(scope,previous["id"],previous["status"],"superseded","review_approve",now)
+                self.con.execute("UPDATE brain_facts SET status='active',valid_until=NULL WHERE id=?",(fact_id,))
+                self._fact_revision(scope,fact_id,row["status"],"active","review_approve",now)
             else:
-                self.con.execute("UPDATE brain_facts SET status='rejected' WHERE id=?",(fact_id,))
-                self.con.execute("""UPDATE brain_facts SET status='active' WHERE id IN
-                  (SELECT id FROM brain_facts WHERE scope=? AND subject_id=? AND attribute=?
-                   AND status='disputed' ORDER BY created LIMIT 1)""",
-                  (scope,row["subject_id"],row["attribute"]))
+                self.con.execute("""UPDATE brain_facts SET status='rejected',valid_until=?,
+                    reviewed_count=seen_count WHERE id=?""",(now,fact_id))
+                self._fact_revision(scope,fact_id,row["status"],"rejected","review_reject",now)
+                others=self.con.execute("""SELECT id,status FROM brain_facts
+                    WHERE scope=? AND subject_id=? AND attribute=? AND status='disputed'
+                    ORDER BY created LIMIT 1""",(scope,row["subject_id"],row["attribute"])).fetchall()
+                for previous in others:
+                    self.con.execute("UPDATE brain_facts SET status='active',valid_until=NULL WHERE id=?",(previous["id"],))
+                    self._fact_revision(scope,previous["id"],"disputed","active","review_reject",now)
         return True
 
     def decide_goal(self, scope: str, goal_id: str, decision: str) -> bool:
@@ -408,6 +503,6 @@ class BrainBook:
                         "brain_goal_events":"brain_goals"}[table]
                 col={"brain_event_evidence":"event_id","brain_fact_evidence":"fact_id","brain_goal_events":"goal_id"}[table]
                 self.con.execute(f"DELETE FROM {table} WHERE {col} IN (SELECT id FROM {parent} WHERE scope=?)",(scope,))
-            for table in ("brain_events","brain_facts","brain_goals","brain_decisions","brain_cycles","brain_runs"):
+            for table in ("brain_events","brain_facts","brain_fact_revisions","brain_goals","brain_decisions","brain_cycles","brain_runs"):
                 self.con.execute(f"DELETE FROM {table} WHERE scope=?",(scope,))
         return True
