@@ -135,6 +135,27 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(self.db.status(GROUP_SCOPE)["facts"],0)
         self.assertEqual(self.db.status(GROUP_SCOPE)["goals"],0)
 
+    def test_existing_v08_archived_fact_does_not_reuse_old_evidence(self):
+        import sqlite3
+        old_path=Path(self.tmp.name)/"existing_v08.sqlite3"
+        legacy=sqlite3.connect(old_path)
+        legacy.execute("""CREATE TABLE brain_facts (
+            id TEXT PRIMARY KEY, scope TEXT NOT NULL, subject_id TEXT NOT NULL,
+            attribute TEXT NOT NULL, value TEXT NOT NULL, confidence REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', seen_count INTEGER NOT NULL DEFAULT 0,
+            created REAL NOT NULL, updated REAL NOT NULL, valid_until REAL)""")
+        legacy.execute("""INSERT INTO brain_facts VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            ("Flegacy",PRIVATE,OWNER,"偏好","蓝色",.93,"superseded",2,self.now,self.now,self.now))
+        legacy.commit()
+        legacy.close()
+        migrated=BrainBook(old_path)
+        row=migrated.con.execute(
+            "SELECT status,seen_count,reviewed_count FROM brain_facts WHERE id='Flegacy'"
+        ).fetchone()
+        self.assertEqual((row["status"],row["seen_count"],row["reviewed_count"]),
+                         ("superseded",2,2))
+        migrated.close()
+
     def test_quick_update_has_independent_cooldown(self):
         self.assertEqual(self.db.quick_due(PRIVATE,"quick-a",now=self.now), (True,"ready"))
         self.db.mark_quick_attempt(PRIVATE,self.now)
