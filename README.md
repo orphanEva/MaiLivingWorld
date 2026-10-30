@@ -1,4 +1,4 @@
-# MaiLivingWorld · 麦麦的小世界 v0.7.0（可信记忆与反思闭环）
+# MaiLivingWorld · 麦麦的小世界 v0.8.0（可信记忆与反思闭环）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
 
@@ -30,6 +30,54 @@ negative_pause_hours = 12
 新增仅管理员可调用的内部 API：`living_world_experience_status()` 查看状态，`living_world_experience_resume(confirm="RESUME_OWNER_PROACTIVE")` 解除主人拒绝主动联系。
 
 **边界**：这是可运行的主动联系行为反馈**小闭环**，不是完整自主认知。长期目标规划、跨人物记忆、开放式反馈语义判断及事实观点修正尚待后续。MaiBot 现有 Hook 没有端到端 task_id/message_id 强关联，复杂并发下仍不能保证百分百归因。该数据库固定为本地 SQLite，切换资讯存储为 MySQL 时仍需备份。
+
+## v0.8.0 · 情景记忆、可信事实、目标、进展与元认知（按模块逐项测试）
+
+新增独立 `brain_book.sqlite3`，**不覆盖**既有 `experience_loop.sqlite3`、私人 `mind.sqlite3` 或 MaiBot `A_Memorix`。参考 Hindsight/A-MEM 的概念，完全独立实现（不复制 AGPL 源码）。默认全部关闭。
+
+- **模块一：情景记忆**：当前 QQ 会话结构化消息，生成带人物、事件时间、摘要和证据哈希的记忆，不保存完整原文。
+- **模块二：事实、关系与巩固**：作用域内的主体-属性-值；两个独立证据且置信度达到阈值才激活，矛盾先冻结并供管理员审核，保留被取代的旧事实。
+- **模块三：目标与计划**：用户明确表达的未完目标、完成条件与 `next_action`；不执行外部工具。
+- **模块四：进展闭环**：必须有目标发起者的新证据才可标记完成/放弃；管理员可显式复核。
+- **模块五：元认知复盘**：记录有边界的反思摘要与每轮更新计数，不持久化隐藏思维链。
+- **模块六：可用记忆与反馈**：`brain.mode="active"` 才向身份/会话核验通过的提示词注入当前作用域的有效事实、待办；主动行为的真实发送评价仍由 v0.7 的经验模块处理，不会增加主动次数。
+
+**隔离**：只允许显式配置的 QQ 私聊与群聊；`private:QQ号`、`group:群号` 独立。某群的记忆不进入任何人私聊，也不跨群共享。同一用户在群中和私聊的内容不会无审核合并。
+
+### 按顺序开启测试
+
+保留其他配置，只修改以下配置字段：
+
+```toml
+[brain]
+enabled = true
+mode = "observe"
+auto_reflect = true
+include_owner = true
+private_users = []
+group_ids = []
+enable_events = true          # ① 情景事件
+enable_facts = false          # ② 事实巩固
+enable_goals = false          # ③ 未完目标
+enable_progress = false       # ④ 完成与修正
+enable_metacognition = false  # ⑤ 元认知摘要
+interval_hours = 12
+min_messages = 4
+history_limit = 40
+max_scopes_per_check = 2
+event_limit = 200
+```
+
+先观察事件，再逐一开启 `enable_facts`、`enable_goals`、`enable_progress`、`enable_metacognition`。需开启 `owner.enabled` 并绑定 `owner.qq` 才会自动包含主人私聊。其他用户必须加入 `private_users`；群聊必须在 `group_ids`。**不必打开 `general.enabled` 来运行后台记忆反思**。同时启用旧 `mind.auto_reflect` 会增加模型开销，初期建议只测一个。
+
+仅管理端内部 API（`public=False`，仍需宿主访问控制）：
+- `living_world_brain_status(scope="private:QQ号")`
+- `living_world_brain_recall(scope="group:群号")`
+- `living_world_brain_review_fact(scope,fact_id,decision="approve|reject",confirm="REVIEW_BRAIN_FACT")`
+- `living_world_brain_decide_goal(scope,goal_id,decision="done|abandoned|reopen",confirm="REVIEW_BRAIN_GOAL")`
+- `living_world_brain_clear(scope,confirm="CLEAR_BRAIN_SCOPE")`
+
+**局限**：LLM 给出证据 ID 只能证明对应消息存在，不能证明总结语义完全准确，先用 `observe` 人工检查；没做完整的跨群授权分享、自动网页验证、无限规划或底模微调。它在系统层面提供有限的记忆/认知循环，而不是人类意识。SQLite 文件需独立备份；若启用 MySQL 资讯后端仍不会转移此账本。
 
 ## 功能与边界
 
