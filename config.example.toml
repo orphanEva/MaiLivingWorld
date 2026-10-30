@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.6.0 · 全字段中文注释配置模板
+# MaiLivingWorld v0.7.0 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -35,6 +35,19 @@ mysql_database = "mai_living_world"
 mysql_table_prefix = "mlw_"
 # MySQL 连接超时（秒）
 mysql_connect_timeout = 5
+
+# ====================================================================
+# 08 / 经验与行为反馈（绑定主人 QQ 的真实私聊；默认关闭）
+# ====================================================================
+[experience]
+# 必须同时 owner.enabled=true 且填写 owner.qq 才有作用。
+enabled = false
+# observe 仅记账；active 对明确负反馈暂缓同类选题，不能增加主动联系次数。
+mode = "observe"
+# 只分析成功主动发送后24小时内、本人有消息ID的可信回复。
+feedback_hours = 24
+# active 模式下明确不感兴趣则该类主动选题暂缓12小时。
+negative_pause_hours = 12
 
 # ====================================================================
 # 01 / 基础与安全
