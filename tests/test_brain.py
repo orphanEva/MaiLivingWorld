@@ -232,6 +232,32 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
             messages=[{"role":"system","content":"original prompt"}])
         self.assertNotIn("modified_kwargs",isolated)
 
+    async def test_proactive_result_and_owner_feedback_reaches_brain(self):
+        """v0.7 真实反馈链和 v0.8 情景账本应使用相同的主动事件ID。"""
+        from MaiLivingWorld.proactive_feedback import ProactiveFeedback
+        from MaiLivingWorld.experience_loop import ExperienceLoop
+        from MaiLivingWorld.tests.test_proactive_feedback import outgoing, tool
+        self.bot.config.experience.enabled=True
+        self.bot.config.experience.mode="active"
+        self.bot._experience=ExperienceLoop(Path(self.tmp.name)/"experience.db")
+        self.bot._feedback=ProactiveFeedback(Path(self.tmp.name)/"proactive.db")
+        db=self.bot._ensure_brain()
+        now=time.time()
+        eid=self.bot._feedback.begin("qq:private:"+OWNER,"private-one",now)
+        self.assertTrue(db.record_action(PRIVATE,eid,"history",now=now))
+        self.assertTrue(self.bot._experience.begin(eid,OWNER,"private-one","history","topic",now=now))
+        self.bot._pending_proactive["private-one"]=(eid,now,"qq:private:"+OWNER)
+        await self.bot.proactive_planner_feedback(session_id="private-one",output_items=tool("reply"))
+        await self.bot.proactive_send_feedback(message=outgoing("private-one"),sent=True)
+        self.assertEqual(db.recall(PRIVATE)["actions"][0]["outcome"],"send_confirmed")
+        await self.bot.capture_experience_feedback(
+            message=host_msg("feedback-msg",text="这个话题没兴趣"))
+        self.assertEqual(db.recall(PRIVATE)["actions"][0]["user_feedback"],"negative")
+        self.assertEqual(db.status(PRIVATE)["decisions"],1)
+        self.assertEqual(db.status(GROUP_SCOPE)["decisions"],0)
+        self.bot._feedback.close()
+        self.bot._experience.close()
+
     async def test_default_is_off(self):
         cfg=plugin.Config()
         self.assertFalse(cfg.brain_memory.enabled)
