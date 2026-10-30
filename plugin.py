@@ -206,6 +206,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._feedback: ProactiveFeedback | None = None
         # 仅关联一次已提交的主动任务与当前会话，绝不跨聊天流归因。
         self._pending_proactive: dict[str, tuple[int, float, str]] = {}
+        # 公开见闻仅在主动消息得到成功发送回执后写入记忆。
+        self._pending_memory: dict[int, dict[str, Any]] = {}
         self._last_proactive_skip_log: dict[tuple[str,str], float] = {}
 
     async def on_load(self):
@@ -242,6 +244,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._owner_group_messages.clear()
         # 新配置中的限频条件立即生效；旧任务不得误归因新发出的消息。
         self._pending_proactive.clear()
+        self._pending_memory.clear()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
     async def _owner_session_id(self, sender):
@@ -311,6 +314,7 @@ class MaiLivingWorld(MaiBotPlugin):
         account_id = str(message.get("account_id") or "")
         if sender_id and (not account_id or sender_id != account_id):
             event_id, _, target = self._pending_proactive.pop(sid)
+            self._pending_memory.pop(event_id, None)
             self._feedback.finish(event_id, "interrupted")
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] 已收到用户新消息，主动任务归因终止 target=%s", target)
         return {"action": "continue"}
@@ -329,6 +333,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if time.time() - created_at > 240:
             self._feedback.finish(event_id, "unknown")
             self._pending_proactive.pop(sid, None)
+            self._pending_memory.pop(event_id, None)
             return {"action": "continue"}
         outcome = decision_from_items(kwargs.get("output_items"))
         if outcome == "planner_stop":
@@ -338,6 +343,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 max_backoff_minutes=max(cfg.stop_backoff_base_minutes, cfg.stop_backoff_max_minutes)):
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择stop，未发送，已进入退避 target=%s", target)
             self._pending_proactive.pop(sid, None)
+            self._pending_memory.pop(event_id, None)
         elif outcome == "reply_planned":
             if self._feedback.finish(event_id, "reply_planned"):
                 self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] Planner选择reply，等待发送回执 target=%s", target)
@@ -360,10 +366,20 @@ class MaiLivingWorld(MaiBotPlugin):
         # 没有 Planner 的明确 reply 决策，绝不把普通会话发送归到主动任务。
         if self._feedback.outcome(event_id) != "reply_planned" or time.time() - created_at > 240:
             return {"action": "continue"}
+        # 不能将同一会话里其他账号的消息记作主动任务的确认发送。
+        info = msg.get("message_info")
+        sender = info.get("user_info") if isinstance(info, dict) else None
+        account_id = str(msg.get("account_id") or "").strip()
+        sender_id = str(sender.get("user_id") or "").strip() if isinstance(sender, dict) else ""
+        if not account_id or not sender_id or account_id != sender_id:
+            return {"action": "continue"}
         is_sent = kwargs.get("sent") is True
         status = "send_confirmed" if is_sent else "send_failed"
         if self._feedback.finish(event_id, status):
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] %s target=%s", status, target)
+            story = self._pending_memory.pop(event_id, None)
+            if is_sent and story:
+                await self._remember(story)
         self._pending_proactive.pop(sid, None)
         return {"action": "continue"}
 
@@ -443,6 +459,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._owner_events.clear()
         self._owner_group_messages.clear()
         self._pending_proactive.clear()
+        self._pending_memory.clear()
         # 退出后不能继续访问可能已关闭的 SQLite/MySQL 连接。
         for job in tuple(self._memory_jobs):
             job.cancel()
@@ -604,6 +621,7 @@ class MaiLivingWorld(MaiBotPlugin):
                         for sid, (eid, started, _) in list(self._pending_proactive.items()):
                             if now - started > 240:
                                 self._pending_proactive.pop(sid, None)
+                                self._pending_memory.pop(eid, None)
                     if self.config.mind.enabled and self.config.mind.auto_reflect and now-self._last_reflection_check >= 600:
                         self._last_reflection_check = now
                         try:
@@ -612,8 +630,7 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.exception("[MaiLivingWorld][MIND] 反思失败，聊天功能不受影响")
-                    if not self.config.general.enabled:
-                        continue
+                    # 外部观察不依赖主动聊天开关，关闭私聊唤醒也能继续收集公开资讯。
                     if self.config.explorer.enabled and now-self._last_scan >= self.config.explorer.scan_interval_minutes*60:
                         self._last_scan=now
                         await self._scan()
@@ -625,6 +642,8 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.exception("[MaiLivingWorld][COGNITION] 公开认知失败，其他功能继续")
+                    if not self.config.general.enabled:
+                        continue
                     if now-self._last_chat_check >= self.config.audience.check_interval_minutes*60:
                         self._last_chat_check=now
                         await self._check_targets()
@@ -644,8 +663,8 @@ class MaiLivingWorld(MaiBotPlugin):
     async def _think_public(self) -> None:
         """只整理公开资讯，不自动执行下步动作，也不接触 QQ 私聊或人格。"""
         cfg = self.config.cognition
-        if not (self.config.plugin.enabled and self.config.general.enabled
-                and self.config.explorer.enabled and cfg.enabled and cfg.auto_think and self._store):
+        if not (self.config.plugin.enabled and self.config.explorer.enabled
+                and cfg.enabled and cfg.auto_think and self._store):
             return
         store = self._ensure_cognition()
         if store is None:
@@ -873,7 +892,16 @@ class MaiLivingWorld(MaiBotPlugin):
         if activity is None or activity:
             return
         msgs=await self.ctx.message.get_recent(sid,limit=cfg.recent_message_limit)
-        if not isinstance(msgs,list) or len(msgs)<2:
+        if not isinstance(msgs, list):
+            return
+        if len(msgs) < 2:
+            # Host get_recent 默认只查询24小时；不足两条时回查该会话的持久化历史。
+            # 仍限制条数，不跨会话，更不会在缺乏真实历史时编造话题。
+            older = await self.ctx.message.get_by_time_in_chat(
+                sid, "0", str(now), limit=cfg.recent_message_limit, limit_mode="latest")
+            if isinstance(older, list):
+                msgs = older
+        if len(msgs) < 2:
             return
         history=await self.ctx.message.build_readable(msgs,truncate=True)
         if not isinstance(history,str) or not history.strip():
@@ -923,11 +951,11 @@ class MaiLivingWorld(MaiBotPlugin):
             return
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
-        if story and self.config.memory.enabled:
-            await self._remember(story)
         event_id = feedback.begin(target, sid, now) if feedback else None
         if event_id is not None:
             self._pending_proactive[sid] = (event_id, now, target)
+            if story and self.config.memory.enabled:
+                self._pending_memory[event_id] = story
         try:
             result=await self.ctx.maisaka.proactive.trigger(
                 sid,intent,reason="MaiLivingWorld: 浏览见闻" if story else "MaiLivingWorld: 继续话题",
@@ -937,11 +965,13 @@ class MaiLivingWorld(MaiBotPlugin):
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
                 self._pending_proactive.pop(sid,None)
+                self._pending_memory.pop(event_id,None)
             raise
         if isinstance(result,dict) and result.get('success') is False:
             if feedback and event_id is not None:
                 feedback.finish(event_id,"rejected")
                 self._pending_proactive.pop(sid,None)
+                self._pending_memory.pop(event_id,None)
             self.ctx.logger.warning("[MaiLivingWorld] 主动请求未成功：%s",str(result)[:200])
         else:
             self.ctx.logger.info("[MaiLivingWorld][PROACTIVE] 唤醒任务已被宿主接收 target=%s 主题=%s；等待 Planner/发送回执",
