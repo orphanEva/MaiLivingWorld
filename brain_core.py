@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -46,6 +47,47 @@ def _record_reject(diagnostics: dict[str, Any] | None, category: str, reason: st
         code = category + "." + reason
         reasons[code] = reasons.get(code, 0) + 1
     return False
+
+
+
+def _goal_completion_proven(criterion: str, used: list[dict[str, Any]]) -> bool:
+    """保守核对完成条件：每个明确子条件都要在主人新消息里获得肯定证据。
+
+    此处不做语义猜测；不理解的表述维持 open，可通过管理员显式审核完成。
+    """
+    parts = re.split(r"(?:并且|以及|同时|并|且|、|和)", criterion)
+    obligations = []
+    for part in parts:
+        atom = re.sub(r"[\s，,。；;:：!?！？（）()·]", "", part).casefold()
+        atom = re.sub(
+            r"^(?:(?:本人|用户)(?:明确)?(?:说|表示)?|明确(?:说|表示)|"
+            r"已经|已|完成|确认已经|确定已经)+", "", atom
+        )
+        if len(atom) < 2:
+            return False
+        obligations.append(atom)
+    if not obligations:
+        return False
+
+    clauses = []
+    for item in used:
+        content = item.get("text")
+        if isinstance(content, str):
+            clauses.extend(re.split(r"[，,。；;！？!?\n]|但是|不过|然而|可是|但", content.casefold()))
+
+    def supported(atom: str) -> bool:
+        for clause in clauses:
+            line = re.sub(r"\s+", "", clause)
+            if atom not in line:
+                continue
+            # “已下单但还没装箱”不可凭提到“装箱”就算完成。
+            if re.search(r"还没|尚未|没有|未|不|计划|准备|打算|以后|之后|下次|待|需要|明天", line):
+                continue
+            if re.search(r"已经|已|完成|做完|搞定|办妥|选定|确定|确认|成功|好了|了", line):
+                return True
+        return False
+
+    return all(supported(atom) for atom in obligations)
 
 
 class BrainBook:
@@ -329,8 +371,19 @@ class BrainBook:
         used=[evidence[k] for k in ids[:6] if isinstance(k,str) and k in evidence and evidence[k]["actor_id"]==row["owner_id"]]
         if not used:
             return _record_reject(diagnostics, "progress", "owner_evidence_mismatch")
-        # 不靠模型单方面宣布“任务完成”；需要拥有该目标的用户的新证据。
-        for item in used:
+        # 原始目标证据不得再次用作“新进展”，防止反思重复引用旧消息直接结案。
+        old_digests = {
+            r["message_digest"] for r in self.con.execute(
+                "SELECT message_digest FROM brain_goal_events WHERE goal_id=?", (gid,)
+            )
+        }
+        fresh = [item for item in used if item["digest"] not in old_digests]
+        if not fresh:
+            return _record_reject(diagnostics, "progress", "no_new_owner_evidence")
+        if state == "done" and not _goal_completion_proven(row["criterion"], fresh):
+            return _record_reject(diagnostics, "progress", "criterion_not_proven")
+        # 只保留来自目标主人的新证据；不能单凭模型输出状态完成目标。
+        for item in fresh:
             self.con.execute("INSERT OR IGNORE INTO brain_goal_events VALUES (?,?,?,?)",
                              (gid,item["digest"],state,now))
         self.con.execute("""UPDATE brain_goals SET status=?,closed_at=?,updated=?,revision=revision+1
