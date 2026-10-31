@@ -2,15 +2,17 @@
 from __future__ import annotations
 import json
 import sqlite3
+
+from .sql_logging import connect_sqlite
 import time
 from pathlib import Path
 from typing import Any
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(str(path), timeout=10)
+        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.execute("PRAGMA busy_timeout=5000")
         self.con.executescript("""
