@@ -58,7 +58,7 @@ class Result:
         self.cursor = cursor
         self._rows = None if rows is None else list(rows)
         self.rowcount = cursor.rowcount if cursor is not None else 0
-        self.lastrowid = cursor.lastrowid if cursor is not None else None
+        self.lastrowid = getattr(cursor, "lastrowid", None) if cursor is not None else None
 
     def fetchall(self):
         if self._rows is not None:
