@@ -85,7 +85,7 @@ def mysql_create_table(sql: str) -> str:
         # 索引/主键一律短字符串，较长的私聊摘要等用 TEXT。
         rest = sql[match.end():].split(",", 1)[0]
         if column in LONG_TEXT:
-            typ = ("VARCHAR(1024)" if re.search(r"\\bDEFAULT\\b", rest, re.I)
+            typ = ("VARCHAR(1024)" if re.search(r"\bDEFAULT\b", rest, re.I)
                    else "LONGTEXT" if column == "payload" else "TEXT")
         else:
             typ = "VARCHAR(191)"
