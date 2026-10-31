@@ -565,8 +565,31 @@ class BrainBook:
             "events":rows("SELECT id,actor_id,kind,summary,importance,happened FROM brain_events WHERE scope=? ORDER BY happened DESC LIMIT ?"),
             "facts":rows("SELECT id,subject_id,attribute,value,confidence,status,seen_count,updated FROM brain_facts WHERE scope=? ORDER BY updated DESC LIMIT ?"),
             "goals":rows("SELECT id,owner_id,title,criterion,next_action,status,revision FROM brain_goals WHERE scope=? ORDER BY updated DESC LIMIT ?"),
+            "milestones":self.recent_goal_milestones(scope,limit=n),
             "actions":rows("SELECT feedback_event_id,action,reason,outcome,user_feedback,recorded,finished FROM brain_decisions WHERE scope=? ORDER BY id DESC LIMIT ?"),
             "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created,cycle_kind FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
+
+    def recent_goal_milestones(self, scope: str, *, limit: int = 6) -> list[dict[str, Any]]:
+        """返回同作用域目标的近期阶段标记；相关事件仍是待核实线索。"""
+        if not valid_scope(scope):
+            return []
+        n=max(1,min(int(limit),12))
+        rows=self.con.execute("""SELECT ge.goal_id,ge.message_digest,ge.kind,ge.recorded,
+                 g.owner_id,g.status
+            FROM brain_goal_events ge JOIN brain_goals g ON g.id=ge.goal_id
+            WHERE g.scope=? AND ge.kind IN ('in_progress','done','abandoned')
+            ORDER BY ge.recorded DESC,ge.rowid DESC LIMIT ?""",(scope,n)).fetchall()
+        out=[]
+        for row in rows:
+            ev=self.con.execute("""SELECT e.summary FROM brain_event_evidence x
+                JOIN brain_events e ON e.id=x.event_id
+                WHERE x.message_digest=? AND e.scope=? AND e.actor_id=?
+                ORDER BY e.created DESC LIMIT 1""",
+                (row["message_digest"],scope,row["owner_id"])).fetchone()
+            out.append({"scope":scope,"goal_id":row["goal_id"],
+                        "stage":row["kind"],"recorded":row["recorded"],
+                        "event_hint":ev["summary"] if ev else ""})
+        return out
 
     def goal_trace(self, scope: str, goal_id: str, *, limit: int = 30) -> dict[str, Any]:
         """按真实证据关联目标阶段与同消息事件/事实；只读，不推断语义因果。"""
@@ -579,7 +602,8 @@ class BrainBook:
         n=max(1,min(int(limit),50))
         history=self.con.execute("""SELECT message_digest,kind,recorded
             FROM brain_goal_events WHERE goal_id=?
-            ORDER BY recorded ASC,kind ASC LIMIT ?""",(goal_id,n)).fetchall()
+            ORDER BY recorded DESC,rowid DESC LIMIT ?""",(goal_id,n)).fetchall()
+        history=list(reversed(history))
         timeline=[]
         for stage in history:
             # 同一证据可能涉及多件事：这里只表示消息来源重合，不声称语义相同。
