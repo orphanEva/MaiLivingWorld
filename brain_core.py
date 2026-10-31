@@ -73,17 +73,30 @@ def _goal_completion_proven(criterion: str, used: list[dict[str, Any]]) -> bool:
     for item in used:
         content = item.get("text")
         if isinstance(content, str):
-            clauses.extend(re.split(r"[，,。；;！？!?\n]|但是|不过|然而|可是|但", content.casefold()))
+            # 保留问号：不能把“已经完成了吗？”当成陈述证据。
+            clauses.extend(re.split(r"[，,。；;\n]|但是|不过|然而|可是|但", content.casefold()))
 
     def supported(atom: str) -> bool:
         for clause in clauses:
             line = re.sub(r"\s+", "", clause)
-            if atom not in line:
+            if not line or re.search(r"[?？]|(?:是不是|有没有|是否|能否)", line):
                 continue
-            # “已下单但还没装箱”不可凭提到“装箱”就算完成。
-            if re.search(r"还没|尚未|没有|未|不|计划|准备|打算|以后|之后|下次|待|需要|明天", line):
+            # 假设、计划、部分完成都不是已经完成的证据。
+            if re.search(
+                r"还没|尚未|没有|未|不|计划|准备|打算|决定|"
+                r"如果|假如|要是|若是|倘若|等到|等我|一旦|"
+                r"可能|或许|也许|大概|好像|似乎|估计|应该|"
+                r"以后|之后|下次|待|需要|明天|部分|一部分|初步|一半|还差", line
+            ):
                 continue
-            if re.search(r"已经|已|完成|做完|搞定|办妥|选定|确定|确认|成功|好了|了", line):
+            matched = atom in line
+            # “确定裙子款式”与“裙子款式已经确定”属于常见语序变体。
+            if not matched:
+                match = re.match(r"^(确定|确认|选定)(.{2,})$", atom)
+                matched = bool(match and match.group(2) in line and match.group(1) in line)
+            if matched and re.search(
+                r"已经|已|完成|做完|搞定|办妥|选定|确定|确认|成功|好了|了", line
+            ):
                 return True
         return False
 
