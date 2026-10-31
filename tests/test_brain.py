@@ -85,7 +85,7 @@ class BrainBookTests(unittest.TestCase):
         self.assertIn("喜欢带数字计算的示例",self.db.hint(PRIVATE))
         self.assertNotIn("喜欢带数字计算的示例",self.db.hint(GROUP_SCOPE))
         gid=got["goals"][0]["id"]
-        counts=self.db.apply(PRIVATE,"digest-2",[entry("E3")],{
+        counts=self.db.apply(PRIVATE,"digest-2",[entry("E3",txt="我已完成RNN基础内容")],{
             "progress":[{"goal_id":gid,"state":"done","evidence_ids":["E3"]}]
         },now=self.now+10)
         self.assertEqual(counts["progress"],1)
@@ -93,6 +93,67 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(self.db.status(PRIVATE)["cycles"],2)
         self.assertTrue(isinstance(self.db.recall(PRIVATE)["reflections"],list))
         self.assertEqual(self.db.status(GROUP_SCOPE)["events"],0)
+
+    def test_goal_completion_requires_all_criteria_with_fresh_owner_evidence(self):
+        origin = entry("G1", txt="我要完成下单并放入箱子")
+        self.db.apply(PRIVATE, "goal-origin", [origin], {
+            "goals": [{"owner_id": OWNER, "title": "下单并装箱",
+                       "criterion": "完成下单并放入箱子",
+                       "next_action": "follow_up", "evidence_ids": ["G1"]}]
+        }, now=self.now)
+        gid = self.db.recall(PRIVATE)["goals"][0]["id"]
+
+        def progress(evidence_rows, seq):
+            diag = {}
+            counts = self.db.apply(PRIVATE, "goal-progress-" + str(seq),
+                evidence_rows, {"progress": [{
+                    "goal_id": gid, "state": "done",
+                    "evidence_ids": [e["id"] for e in evidence_rows]
+                }]}, now=self.now + seq, diagnostics=diag)
+            return counts["progress"], diag
+
+        # 新证据仅表明下单，还明确否定装箱。
+        count, diag = progress(
+            [entry("G2", txt="我已经下单了，但还没有放入箱子")], 1)
+        self.assertEqual(count, 0)
+        self.assertEqual(diag["store_rejected"]["progress.criterion_not_proven"], 1)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "open")
+
+        # 旧的目标创建证据不能被重用为“新进展”。
+        count, diag = progress([origin], 2)
+        self.assertEqual(count, 0)
+        self.assertEqual(diag["store_rejected"]["progress.no_new_owner_evidence"], 1)
+
+        # 两条独立的正向新消息共同证明全部子条件。
+        count, _ = progress([
+            entry("G3", txt="我已经下单了"),
+            entry("G4", txt="我已经放入箱子了")
+        ], 3)
+        self.assertEqual(count, 1)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "done")
+
+    def test_goal_completion_rejects_unrelated_or_negated_evidence(self):
+        self.db.apply(PRIVATE, "goal-A", [entry("G1", txt="我要学习RNN")], {
+            "goals": [{"owner_id": OWNER, "title": "完成RNN基础学习",
+                       "criterion": "本人明确说已完成RNN基础内容",
+                       "next_action": "follow_up", "evidence_ids": ["G1"]}]
+        }, now=self.now)
+        gid = self.db.recall(PRIVATE)["goals"][0]["id"]
+        for i, text in enumerate(("最近在学RNN基础内容", "我还没完成RNN基础内容"), 1):
+            counts = self.db.apply(PRIVATE, "incorrect-progress-"+str(i),
+                [entry("G"+str(i+1), txt=text)],
+                {"progress": [{"goal_id": gid, "state": "done",
+                               "evidence_ids": ["G"+str(i+1)]}]},
+                now=self.now+i)
+            self.assertEqual(counts["progress"], 0)
+            self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "open")
+
+        counts = self.db.apply(PRIVATE, "correct-progress",
+            [entry("G5", txt="我已完成RNN基础内容")],
+            {"progress": [{"goal_id": gid, "state": "done", "evidence_ids": ["G5"]}]},
+            now=self.now+5)
+        self.assertEqual(counts["progress"], 1)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "done")
 
     def test_conflict_requires_explicit_review(self):
         def p(value, i):
