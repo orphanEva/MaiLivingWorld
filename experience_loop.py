@@ -11,6 +11,7 @@ import re
 import sqlite3
 
 from .sql_logging import connect_sqlite
+from .mysql_compat import MySQLCompatConnection
 import time
 from pathlib import Path
 from typing import Any
@@ -51,9 +52,12 @@ def digest(value: str) -> str:
 class ExperienceLoop:
     """独立 SQLite 经验账本；仅存 QQ 主人私聊中主动发送的关联记录。"""
 
-    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False,
+                 mysql_settings: dict | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
+        self.con = (MySQLCompatConnection(**mysql_settings, logger=logger, sql_debug=sql_debug)
+                    if mysql_settings else
+                    connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug))
         self.con.execute("PRAGMA busy_timeout=10000")
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript("""
