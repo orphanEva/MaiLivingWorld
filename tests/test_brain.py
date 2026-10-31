@@ -264,6 +264,14 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(milestone["relation"],"shared_verified_message")
         self.assertEqual(milestone["events"][0]["summary"],"已经开始给数据线贴编号")
         self.assertEqual(milestone["facts"][0]["attribute"],"数据线整理进度")
+        # 后续深度整理应看见此目标的历史阶段，但绝不将其视为新消息证据。
+        existing=self.db.recall(PRIVATE)
+        self.assertEqual(len(existing["milestones"]),1)
+        self.assertEqual(existing["milestones"][0]["stage"],"in_progress")
+        later=build_prompt(PRIVATE,[entry("NEXT")],existing)
+        self.assertIn("milestones",later)
+        self.assertIn("已经开始给数据线贴编号",later)
+        self.assertIn("不代表语义必然相关",later)
         # 不返回未经筛选的聊天原文或证据摘要标识符。
         self.assertNotIn("hash:T2",str(trace))
         self.assertNotIn("拍照还没做",str(trace))
@@ -304,6 +312,17 @@ class BrainBookTests(unittest.TestCase):
         self.assertFalse(self.db.goal_trace(GROUP_SCOPE,gid)["found"])
         self.assertFalse(self.db.goal_trace("private:../bad",gid)["found"])
         self.assertFalse(self.db.goal_trace(PRIVATE,"nonexistent")["found"])
+        self.assertEqual(self.db.recent_goal_milestones(GROUP_SCOPE),[])
+        # 模拟传入的错误作用域历史也不得被模型提示引用。
+        fake={"milestones":[
+            {"scope":GROUP_SCOPE,"goal_id":"Gfake","stage":"in_progress",
+             "event_hint":"群聊内部讨论的秘密事件"},
+            {"scope":PRIVATE,"goal_id":gid,"stage":"in_progress",
+             "event_hint":"密码12345678不应回灌"},
+        ]}
+        prompt=build_prompt(PRIVATE,[entry("NEXT")],fake)
+        self.assertNotIn("群聊内部讨论的秘密事件",prompt)
+        self.assertNotIn("密码12345678",prompt)
         # 其他人的消息不能更新目标阶段。
         denied=self.db.apply(PRIVATE,"cross-user",[entry("Z1",who=OTHER,txt="正在贴标签")],{
             "progress":[{"goal_id":gid,"state":"in_progress","evidence_ids":["Z1"]}]
