@@ -12,6 +12,7 @@ import re
 import sqlite3
 
 from .sql_logging import connect_sqlite
+from .mysql_compat import MySQLCompatConnection
 import time
 import unicodedata
 from pathlib import Path
@@ -125,9 +126,12 @@ def _fact_value_key(value: str) -> str:
 class BrainBook:
     """无外部依赖的原子记忆账本，单插件 SQLite。"""
 
-    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False,
+                 mysql_settings: dict | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
+        self.con = (MySQLCompatConnection(**mysql_settings, logger=logger, sql_debug=sql_debug)
+                    if mysql_settings else
+                    connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug))
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA busy_timeout=10000")
         self.con.execute("PRAGMA journal_mode=WAL")
