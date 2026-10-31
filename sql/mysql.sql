@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS `mlw_brain_events` (
 CREATE TABLE IF NOT EXISTS `mlw_brain_event_evidence` (
           event_id VARCHAR(191) NOT NULL, message_digest VARCHAR(191) NOT NULL,
           PRIMARY KEY(event_id,message_digest),
-          FOREIGN KEY(event_id) REFERENCES brain_events(id) ON DELETE CASCADE
+          FOREIGN KEY(event_id) REFERENCES `mlw_brain_events`(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- brain_core.py
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS `mlw_brain_facts` (
 CREATE TABLE IF NOT EXISTS `mlw_brain_fact_evidence` (
           fact_id VARCHAR(191) NOT NULL, message_digest VARCHAR(191) NOT NULL,
           PRIMARY KEY(fact_id,message_digest),
-          FOREIGN KEY(fact_id) REFERENCES brain_facts(id) ON DELETE CASCADE
+          FOREIGN KEY(fact_id) REFERENCES `mlw_brain_facts`(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- brain_core.py
@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS `mlw_brain_goal_events` (
           goal_id VARCHAR(191) NOT NULL, message_digest VARCHAR(191) NOT NULL,
           kind VARCHAR(191) NOT NULL, recorded DOUBLE NOT NULL,
           PRIMARY KEY(goal_id,message_digest,kind),
-          FOREIGN KEY(goal_id) REFERENCES brain_goals(id) ON DELETE CASCADE
+          FOREIGN KEY(goal_id) REFERENCES `mlw_brain_goals`(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- brain_core.py
