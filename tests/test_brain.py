@@ -575,7 +575,10 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.bot._reflect_brain(),1)
         self.assertIn(note,self.bot.ctx.llm.generate.await_args.args[0])
         self.assertNotIn(note,db.hint(PRIVATE))
-        # 轻量更新不能因为历史反思而扩大数据输入。
+        # 轻量更新必须看到新增 QQ 消息；内容不变时本来就应被限频保护跳过。
+        self.bot.ctx.message.get_recent.return_value=[
+            *messages, host_msg("cycle-5",text="刚贴完最后一根数据线的标签")
+        ]
         self.bot.ctx.llm.generate.reset_mock()
         self.assertEqual(await self.bot._reflect_brain(quick=True),1)
         self.assertNotIn(note,self.bot.ctx.llm.generate.await_args.args[0])
