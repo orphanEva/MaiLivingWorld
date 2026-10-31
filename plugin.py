@@ -734,6 +734,12 @@ class MaiLivingWorld(MaiBotPlugin):
         db=self._ensure_brain()
         return db.recall(scope) if db else {"ready":False}
 
+    @API("living_world_brain_goal_trace",
+         description="管理员按明确作用域查看目标阶段进展与同消息证据关联，不包含原始聊天",public=False)
+    async def brain_goal_trace(self, scope: str = "", goal_id: str = "") -> dict[str,Any]:
+        db=self._ensure_brain()
+        return db.goal_trace(scope,goal_id) if db else {"found":False}
+
     @API("living_world_brain_review_fact",description="管理员审核待确认或冲突事实",public=False)
     async def brain_review_fact(self, scope: str = "", fact_id: str = "", decision: str = "", confirm: str = "") -> dict[str,Any]:
         if confirm != "REVIEW_BRAIN_FACT":
