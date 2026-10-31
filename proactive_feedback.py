@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import sqlite3
+
+from .sql_logging import connect_sqlite
 import time
 from pathlib import Path
 from typing import Any
@@ -35,9 +37,9 @@ def decision_from_items(output_items: Any) -> str:
 class ProactiveFeedback:
     """跨重启保留限流和结果；不会把未确认的任务统计成真实消息。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(str(path), timeout=10)
+        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
         self.con.execute("PRAGMA busy_timeout=10000")
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript("""
