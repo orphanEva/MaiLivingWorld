@@ -95,6 +95,23 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
                          ["origin","in_progress","done","done"])
         self.assertEqual(db.recall(scope)["goals"][0]["status"],"done")
         self.assertFalse(db.goal_trace("group:98765432",gid)["found"])
+        # 语义等价事实追加证据、不制造虚假冲突；真正状态变化仍需复核。
+        def fact(val,prefix):
+            return {"facts":[{"subject_id":"12345678","attribute":"学习进度",
+                              "value":val,"confidence":.94,
+                              "evidence_ids":[prefix+"1",prefix+"2"]}]}
+        def proof(prefix):
+            return [self.evidence(prefix+"1","我正在学习循环神经网络基础"),
+                    self.evidence(prefix+"2","我正在学习循环神经网络基础")]
+        first=db.apply(scope,"fact-cycle-1",proof("F"),fact("正在学习RNN基础","F"),now=now+10)
+        self.assertEqual(first["facts"],1)
+        equivalent=db.apply(scope,"fact-cycle-2",proof("H"),
+                            fact("目前在学习循环神经网络基础","H"),now=now+11)
+        self.assertEqual(equivalent["facts"],1)
+        self.assertEqual(len(db.recall(scope)["facts"]),1)
+        self.assertEqual(db.recall(scope)["facts"][0]["seen_count"],4)
+        self.assertEqual(db.recall(scope)["facts"][0]["status"],"active")
+        self.assertFalse(db.hint("group:98765432"))
         db.close()
         reopened=BrainBook(self.dir/"brain.db",mysql_settings=self.settings)
         self.assertEqual(reopened.recall(scope)["goals"][0]["status"],"done")
@@ -121,7 +138,22 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
         self.assertTrue(db.eligible(now,now-10,1,2)[0])
         cid=db.begin(now,1)
         self.assertGreater(cid,0)
-        db.failed(cid)
+        # 真实 MySQL 的公开认知：来源证据 -> 待解决问题 -> 决策状态。
+        src={"key":"public-k1","source":"B站热门","title":"开源模型推理评测",
+             "summary":"公开信息描述推理性能的对比测试。",
+             "url":"https://www.bilibili.com/video/BV1234567890"}
+        question={"source_key":"public-k1","topic":"开源模型",
+                  "question":"这个模型真实推理性能如何？",
+                  "observation":"公开简介有评测介绍，细节未验证。",
+                  "uncertainty":"尚缺少可靠对照数据。",
+                  "next_action":"compare_public_sources"}
+        accepted=db.commit_cycle(cid,[src],[question],[],1,now)
+        self.assertEqual(accepted,{"added":1,"updated":0})
+        goal=db.goals()[0]
+        self.assertEqual(len(db.sources_for(goal["goal_id"])),1)
+        self.assertTrue(db.decide(goal["goal_id"],"resolved"))
+        self.assertTrue(db.decide(goal["goal_id"],"reopen"))
+        self.assertGreaterEqual(len(db.events(goal["goal_id"])),2)
         self.assertEqual(db.summary()["cycle_count"],1)
         db.close()
 
