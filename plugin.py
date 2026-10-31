@@ -187,6 +187,7 @@ class Storage(PluginConfigBase):
     mysql_database: str = Field(default="mai_living_world", description="MySQL 数据库（需先创建）；数据表由插件自动初始化")
     mysql_table_prefix: str = Field(default="mlw_", description="表名前缀，仅允许字母数字下划线，以英文字母开头")
     mysql_connect_timeout: int = Field(default=5, ge=1, le=30, description="MySQL 连接超时（秒）")
+    sql_debug: bool = Field(default=False, description="打印 MyBatis 风格 SQL 模板、脱敏参数类型和耗时；默认关闭")
 
 
 class Config(PluginConfigBase):
@@ -267,16 +268,19 @@ class MaiLivingWorld(MaiBotPlugin):
                 database=storage.mysql_database,
                 table_prefix=storage.mysql_table_prefix,
                 connect_timeout=storage.mysql_connect_timeout,
+                logger=self.ctx.logger, sql_debug=storage.sql_debug,
             )
         elif backend == "sqlite":
-            self._store = Store(Path(self.ctx.paths.data_dir) / "living_world.sqlite3")
+            self._store = Store(Path(self.ctx.paths.data_dir) / "living_world.sqlite3",
+                                logger=self.ctx.logger, sql_debug=storage.sql_debug)
         else:
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         if self.config.mind.enabled:
             self._ensure_mind()
         if self.config.cognition.enabled:
             self._ensure_cognition()
-        self._feedback = ProactiveFeedback(Path(self.ctx.paths.data_dir) / "proactive_feedback.sqlite3")
+        self._feedback = ProactiveFeedback(Path(self.ctx.paths.data_dir) / "proactive_feedback.sqlite3",
+                                            logger=self.ctx.logger, sql_debug=storage.sql_debug)
         self._feedback.expire_unfinished()
         if self.config.experience.enabled:
             self._ensure_experience()
@@ -721,7 +725,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not (self.config.plugin.enabled and self.config.brain_memory.enabled):
             return None
         if self._brain is None:
-            self._brain = BrainBook(Path(self.ctx.paths.data_dir) / "brain_book.sqlite3")
+            self._brain = BrainBook(Path(self.ctx.paths.data_dir) / "brain_book.sqlite3",
+                                    logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
         return self._brain
 
     @API("living_world_brain_status",description="管理员按明确作用域查看事件/事实/目标数量",public=False)
@@ -778,7 +783,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not (self.config.plugin.enabled and self.config.experience.enabled):
             return None
         if self._experience is None:
-            self._experience = ExperienceLoop(Path(self.ctx.paths.data_dir) / "experience_loop.sqlite3")
+            self._experience = ExperienceLoop(Path(self.ctx.paths.data_dir) / "experience_loop.sqlite3",
+                                              logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
         return self._experience
 
     @API("living_world_experience_status",
@@ -953,7 +959,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not self.config.plugin.enabled or not self.config.cognition.enabled:
             return None
         if self._cognition is None:
-            self._cognition = CognitiveStore(Path(self.ctx.paths.data_dir) / "cognition.sqlite3")
+            self._cognition = CognitiveStore(Path(self.ctx.paths.data_dir) / "cognition.sqlite3",
+                                            logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
         return self._cognition
 
     async def _think_public(self) -> None:
@@ -1032,7 +1039,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not self.config.plugin.enabled or not self.config.mind.enabled:
             return None
         if self._mind is None:
-            self._mind = MindStore(Path(self.ctx.paths.data_dir) / "mind.sqlite3")
+            self._mind = MindStore(Path(self.ctx.paths.data_dir) / "mind.sqlite3",
+                                   logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
         return self._mind
 
     async def _reflect_owner(self) -> None:
