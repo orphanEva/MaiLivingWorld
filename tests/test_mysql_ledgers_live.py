@@ -147,6 +147,35 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
         self.assertEqual(db.outcome(eid),"planner_stop")
         db.close()
 
+    def test_05_plugin_factories_select_mysql_without_sqlite_fallback(self):
+        import types
+        from MaiLivingWorld.tests.test_runtime import plugin, FakeContext
+        bot=plugin.MaiLivingWorld()
+        bot.ctx=FakeContext()
+        bot.ctx.paths=types.SimpleNamespace(data_dir=self.dir)
+        bot.config=plugin.Config()
+        st=bot.config.storage
+        st.backend="mysql"
+        st.mysql_host=self.settings["host"]
+        st.mysql_port=self.settings["port"]
+        st.mysql_user=self.settings["user"]
+        st.mysql_password=self.settings["password"]
+        st.mysql_database=self.settings["database"]
+        st.mysql_table_prefix=self.settings["table_prefix"]
+        bot.config.brain_memory.enabled=True
+        bot.config.mind.enabled=True
+        bot.config.cognition.enabled=True
+        bot.config.experience.enabled=True
+        try:
+            for item in (bot._ensure_brain(),bot._ensure_mind(),
+                         bot._ensure_cognition(),bot._ensure_experience()):
+                self.assertEqual(item.con.prefix,self.settings["table_prefix"])
+        finally:
+            for item in (bot._brain,bot._mind,bot._cognition,bot._experience):
+                if item:
+                    item.close()
+        self.assertFalse(list(self.dir.glob("*.sqlite3")))
+
     def test_06_migration_all_tables_hashes_and_reimport_rejection(self):
         with tempfile.TemporaryDirectory() as temp:
             directory=Path(temp)
