@@ -1153,7 +1153,11 @@ class MaiLivingWorld(MaiBotPlugin):
                         continue
                     db.mark_attempt(scope,now)
                 existing=db.recall(scope,limit=8)
-                prompt=build_prompt(scope,evidence,existing)
+                # 仅深度元认知开启时回看同作用域的旧反思；快速更新不读取。
+                # 旧反思在模型提示里是待核实线索，永不进入 QQ 回复注入。
+                past_reviews = (db.recent_reflections(scope,now=now)
+                                if cfg.enable_metacognition and not quick else [])
+                prompt=build_prompt(scope,evidence,existing,prior_reflections=past_reviews)
                 response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
                                                     temperature=0.2,max_tokens=1300)
                 diagnostics: dict[str, Any] = {}
