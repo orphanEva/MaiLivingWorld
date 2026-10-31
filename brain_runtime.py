@@ -162,6 +162,17 @@ def build_prompt(scope: str, evidence: list[dict[str,Any]], existing: dict[str,A
                   "value":f["value"],"status":f["status"]} for f in existing.get("facts",[])[:8]],
         "goals":[{"id":g["id"],"owner_id":g["owner_id"],"title":g["title"],
                   "criterion":g["criterion"],"status":g["status"]} for g in existing.get("goals",[])[:6]],
+        "milestones":[
+            {"goal_id":m["goal_id"],"stage":m["stage"],
+             "candidate_event":m["event_hint"][:120]
+                 if isinstance(m.get("event_hint"),str)
+                 and not UNSAFE.search(m["event_hint"])
+                 and not PRIVATE.search(m["event_hint"]) else ""}
+            for m in existing.get("milestones",[])[:6]
+            if isinstance(m,dict) and m.get("scope")==scope
+            and m.get("stage") in ("in_progress","done","abandoned")
+            and isinstance(m.get("goal_id"),str)
+        ],
     }
     # 模型曾生成的反思是待复核线索，绝不是事实证据或要执行的指令。
     # 上游按 scope/时间筛选，这里再校验来源范围与内容安全性。
@@ -200,6 +211,8 @@ def build_prompt(scope: str, evidence: list[dict[str,Any]], existing: dict[str,A
         "对已有目标，新出现明确阶段性进展时输出 progress.state=in_progress，且不得宣称已完成；"
         "只有目标本人完整满足完成条件并明确宣布时才输出 done；主动取消时可输出 abandoned。"
         "不要将计划、假设或别人的发言当作真实阶段进展；所有进展必须绑定本轮可信新消息。"
+        "历史 milestones 只证明此前记录过某阶段状态；candidate_event 是同消息的待核实事件摘要，"
+        "不代表语义必然相关，不是本轮新证据，也不能用来直接宣布完成。"
         "完成时必须有属于目标发起者的明确新证据；购买与选款是不同完成条件。"
         "next_action 只允许 wait/follow_up/compare_evidence/review，只是一条内部计划，绝不执行外部动作。"
         "reflection 仅写一条简短的、可检验的自我复盘；不输出隐藏推理过程。"
