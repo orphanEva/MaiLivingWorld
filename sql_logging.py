@@ -72,7 +72,7 @@ class SQLAudit:
                                 self.backend, type(exc).__name__,
                                 (time.perf_counter()-start)*1000)
             raise
-        rows = getattr(result, "rowcount", None)
+        rows = result if isinstance(result, int) else getattr(result, "rowcount", None)
         if isinstance(rows, int) and rows >= 0:
             self.logger.info("[MaiLivingWorld][SQL][%s] <== Updates: %d (%.2f ms)",
                              self.backend, rows, (time.perf_counter()-start)*1000)
