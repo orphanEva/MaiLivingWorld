@@ -144,7 +144,16 @@ class MySQLCompatConnection:
         query = _EXCLUDED.sub(lambda m: "VALUES("+m.group(1)+")", query)
         query = _MAX_TWO.sub(r"GREATEST(\1,", query)
         query = re.sub(r"\blast_insert_rowid\s*\(\s*\)", "LAST_INSERT_ID()", query, flags=re.I)
-        return query.replace("?", "%s")
+        query = query.replace("?", "%s")
+        # MySQL rejects LIMIT directly inside an IN subquery.
+        limited = re.compile(
+            r"\bNOT\s+IN\s*\(\s*(SELECT\s+.*?\bLIMIT\s+(?:%s|\d+))\s*\)",
+            flags=re.I | re.S,
+        )
+        return limited.sub(
+            lambda m: "NOT IN (SELECT * FROM (" + m.group(1) + ") AS mlw_recent)",
+            query,
+        )
 
     def _raw(self, sql: str, parameters=()):
         cursor = self.con.cursor()
