@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS `mlw_brain_fact_revisions` (
 CREATE TABLE IF NOT EXISTS `mlw_mind_runs` (
             owner_id VARCHAR(191) PRIMARY KEY, last_hash VARCHAR(191) NOT NULL DEFAULT '',
             last_attempt_at DOUBLE NOT NULL DEFAULT 0, last_success_at DOUBLE NOT NULL DEFAULT 0,
-            behavior_goal TEXT NOT NULL DEFAULT '', reflection_count BIGINT NOT NULL DEFAULT 0
+            behavior_goal VARCHAR(1024) NOT NULL DEFAULT '', reflection_count BIGINT NOT NULL DEFAULT 0
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- mind.py
