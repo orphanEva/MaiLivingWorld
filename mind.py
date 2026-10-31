@@ -7,6 +7,7 @@ import re
 import sqlite3
 
 from .sql_logging import connect_sqlite
+from .mysql_compat import MySQLCompatConnection
 import time
 from pathlib import Path
 from typing import Any
@@ -129,9 +130,12 @@ def parse_reflection(response: Any, evidence: list[dict[str, str]], *, min_confi
 class MindStore:
     """每位主人独立存储；旧版无证据笔记保留但只供人工审查。"""
 
-    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False,
+                 mysql_settings: dict | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = connect_sqlite(str(path), timeout=15, logger=logger, sql_debug=sql_debug)
+        self.con = (MySQLCompatConnection(**mysql_settings, logger=logger, sql_debug=sql_debug)
+                    if mysql_settings else
+                    connect_sqlite(str(path), timeout=15, logger=logger, sql_debug=sql_debug))
         self.con.execute('PRAGMA journal_mode=WAL')
         self.con.execute('PRAGMA busy_timeout=15000')
         self.con.executescript('''
