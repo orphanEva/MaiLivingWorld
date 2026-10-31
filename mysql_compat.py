@@ -72,6 +72,13 @@ class Result:
         row = self.cursor.fetchone()
         return CompatRow(row) if row is not None else None
 
+    def __iter__(self):
+        while True:
+            row = self.fetchone()
+            if row is None:
+                break
+            yield row
+
     def close(self):
         if self.cursor is not None:
             self.cursor.close()
@@ -83,7 +90,7 @@ def mysql_create_table(sql: str) -> str:
     def replace_text(match):
         column = match.group(1).lower()
         # 索引/主键一律短字符串，较长的私聊摘要等用 TEXT。
-        rest = sql[match.end():].split(",", 1)[0]
+        rest = line[match.end():].split(",", 1)[0]
         if column in LONG_TEXT:
             typ = ("VARCHAR(1024)" if re.search(r"\bDEFAULT\b", rest, re.I)
                    else "LONGTEXT" if column == "payload" else "TEXT")
@@ -127,6 +134,8 @@ class MySQLCompatConnection:
 
     def _sql(self, sql: str) -> str:
         query = self._tables(sql)
+        # MySQL 8.x 的 SIGNAL 是保留关键字；SQLite 允许无引号的同名列。
+        query = re.sub(r"(?<![`\w])signal(?![`\w])", "`signal`", query, flags=re.I)
         query = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
                        "INSERT IGNORE INTO", query, flags=re.I)
         query = re.sub(r"\bINSERT\s+OR\s+REPLACE\s+INTO\b",
