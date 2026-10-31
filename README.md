@@ -1,6 +1,13 @@
-# MaiLivingWorld · 麦麦的小世界 v0.9.1（渐进记忆与动态认知）
+# MaiLivingWorld · 麦麦的小世界 v0.10.0（统一 MySQL 持久化）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+
+## v0.10.0 · 六套 SQLite/MySQL 同后端及完整迁移
+
+- `[storage] backend="mysql"` 统一控制外部资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback 六套持久化，不再只切换资讯库。
+- `sql/mysql.sql` 包含总计 29 张表，建议 MySQL 8.4，保留原始作用域、身份、主键、历史审核状态和证据表。
+- `scripts/migrate_all_sqlite_to_mysql.py` 支持一次性只读预览；正式导入必须目标为空、数据库字段完全匹配、全部表校验通过且原子提交。确实没有启用某个模块时，正式迁移需显式加 `--allow-missing`。
+- SQLite 仍为可选后端；MyBatis 风格的脱敏 SQL 日志共用 `storage.sql_debug`。**线上迁移前必须停止写入并完整备份，不会自动双写。**
 
 ## v0.9.1 · 事实与目标未入库的隐私安全诊断
 
@@ -247,47 +254,49 @@ group_template = ""                # 留空使用预设
 
 SQLite 和 MySQL 实现相同的资讯与尝试记录接口；SQLite 零配置单机更简单，MySQL 方便与已有数据库集中维护，但**不提升语言模型的理解能力**。
 
-**备份注意：MySQL 并未覆盖所有状态。** 即便设为 `storage.backend="mysql"`，`mind.sqlite3`（主人观察）、`cognition.sqlite3`（公开认知）和 `proactive_feedback.sqlite3`（发送反馈/退避）仍位于插件 `data_dir`。备份、迁移时必须同时保留这些文件（建议停止插件后备份 SQLite WAL 数据）和 MySQL 数据，否则可能丢失记忆审核状态或重置冷却。
+**六套库统一后端（全量 MySQL 开发分支）：** `storage.backend="mysql"` 现在让外部资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback 全部使用 MySQL；`storage.backend="sqlite"` 则保留原有六个 SQLite 数据库。不会同时双写，也不会自动迁移旧数据。旧 SQLite 保持不变以备回滚，但回滚前需先处理 MySQL 期间产生的新记录。
 
-### 如何切换到 MySQL
+### 一次性迁移六个 SQLite 库
 
-1. 确认 MaiBot 所在 Docker 容器能访问 MySQL。两个容器同一个自定义 Docker 网络时，`mysql_host` 可填写数据库服务名；不同机器请填**私有网络地址**，不要将 MySQL 3306 暴露公网。
-2. 用 `sql/mysql.sql` 的建库语句先创建 `mai_living_world` 数据库，给插件一个只允许访问该库的独立账号。插件启动时会自动创建表；首次运行账号需要 `CREATE` 权限。
-3. 在 WebUI 插件设置中找到 **「07 / 数据持久化」**，填写以下参数：
+1. 使用**独立的、尚无业务数据的** MySQL 数据库，建议 MySQL 8.4；仓库 `sql/mysql.sql` 包含三张资讯表和 26 张内部账本表，共 **29 张**，可在数据库客户端执行。MySQL 需要支持 InnoDB、utf8mb4。已有的旧版三张表可保留，不需清空。
+2. **先停止 MaiLivingWorld 的所有写入**，备份六个 SQLite 文件和原插件配置。SQLite 使用 WAL 时必须一并处理 `-wal` 文件，建议对每个库运行 `sqlite3.Connection.backup()` 得到一致快照；不要只复制正在写入的主数据库。迁移不保证六个库在并发写入时自动取得同一时刻的快照。
+3. 将完整快照放在一个独立目录，例如 `/mnt/mlw-backup-20261101/`，包含（如存在）：`living_world.sqlite3`、`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`。少数模块未启用时允许缺失；正式执行时须加 `--allow-missing`，避免漏备份被当成空账本。
+4. 在拥有迁移脚本和 Python 依赖的环境下先预览，不连接 MySQL、不修改文件：
+
+```bash
+python scripts/migrate_all_sqlite_to_mysql.py --directory /mnt/mlw-backup-20261101
+```
+
+5. 确认每个表的源库记录数后，把 MySQL 配置通过环境变量（`MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE`、`MLW_MYSQL_PREFIX`）安全提供给迁移进程。**只对空目标数据库/表前缀执行正式迁移**：
+
+```bash
+python scripts/migrate_all_sqlite_to_mysql.py \
+  --directory /mnt/mlw-backup-20261101 \
+  --apply --confirm MIGRATE_ALL_EMPTY_TARGET
+```
+
+正式迁移先核验目标 29 张表全部为空，再统一事务插入，逐表比较记录数和字段值 SHA-256；异常时回滚。旧 SQLite 文件与原配置均不删除。源库字段与目标不一致时默认拒绝，不偷偷遗漏字段；如果运行旧版 SQLite schema，请先在**备份副本**升级 schema 并核对后再迁。
+
+6. 成功后在 WebUI 配置中设置：
 
 ```toml
 [storage]
-backend = "mysql"               # sqlite / mysql，默认 sqlite
-mysql_host = "mysql"             # 同 Docker 网络里 MySQL 的服务名；按实际环境修改
+backend = "mysql"
+mysql_host = "mysql"
 mysql_port = 3306
 mysql_user = "mai_living_world"
-mysql_password = "填写自己的强密码" # 不要上传日志或提交到 GitHub
+mysql_password = "填写本地安全密码"
 mysql_database = "mai_living_world"
 mysql_table_prefix = "mlw_"
 mysql_connect_timeout = 5
-sql_debug = false              # 开启 MyBatis 风格脱敏 SQL 日志，默认关闭
+sql_debug = false
 ```
 
-4. **保存并重载插件/重启 MaiBot**，查看日志出现 `storage=mysql`。只有当前后端被选中；不会双写。
-5. 没有运行 MySQL 时，保持 `backend = "sqlite"`，ZIP 仍可安装。MySQL 连接失败会报错而不会自动退回 SQLite，防止记录错乱。
+重载/重启 MaiBot 后，从管理员接口查询事实、目标、历史反思和各模块状态，再做小范围 QQ 联调。**不要在迁移前切换生产插件配置**。MySQL 连接异常时抛出错误而不是静默切换回 SQLite，避免两边数据分叉。
 
-**数据迁移：** MySQL 切换**不会自动移动任何 SQLite 数据**。外部资讯和主动尝试使用 `living_world.sqlite3`，另外五个 SQLite 文件（`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`）仍由本地模块使用。SQL 日志开关统一生效，但它**不会把这五套账本变为 MySQL**。要做到完全 MySQL 化，需要分别适配事务、索引和迁移。
+### 旧资讯库单独迁移
 
-在首次启用 MySQL 主库前，先**停止 MaiBot/禁用插件写入**，备份 `living_world.sqlite3`（含 WAL 变化）及其他账本，再准备**完全空的专用 MySQL 表**。迁移脚本默认只输出数量，不连接 MySQL：
-
-```bash
-python scripts/migrate_sqlite_to_mysql.py --sqlite /path/to/living_world.sqlite3
-```
-
-核对源库数量，使用环境变量设置 `MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE` 及可选 `MLW_MYSQL_PREFIX`。密码不要写进脚本或 Git 仓库。**正式导入需要两重确认**：
-
-```bash
-python scripts/migrate_sqlite_to_mysql.py \
-  --sqlite /path/to/living_world.sqlite3 \
-  --apply --confirm MIGRATE_EMPTY_TARGET
-```
-
-脚本仅允许目标三张业务表全部为空，先用事务写入，再校验三个表的数量及资讯长期记忆标记总数；有异常则回滚。完成后核对 MySQL 中数据及真实连接，再切换 `storage.backend="mysql"` 并重启。
+仅迁移外部资讯、主动尝试的旧脚本 `scripts/migrate_sqlite_to_mysql.py` 仍保留，用于特定场景；需要完整切换时请使用上面的六库迁移脚本，**不要两个脚本依次对同一个 MySQL 数据库执行**。
 
 ### MyBatis 风格 SQL 排查日志
 
@@ -304,7 +313,7 @@ python scripts/migrate_sqlite_to_mysql.py \
 
 SQLite 各账本及 MySQL 主库会使用同一开关，能显示 SQL 模板、参数**类型**、影响行数和耗时。**永不打印参数原值**，不含用户名密码、QQ 号、原始聊天或 Token。排障结束请设回 `sql_debug = false`，避免持续产生大量日志。
 
-当前 MySQL 主库接入通过模拟连接测试，**仍需在实际 MySQL 数据库中完成端到端验收**。如果你使用现有的 cap MySQL，请用单独的 `mai_living_world` 库，或至少不同表前缀，防止和 cap 的表混用。配置文件可能保存明文数据库密码，请限制文件权限并避免提交到仓库。
+完整账本 MySQL 集成测试使用 GitHub Actions 启动临时 MySQL 8.4；上线前仍须使用你的真实备份做校验及回滚演练。如果你使用现有的 cap MySQL，请用单独的 `mai_living_world` 库，或至少不同表前缀，防止和 cap 的表混用。配置文件可能保存明文数据库密码，请限制文件权限并避免提交到仓库。
 
 ## GitHub 公开仓库与发布 ZIP
 

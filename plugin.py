@@ -39,7 +39,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.9.1",
+        default="0.10.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -280,14 +280,14 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.cognition.enabled:
             self._ensure_cognition()
         self._feedback = ProactiveFeedback(Path(self.ctx.paths.data_dir) / "proactive_feedback.sqlite3",
-                                            logger=self.ctx.logger, sql_debug=storage.sql_debug)
+                                            **self._ledger_storage_options())
         self._feedback.expire_unfinished()
         if self.config.experience.enabled:
             self._ensure_experience()
         if self.config.brain_memory.enabled:
             self._ensure_brain()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.9.1；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.10.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -721,12 +721,29 @@ class MaiLivingWorld(MaiBotPlugin):
         targets = ["qq:private:"+x for x in ids] + ["qq:group:"+x for x in _clean_ids(self.config.audience.group_ids)]
         return {"ready": True, "targets": [self._feedback.status(t, day_start=day_start) for t in targets[:30]]}
 
+    def _ledger_storage_options(self) -> dict[str, Any]:
+        """统一六套数据后端；配置为 MySQL 时任何子库都不得偷偷回退到 SQLite。"""
+        cfg=self.config.storage
+        backend=str(cfg.backend).strip().lower()
+        mysql_settings=None
+        if backend=="mysql":
+            mysql_settings={
+                "host":cfg.mysql_host, "port":cfg.mysql_port,
+                "user":cfg.mysql_user,"password":cfg.mysql_password,
+                "database":cfg.mysql_database,"table_prefix":cfg.mysql_table_prefix,
+                "connect_timeout":cfg.mysql_connect_timeout,
+            }
+        elif backend!="sqlite":
+            raise ValueError("存储类型只能是 sqlite 或 mysql")
+        return {"logger":self.ctx.logger, "sql_debug":cfg.sql_debug,
+                "mysql_settings":mysql_settings}
+
     def _ensure_brain(self) -> BrainBook | None:
         if not (self.config.plugin.enabled and self.config.brain_memory.enabled):
             return None
         if self._brain is None:
             self._brain = BrainBook(Path(self.ctx.paths.data_dir) / "brain_book.sqlite3",
-                                    logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
+                                    **self._ledger_storage_options())
         return self._brain
 
     @API("living_world_brain_status",description="管理员按明确作用域查看事件/事实/目标数量",public=False)
@@ -784,7 +801,7 @@ class MaiLivingWorld(MaiBotPlugin):
             return None
         if self._experience is None:
             self._experience = ExperienceLoop(Path(self.ctx.paths.data_dir) / "experience_loop.sqlite3",
-                                              logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
+                                              **self._ledger_storage_options())
         return self._experience
 
     @API("living_world_experience_status",
@@ -960,7 +977,7 @@ class MaiLivingWorld(MaiBotPlugin):
             return None
         if self._cognition is None:
             self._cognition = CognitiveStore(Path(self.ctx.paths.data_dir) / "cognition.sqlite3",
-                                            logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
+                                            **self._ledger_storage_options())
         return self._cognition
 
     async def _think_public(self) -> None:
@@ -1040,7 +1057,7 @@ class MaiLivingWorld(MaiBotPlugin):
             return None
         if self._mind is None:
             self._mind = MindStore(Path(self.ctx.paths.data_dir) / "mind.sqlite3",
-                                   logger=self.ctx.logger, sql_debug=self.config.storage.sql_debug)
+                                   **self._ledger_storage_options())
         return self._mind
 
     async def _reflect_owner(self) -> None:
