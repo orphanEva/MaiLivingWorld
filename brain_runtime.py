@@ -68,40 +68,88 @@ def evidence_from_qq(messages: Any, scope: str, sid: str, limit: int = 30) -> li
     return list(selected.values())[-max(4,min(limit,80)):]
 
 
-def parse_proposal(result: Any, evidence: list[dict[str, Any]]) -> dict[str, Any] | None:
+def parse_proposal(result: Any, evidence: list[dict[str, Any]],
+                   diagnostics: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """解析可信证据提案；可选输出仅包含固定类别与数量的安全诊断。
+
+    绝不把聊天内容、LLM 原文、事实值或证据 ID 加入诊断信息。
+    """
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update({
+            "model": {k: 0 for k in ("events", "facts", "goals", "progress")},
+            "parsed": {k: 0 for k in ("events", "facts", "goals", "progress")},
+            "rejected": {},
+            "parse_error": "",
+        })
+
+    def reject(key: str, reason: str) -> None:
+        if diagnostics is not None:
+            code = key + "." + reason
+            rejected = diagnostics["rejected"]
+            rejected[code] = rejected.get(code, 0) + 1
+
+    def error(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics["parse_error"] = reason
+
     raw = extract_text(result).strip()
-    if len(raw)<2 or len(raw)>9000 or not raw.startswith("{") or not raw.endswith("}"):
+    if len(raw) < 2 or len(raw) > 9000:
+        error("response_length")
+        return None
+    if not raw.startswith("{") or not raw.endswith("}"):
+        error("non_json_object")
         return None
     try:
-        obj=json.loads(raw)
-    except (TypeError,ValueError):
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        error("json_decode")
         return None
-    if not isinstance(obj,dict):
+    if not isinstance(obj, dict):
+        error("wrong_root_type")
         return None
-    valid_ids={x["id"] for x in evidence}
+
+    valid_ids = {x["id"] for x in evidence}
     def clean_list(key: str, limit: int) -> list[dict[str, Any]]:
-        out=[]
-        for row in (obj.get(key) if isinstance(obj.get(key),list) else [])[:limit]:
-            if not isinstance(row,dict):
+        out: list[dict[str, Any]] = []
+        rows = obj.get(key)
+        if rows is None:
+            return out
+        if not isinstance(rows, list):
+            reject(key, "not_list")
+            return out
+        if diagnostics is not None:
+            diagnostics["model"][key] = len(rows)
+        if len(rows) > limit:
+            reject(key, "over_limit")
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                reject(key, "invalid_item")
                 continue
-            ids=row.get("evidence_ids")
-            if not isinstance(ids,list) or not ids or len(ids)>6:
+            ids = row.get("evidence_ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 6:
+                reject(key, "invalid_evidence_list")
                 continue
-            if len(set(ids))!=len(ids) or any(not isinstance(i,str) or i not in valid_ids for i in ids):
+            if (len(set(str(i) for i in ids)) != len(ids)
+                    or any(not isinstance(i, str) or i not in valid_ids for i in ids)):
+                reject(key, "unknown_or_duplicate_evidence")
                 continue
-            # 身份 ID 本身是可信结构化 QQ 数字，敏感词过滤只施加于模型生成的内容字段。
-            strings = [v for k,v in row.items() if isinstance(v,str) and k not in
-                       {"actor_id","subject_id","owner_id","goal_id"}]
+            strings = [v for k, v in row.items() if isinstance(v, str) and k not in
+                       {"actor_id", "subject_id", "owner_id", "goal_id"}]
             if any(UNSAFE.search(v) or "<" in v or ">" in v for v in strings):
+                reject(key, "unsafe_text")
                 continue
             out.append(dict(row))
+        if diagnostics is not None:
+            diagnostics["parsed"][key] = len(out)
         return out
-    summary=obj.get("reflection")
-    if not isinstance(summary,str) or UNSAFE.search(summary):
-        summary=""
-    return {"events":clean_list("events",3),"facts":clean_list("facts",3),
-            "goals":clean_list("goals",2),"progress":clean_list("progress",2),
-            "reflection":summary[:200]}
+
+    summary = obj.get("reflection")
+    if not isinstance(summary, str) or UNSAFE.search(summary):
+        summary = ""
+    return {"events": clean_list("events", 3), "facts": clean_list("facts", 3),
+            "goals": clean_list("goals", 2), "progress": clean_list("progress", 2),
+            "reflection": summary[:200]}
 
 
 def build_prompt(scope: str, evidence: list[dict[str,Any]], existing: dict[str,Any]) -> str:

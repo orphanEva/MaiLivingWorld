@@ -156,6 +156,37 @@ class BrainBookTests(unittest.TestCase):
                          ("superseded",2,2))
         migrated.close()
 
+    def test_store_diagnostic_reports_fixed_reason_only(self):
+        proof=[entry("D1"),entry("D2")]
+        diag={}
+        rows={
+            "facts":[{"subject_id":OTHER,"attribute":"衣服颜色","value":"蓝白",
+                      "confidence":.95,"evidence_ids":["D1","D2"]}],
+            "goals":[{"owner_id":OWNER,"title":"整理桌面数据线",
+                      "criterion":"全部贴编号标签并拍照",
+                      "next_action":"unknown_action","evidence_ids":["D1"]}]
+        }
+        stats=self.db.apply(PRIVATE,"diagnostic-test",proof,rows,now=self.now,
+                            quick=True,diagnostics=diag)
+        self.assertEqual(stats["facts"],0)
+        self.assertEqual(stats["goals"],0)
+        self.assertEqual(diag["store_rejected"]["facts.subject_evidence_mismatch"],1)
+        self.assertEqual(diag["store_rejected"]["goals.invalid_action"],1)
+        self.assertEqual(diag["store_attempted"]["facts"],1)
+        self.assertNotIn("蓝白",str(diag))
+        self.assertNotIn(OTHER,str(diag))
+
+    def test_store_diagnostic_counts_pending_fact(self):
+        diag={}
+        proof=[entry("D1",txt="我喜欢蓝白色")]
+        stats=self.db.apply(PRIVATE,"pending-test",proof,{"facts":[{
+            "subject_id":OWNER,"attribute":"配色偏好","value":"喜欢蓝白色",
+            "confidence":.93,"evidence_ids":["D1"]}]},
+            now=self.now,diagnostics=diag)
+        self.assertEqual(stats["facts"],1)
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["status"],"pending")
+        self.assertEqual(diag["store_rejected"],{})
+
     def test_quick_update_has_independent_cooldown(self):
         self.assertEqual(self.db.quick_due(PRIVATE,"quick-a",now=self.now), (True,"ready"))
         self.db.mark_quick_attempt(PRIVATE,self.now)
@@ -254,6 +285,28 @@ class EvidenceRuntimeTests(unittest.TestCase):
         evidence=evidence_from_qq([msg],PRIVATE,"private-one")
         self.assertEqual(evidence[0]["timestamp"],1234567000.0)
 
+    def test_parser_diagnostics_safe_counts_and_errors(self):
+        proof=[entry("E1")]
+        diag={}
+        payload={"facts":[
+            {"subject_id":OWNER,"attribute":"衣服配色","value":"喜欢蓝白",
+             "confidence":.93,"evidence_ids":["E1"]},
+            {"subject_id":OWNER,"attribute":"衣服配色","value":"喜欢黑色",
+             "confidence":.93,"evidence_ids":["forged"]}],
+            "goals":[{"owner_id":OWNER,"title":"给数据线贴标签",
+                      "criterion":"全部贴完且拍照","next_action":"wait",
+                      "evidence_ids":["E1"]}]}
+        parsed=parse_proposal({"content":json.dumps(payload,ensure_ascii=False)},proof,diag)
+        self.assertEqual(diag["model"]["facts"],2)
+        self.assertEqual(diag["parsed"]["facts"],1)
+        self.assertEqual(diag["parsed"]["goals"],1)
+        self.assertEqual(diag["rejected"]["facts.unknown_or_duplicate_evidence"],1)
+        self.assertEqual(len(parsed["facts"]),1)
+        self.assertNotIn("蓝白",str(diag))
+        self.assertNotIn("forged",str(diag))
+        self.assertIsNone(parse_proposal({"content":"not-json"},proof,diag))
+        self.assertEqual(diag["parse_error"],"non_json_object")
+
     def test_parser_rejects_forged_reference_and_sensitive_content(self):
         ev=[entry("E1")]
         parsed=parse_proposal({"content":json.dumps({
@@ -288,6 +341,23 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         if self.bot._brain:
             self.bot._brain.close()
         self.tmp.cleanup()
+
+    async def test_brain_stage_logs_never_contain_private_values(self):
+        from unittest.mock import MagicMock
+        self.bot.ctx.logger.info=MagicMock()
+        self.bot.config.brain_memory.enable_facts=True
+        msgs=[host_msg(f"diag-{i}",text=f"我喜欢蓝白色的衣服，第{i}次确认") for i in range(1,5)]
+        self.bot.ctx.message.get_recent.return_value=msgs
+        proof=evidence_from_qq(msgs,PRIVATE,"private-one")
+        self.bot.ctx.llm.generate.return_value={"content":json.dumps({"facts":[{
+            "subject_id":OWNER,"attribute":"衣服配色","value":"喜欢蓝白色",
+            "confidence":.95,"evidence_ids":[proof[0]["id"],proof[1]["id"]]}]},ensure_ascii=False)}
+        self.assertEqual(await self.bot._reflect_brain(quick=True),1)
+        entries=[call for call in self.bot.ctx.logger.info.call_args_list
+                 if "BRAIN-STAGES" in str(call.args[0])]
+        self.assertEqual(len(entries),1)
+        self.assertEqual(entries[0].args[4]["facts"],1)
+        self.assertNotIn("喜欢蓝白色",str(entries))
 
     async def test_model_reflection_and_switches(self):
         messages=[host_msg(f"m{i}",text=f"今天在练习第{i}次RNN网络训练") for i in range(1,5)]

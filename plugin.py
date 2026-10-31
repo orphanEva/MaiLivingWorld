@@ -39,7 +39,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.9.0",
+        default="0.9.1",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -283,7 +283,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.brain_memory.enabled:
             self._ensure_brain()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.9.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.9.1；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1156,9 +1156,12 @@ class MaiLivingWorld(MaiBotPlugin):
                 prompt=build_prompt(scope,evidence,existing)
                 response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
                                                     temperature=0.2,max_tokens=1300)
-                proposal=parse_proposal(response,evidence)
+                diagnostics: dict[str, Any] = {}
+                proposal=parse_proposal(response,evidence,diagnostics=diagnostics)
                 if proposal is None:
-                    self.ctx.logger.warning("[MaiLivingWorld][BRAIN] 反思JSON无效 scope=%s",scope)
+                    self.ctx.logger.warning("[MaiLivingWorld][BRAIN-STAGES] mode=%s scope=%s parse_error=%s",
+                                            "quick" if quick else "deep",scope,
+                                            diagnostics.get("parse_error","unknown"))
                     continue
                 for name,enabled in (("events",cfg.enable_events),("facts",cfg.enable_facts),
                                      ("goals",cfg.enable_goals),("progress",cfg.enable_progress)):
@@ -1166,7 +1169,15 @@ class MaiLivingWorld(MaiBotPlugin):
                 if quick or not cfg.enable_metacognition:
                     proposal["reflection"]=""
                 stats=db.apply(scope,signature,evidence,proposal,now=time.time(),
-                               event_limit=cfg.event_limit,quick=quick)
+                               event_limit=cfg.event_limit,quick=quick,diagnostics=diagnostics)
+                # 仅记录计数及枚举的拒绝原因；不要写入 LLM 响应、聊天原文或证据 ID。
+                self.ctx.logger.info(
+                    "[MaiLivingWorld][BRAIN-STAGES] mode=%s scope=%s model=%s parsed=%s "
+                    "attempted=%s accepted=%s parse_rejected=%s store_rejected=%s",
+                    "quick" if quick else "deep",scope,
+                    diagnostics.get("model",{}),diagnostics.get("parsed",{}),
+                    diagnostics.get("store_attempted",{}),stats,
+                    diagnostics.get("rejected",{}),diagnostics.get("store_rejected",{}))
                 processed+=1
                 self.ctx.logger.info("[MaiLivingWorld][%s] scope=%s 证据=%d 无时间=%d 事件=%d 事实=%d 目标=%d 进展=%d",
                                      "BRAIN-QUICK" if quick else "BRAIN",scope,len(evidence),
