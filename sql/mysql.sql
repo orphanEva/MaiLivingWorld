@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS `mlw_experience_evidence` (
             id BIGINT PRIMARY KEY AUTO_INCREMENT,
             event_id BIGINT NOT NULL,
             evidence_digest VARCHAR(191) NOT NULL,
-            signal VARCHAR(191) NOT NULL,
+            `signal` VARCHAR(191) NOT NULL,
             created_at DOUBLE NOT NULL,
             UNIQUE(event_id,evidence_digest)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
