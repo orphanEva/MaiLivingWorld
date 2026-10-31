@@ -83,6 +83,25 @@ def apply(source_rows: dict[str,list[dict]], config: dict) -> dict[str,int]:
     prefix=config["table_prefix"]
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,20}",prefix):
         raise ValueError("非法 MySQL 表前缀")
+    # 预检查必须发生在任何 CREATE/ALTER TABLE 之前：已有业务数据时零修改拒绝。
+    preflight=pymysql.connect(
+        host=config["host"],port=int(config["port"]),user=config["user"],
+        password=config["password"],database=config["database"],
+        charset="utf8mb4",autocommit=True,cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with preflight.cursor() as cur:
+            cur.execute("SELECT TABLE_NAME AS name FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA=DATABASE()")
+            present={row["name"] for row in cur.fetchall()}
+            for table in ALL_TABLES:
+                name=prefix+table
+                if name in present:
+                    cur.execute("SELECT COUNT(*) AS n FROM "+chr(96)+name+chr(96))
+                    if int(cur.fetchone()["n"]):
+                        raise ValueError("目标表非空，拒绝增量或覆盖："+table)
+    finally:
+        preflight.close()
     with tempfile.TemporaryDirectory() as temp:
         ensure_schema(config,Path(temp))
     con=pymysql.connect(
