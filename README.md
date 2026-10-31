@@ -256,6 +256,14 @@ SQLite 和 MySQL 实现相同的资讯与尝试记录接口；SQLite 零配置�
 
 **六套库统一后端（全量 MySQL 开发分支）：** `storage.backend="mysql"` 现在让外部资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback 全部使用 MySQL；`storage.backend="sqlite"` 则保留原有六个 SQLite 数据库。不会同时双写，也不会自动迁移旧数据。旧 SQLite 保持不变以备回滚，但回滚前需先处理 MySQL 期间产生的新记录。
 
+### MySQL 表结构中文注释（29 张表 / 183 字段）
+
+- 新建 MySQL 数据库：执行仓库的 `sql/mysql.sql`，29 张表及字段均已附上中文 `COMMENT`，可以在 DataGrip 的表/字段详情中查看。
+- **已经运行过旧版 DDL**：不要删表重建。先备份已有数据库，再在业务低峰且插件停止写入时，使用 `sql/mysql_comments_existing.sql` 给现有 29 张表和 183 个字段补充注释。
+- MySQL 的 `CREATE TABLE IF NOT EXISTS` **不会改变已有表注释或列注释**；仅重新执行更新后的建表 SQL 无法达到补注释效果。
+- 注释更新脚本使用 `ALTER TABLE ... MODIFY COLUMN ... COMMENT`，不会主动增删业务行，但数据库可能申请元数据锁、执行表重建；执行前建议先在同版本的测试库验证，确认 `SHOW CREATE TABLE` 与仓库 DDL 的列定义一致。
+- 注释脚本可重复执行，不应与业务并发写入，且不会迁移 SQLite 或修改插件后端配置。
+
 ### 一次性迁移六个 SQLite 库
 
 1. 使用**独立的、尚无业务数据的** MySQL 数据库，建议 MySQL 8.4；仓库 `sql/mysql.sql` 包含三张资讯表和 26 张内部账本表，共 **29 张**，可在数据库客户端执行。MySQL 需要支持 InnoDB、utf8mb4。已有的旧版三张表可保留，不需清空。
