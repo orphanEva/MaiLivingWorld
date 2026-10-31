@@ -52,8 +52,8 @@ def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
             actual={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             for name in names:
                 if name not in actual:
-                    result[name]=[]
-                    continue
+                    # 已有文件却缺少该模块应有的业务表，可能是旧版数据库或备份错误。
+                    raise RuntimeError(f"{file} 缺少预期表 {name}；请先升级备份副本再迁移")
                 result[name]=[dict(row) for row in db.execute('SELECT * FROM "'+name+'"')]
         finally:
             db.close()
@@ -144,6 +144,8 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description="一次性迁移 MaiLivingWorld 六个 SQLite 库（29张表）")
     parser.add_argument("--directory",required=True,type=Path,help="只读备份目录")
     parser.add_argument("--apply",action="store_true",help="实际写入空 MySQL")
+    parser.add_argument("--allow-missing",action="store_true",
+                        help="明确允许未启用的模块缺少 SQLite 文件")
     parser.add_argument("--confirm",default="",help="必须为 MIGRATE_ALL_EMPTY_TARGET")
     ns=parser.parse_args(argv)
     directory=ns.directory.resolve()
@@ -159,6 +161,8 @@ def main(argv=None):
         return 0
     if ns.confirm!="MIGRATE_ALL_EMPTY_TARGET":
         parser.error("正式导入需要 --confirm MIGRATE_ALL_EMPTY_TARGET")
+    if missing and not ns.allow_missing:
+        parser.error("备份缺少 SQLite 文件；请核对是否漏备份。确属未启用模块才加 --allow-missing")
     mandatory=["MLW_MYSQL_HOST","MLW_MYSQL_USER","MLW_MYSQL_PASSWORD","MLW_MYSQL_DATABASE"]
     if any(key not in os.environ for key in mandatory):
         parser.error("MySQL 配置必须通过环境变量提供："+",".join(mandatory))
