@@ -1,4 +1,4 @@
--- MaiLivingWorld v0.2.0 (MySQL 5.7+/8.x) 参考建库及建表语句
+-- MaiLivingWorld v0.10.0 (MySQL 8.4 已验证) 六套数据共 29 表
 -- 注意：插件切换到 MySQL 后会执行 CREATE TABLE IF NOT EXISTS，因此无需重复运行建表部分。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
 
