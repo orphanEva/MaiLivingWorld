@@ -11,6 +11,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,22 @@ def _goal_completion_proven(criterion: str, used: list[dict[str, Any]]) -> bool:
         return False
 
     return all(supported(atom) for atom in obligations)
+
+
+def _fact_value_key(value: str) -> str:
+    """仅规范确定的同义写法，避免模糊相似度误合并相反事实。"""
+    result = unicodedata.normalize("NFKC", value).casefold()
+    result = re.sub(r"\s+", "", result)
+    # 对独立缩写做精确替换，不能把其他单词中的 rnn 当作同一概念。
+    result = re.sub(r"(?<![a-z0-9])rnn(?![a-z0-9])", "循环神经网络", result)
+    # 仅调整“当前正在学习”的常见语序，不移除“已完成/刚开始/不学习”等阶段信息。
+    present = re.match(
+        r"^(?:(?:我|本人))?(?:(?:目前|当前|现在|现阶段))?"
+        r"(?:正在学习|在学习|正在学|在学|学习)", result
+    )
+    if present:
+        result = "在学习" + result[present.end():]
+    return result
 
 
 class BrainBook:
@@ -295,7 +312,17 @@ class BrainBook:
         used = [evidence[k] for k in ids[:6] if isinstance(k,str) and k in evidence and evidence[k]["actor_id"] == subject]
         if not subject or not used:
             return _record_reject(diagnostics, "facts", "subject_evidence_mismatch")
-        fid = "F" + _hash(scope+"\0"+subject+"\0"+attr.casefold()+"\0"+value.casefold())[:24]
+        key = _fact_value_key(value)
+        # 优先复用同范围、同主体、同属性下语义等价的既有记录，
+        # 兼容旧版用原文生成的事实 ID，不自动改变已审核的结论。
+        candidates = self.con.execute("""SELECT id,value,status FROM brain_facts
+            WHERE scope=? AND subject_id=? AND attribute=?
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1
+                 WHEN 'disputed' THEN 2 ELSE 3 END, updated DESC""",
+            (scope,subject,attr)).fetchall()
+        equivalent = next((r for r in candidates if _fact_value_key(r["value"]) == key), None)
+        fid = (equivalent["id"] if equivalent else
+               "F" + _hash(scope+"\0"+subject+"\0"+attr.casefold()+"\0"+key)[:24])
         self.con.execute("""INSERT OR IGNORE INTO brain_facts
           (id,scope,subject_id,attribute,value,confidence,status,created,updated)
           VALUES (?,?,?,?,?,?,'pending',?,?)""",
@@ -312,14 +339,17 @@ class BrainBook:
         if archived and count - reviewed < 2:
             self.con.execute("UPDATE brain_facts SET seen_count=? WHERE id=?",(count,fid))
             return _record_reject(diagnostics, "facts", "archived_needs_new_evidence")
-        other = self.con.execute("""SELECT id FROM brain_facts WHERE scope=? AND subject_id=?
-          AND attribute=? AND value!=? AND status='active' LIMIT 1""",
-          (scope,subject,attr,value)).fetchone()
+        # 文本不完全相同不等于事实矛盾；只把归一化后仍不同的有效值送入冲突审核。
+        other = next((r for r in candidates if r["id"] != fid
+                      and r["status"] == "active" and _fact_value_key(r["value"]) != key), None)
         # 两条独立用户消息支持才能自动升格；与已生效事实矛盾时双方冻结，人工裁决。
         state = "disputed" if other and count >= 2 else ("active" if count >= 2 and confidence >= .9 else "pending")
         if archived:
             # 重新出现的旧意见先进入待审，不能悄悄取代当前有效意见。
             state = "disputed" if other else "pending"
+        elif previous == "disputed":
+            # 已经进入人工审核的冲突不会因为再次出现等义消息就擅自解除。
+            state = "disputed"
         elif previous == "active" and state != "disputed":
             state = "active"
         self.con.execute("""UPDATE brain_facts SET status=?,confidence=MAX(confidence,?),
