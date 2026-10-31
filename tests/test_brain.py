@@ -570,6 +570,8 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.bot.ctx.message.get_recent.return_value=messages
         self.bot.ctx.llm.generate.return_value={"content":"{}"}
         self.bot.config.brain_memory.enable_metacognition=True
+        # 测试要满足正常的深度周期门槛；默认 12 小时，本例旧记录距今 3 小时。
+        self.bot.config.brain_memory.interval_hours=1
         self.assertEqual(await self.bot._reflect_brain(),1)
         self.assertIn(note,self.bot.ctx.llm.generate.await_args.args[0])
         self.assertNotIn(note,db.hint(PRIVATE))
