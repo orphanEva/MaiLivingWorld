@@ -39,6 +39,15 @@ def _short(value: Any, limit: int = MAX_TEXT, *, min_length: int = 4) -> str:
     return out[:limit] if len(out) >= min_length else ""
 
 
+def _record_reject(diagnostics: dict[str, Any] | None, category: str, reason: str) -> bool:
+    """只记录预定义拒绝原因和数量，不记录私人文本及标识符。"""
+    if diagnostics is not None:
+        reasons = diagnostics.setdefault("store_rejected", {})
+        code = category + "." + reason
+        reasons[code] = reasons.get(code, 0) + 1
+    return False
+
+
 class BrainBook:
     """无外部依赖的原子记忆账本，单插件 SQLite。"""
 
@@ -216,20 +225,21 @@ class BrainBook:
         return bool(cur.rowcount)
 
     def _upsert_fact(self, scope: str, proposal: dict[str, Any],
-                     evidence: dict[str, dict[str, Any]], now: float) -> bool:
+                     evidence: dict[str, dict[str, Any]], now: float,
+                     diagnostics: dict[str, Any] | None = None) -> bool:
         subject = str(proposal.get("subject_id") or "")
         attr = _short(proposal.get("attribute"), 36, min_length=1)
         value = _short(proposal.get("value"), 120, min_length=1)
         ids = proposal.get("evidence_ids")
         confidence = proposal.get("confidence")
         if not attr or not value or not isinstance(ids,list) or type(confidence) not in (float,int):
-            return False
+            return _record_reject(diagnostics, "facts", "missing_or_invalid_fields")
         if not math.isfinite(confidence) or not .5 <= confidence <= 1:
-            return False
+            return _record_reject(diagnostics, "facts", "invalid_confidence")
         # 不能仅凭群里别人的转述，生成某位用户的个人事实。
         used = [evidence[k] for k in ids[:6] if isinstance(k,str) and k in evidence and evidence[k]["actor_id"] == subject]
         if not subject or not used:
-            return False
+            return _record_reject(diagnostics, "facts", "subject_evidence_mismatch")
         fid = "F" + _hash(scope+"\0"+subject+"\0"+attr.casefold()+"\0"+value.casefold())[:24]
         self.con.execute("""INSERT OR IGNORE INTO brain_facts
           (id,scope,subject_id,attribute,value,confidence,status,created,updated)
@@ -246,7 +256,7 @@ class BrainBook:
         # 旧有证据不算第二次支持，旧记录也不会被抹掉。
         if archived and count - reviewed < 2:
             self.con.execute("UPDATE brain_facts SET seen_count=? WHERE id=?",(count,fid))
-            return False
+            return _record_reject(diagnostics, "facts", "archived_needs_new_evidence")
         other = self.con.execute("""SELECT id FROM brain_facts WHERE scope=? AND subject_id=?
           AND attribute=? AND value!=? AND status='active' LIMIT 1""",
           (scope,subject,attr,value)).fetchone()
@@ -268,17 +278,20 @@ class BrainBook:
         return True
 
     def _upsert_goal(self, scope: str, proposal: dict[str, Any],
-                     evidence: dict[str, dict[str, Any]], now: float) -> bool:
+                     evidence: dict[str, dict[str, Any]], now: float,
+                     diagnostics: dict[str, Any] | None = None) -> bool:
         title = _short(proposal.get("title"), 90, min_length=2)
         criterion = _short(proposal.get("criterion"), 100, min_length=2)
         action = proposal.get("next_action")
         owner = str(proposal.get("owner_id") or "")
         ids = proposal.get("evidence_ids")
-        if not title or not criterion or action not in ACTIONS or not isinstance(ids,list):
-            return False
+        if not title or not criterion or not isinstance(ids,list):
+            return _record_reject(diagnostics, "goals", "missing_or_invalid_fields")
+        if action not in ACTIONS:
+            return _record_reject(diagnostics, "goals", "invalid_action")
         used=[evidence[k] for k in ids[:6] if isinstance(k,str) and k in evidence and evidence[k]["actor_id"]==owner]
         if not owner or not used:
-            return False
+            return _record_reject(diagnostics, "goals", "owner_evidence_mismatch")
         gid = "G" + _hash(scope+"\0"+owner+"\0"+title.casefold())[:24]
         # 标题改写但完成条件完全相同时去重；周期性承诺与一次性任务不能合并。
         recurring = any(x in title for x in ("每年","每月","每周","每次","长期"))
@@ -302,19 +315,20 @@ class BrainBook:
         return True
 
     def _progress(self, scope: str, proposal: dict[str, Any],
-                  evidence: dict[str, dict[str, Any]], now: float) -> bool:
+                  evidence: dict[str, dict[str, Any]], now: float,
+                  diagnostics: dict[str, Any] | None = None) -> bool:
         gid = proposal.get("goal_id")
         state = proposal.get("state")
         ids = proposal.get("evidence_ids")
         if not isinstance(gid,str) or state not in {"done","abandoned"} or not isinstance(ids,list):
-            return False
+            return _record_reject(diagnostics, "progress", "invalid_fields")
         row=self.con.execute("SELECT * FROM brain_goals WHERE scope=? AND id=? AND status='open'",
                              (scope,gid)).fetchone()
         if not row:
-            return False
+            return _record_reject(diagnostics, "progress", "missing_or_closed_goal")
         used=[evidence[k] for k in ids[:6] if isinstance(k,str) and k in evidence and evidence[k]["actor_id"]==row["owner_id"]]
         if not used:
-            return False
+            return _record_reject(diagnostics, "progress", "owner_evidence_mismatch")
         # 不靠模型单方面宣布“任务完成”；需要拥有该目标的用户的新证据。
         for item in used:
             self.con.execute("INSERT OR IGNORE INTO brain_goal_events VALUES (?,?,?,?)",
@@ -325,24 +339,28 @@ class BrainBook:
 
     def apply(self, scope: str, history_hash: str, evidence: list[dict[str,Any]],
               response: dict[str,Any], *, now: float, event_limit: int = 200,
-              quick: bool = False) -> dict[str,int]:
+              quick: bool = False, diagnostics: dict[str, Any] | None = None) -> dict[str,int]:
         if not valid_scope(scope) or not isinstance(response,dict):
             return {"events":0,"facts":0,"goals":0,"progress":0}
         lookup={str(x["id"]):x for x in evidence if isinstance(x,dict) and
                 all(k in x for k in ("id","actor_id","digest","timestamp"))}
         output = {"events":0,"facts":0,"goals":0,"progress":0}
+        if diagnostics is not None:
+            diagnostics["store_attempted"] = {k: len(response.get(k, [])) if isinstance(response.get(k),list) else 0
+                                              for k in output}
+            diagnostics["store_rejected"] = {}
         with self.con:
             for item in (response.get("events") if isinstance(response.get("events"),list) else [])[:3]:
                 if isinstance(item,dict) and self._insert_event(scope,item,lookup,now):
                     output["events"]+=1
             for item in (response.get("facts") if isinstance(response.get("facts"),list) else [])[:3]:
-                if isinstance(item,dict) and self._upsert_fact(scope,item,lookup,now):
+                if isinstance(item,dict) and self._upsert_fact(scope,item,lookup,now,diagnostics):
                     output["facts"]+=1
             for item in (response.get("goals") if isinstance(response.get("goals"),list) else [])[:2]:
-                if isinstance(item,dict) and self._upsert_goal(scope,item,lookup,now):
+                if isinstance(item,dict) and self._upsert_goal(scope,item,lookup,now,diagnostics):
                     output["goals"]+=1
             for item in (response.get("progress") if isinstance(response.get("progress"),list) else [])[:2]:
-                if isinstance(item,dict) and self._progress(scope,item,lookup,now):
+                if isinstance(item,dict) and self._progress(scope,item,lookup,now,diagnostics):
                     output["progress"]+=1
             reflection = _short(response.get("reflection"),200)
             self.con.execute("""INSERT INTO brain_cycles
