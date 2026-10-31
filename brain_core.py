@@ -548,6 +548,33 @@ class BrainBook:
             "actions":rows("SELECT feedback_event_id,action,reason,outcome,user_feedback,recorded,finished FROM brain_decisions WHERE scope=? ORDER BY id DESC LIMIT ?"),
             "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created,cycle_kind FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
 
+    def recent_reflections(self, scope: str, *, now: float | None = None,
+                           limit: int = 2, max_age_days: int = 30) -> list[dict[str, Any]]:
+        """仅供同范围下一轮深度复盘；不向聊天提示注入未审核的模型总结。"""
+        if not valid_scope(scope):
+            return []
+        current = time.time() if now is None else float(now)
+        if not math.isfinite(current):
+            return []
+        take = max(1, min(3, int(limit)))
+        days = max(1, min(90, int(max_age_days)))
+        rows = self.con.execute("""SELECT scope,reflection,created FROM brain_cycles
+            WHERE scope=? AND cycle_kind='deep' AND source_count>0
+              AND TRIM(reflection)!='' AND created>=? AND created<=?
+            ORDER BY created DESC,id DESC LIMIT ?""",
+            (scope,current-days*86400,current,take*6)).fetchall()
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            note = " ".join(str(row["reflection"]).split())[:200]
+            if len(note) < 4 or note in seen:
+                continue
+            seen.add(note)
+            found.append({"scope": row["scope"],"reflection": note,"created": row["created"]})
+            if len(found) >= take:
+                break
+        return found
+
     def hint(self, scope: str, *, limit: int = 5) -> str:
         """只有当前作用域的已生效事实和待办；拒绝外部范围的召回。"""
         if not valid_scope(scope):

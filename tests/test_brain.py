@@ -183,6 +183,59 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "done")
 
+    def test_history_reflections_are_scoped_recent_deep_only_and_deduplicated(self):
+        old = self.now - 35 * 86400
+        cases = [
+            (PRIVATE, "past-old", "早期记录已经过时，需要重新核对", old, False),
+            (GROUP_SCOPE, "other-scope", "群内讨论的目标仍需确认", self.now-90, False),
+            (PRIVATE, "first", "主人尚未确认任务确实结束", self.now-60, False),
+            (PRIVATE, "repeat", "主人尚未确认任务确实结束", self.now-50, False),
+            (PRIVATE, "quick", "快速周期不该成为历史反思", self.now-30, True),
+            (PRIVATE, "latest", "学习任务的完成证据依然不明确", self.now-20, False),
+        ]
+        for scope,signature,reflection,stamp,quick in cases:
+            self.db.apply(scope, signature, [entry("E"+signature)], {
+                "reflection": reflection
+            }, now=stamp, quick=quick)
+        rows=self.db.recent_reflections(PRIVATE, now=self.now, limit=3)
+        self.assertEqual([r["reflection"] for r in rows], [
+            "学习任务的完成证据依然不明确",
+            "主人尚未确认任务确实结束",
+        ])
+        self.assertTrue(all(r["scope"]==PRIVATE for r in rows))
+        self.assertEqual(self.db.recent_reflections("private:../../bad", now=self.now),[])
+        self.assertEqual(len(self.db.recent_reflections(GROUP_SCOPE, now=self.now)),1)
+        self.assertNotIn("学习任务的完成证据依然不明确", self.db.hint(PRIVATE))
+
+    def test_history_reflections_do_not_become_new_evidence(self):
+        note="主人也许已经完成装箱，但还没有新证据"
+        self.db.apply(PRIVATE,"record-note",[entry("N1")],{"reflection":note},
+                      now=self.now-10)
+        past=self.db.recent_reflections(PRIVATE,now=self.now)
+        prompt=build_prompt(PRIVATE,[entry("E1")],{"facts":[],"goals":[]},
+                            prior_reflections=past)
+        self.assertIn(note,prompt)
+        self.assertIn("unverified_previous_model_review",prompt)
+        self.assertIn("不得把它当成新证据",prompt)
+        self.assertNotIn(note,build_prompt(PRIVATE,[entry("E1")],{}))
+        # 有历史反思却没有本轮真实引用时，解析器不会凭旧笔记产出事实。
+        parsed=parse_proposal({"content":json.dumps({"facts":[{
+            "subject_id":OWNER,"attribute":"goal_status","value":"已经装箱",
+            "confidence":.99,"evidence_ids":["N1"]}]} ,ensure_ascii=False)},
+            [entry("E1")])
+        self.assertEqual(parsed["facts"],[])
+
+    def test_historical_reflection_prompt_rejects_other_scope_and_sensitive_text(self):
+        rows=[
+            {"scope":GROUP_SCOPE,"reflection":"其他群的绝密计划，不得出现在私聊"},
+            {"scope":PRIVATE,"reflection":"密码12345678已经泄露"},
+            {"scope":PRIVATE,"reflection":"仍需核实是否真的完成了数据线整理"},
+        ]
+        prompt=build_prompt(PRIVATE,[entry("E1")],{},prior_reflections=rows)
+        self.assertNotIn("绝密计划",prompt)
+        self.assertNotIn("密码12345678",prompt)
+        self.assertIn("仍需核实是否真的完成了数据线整理",prompt)
+
     def test_conflict_requires_explicit_review(self):
         def p(value, i):
             return {"facts":[{"subject_id":OWNER,"attribute":"study_current_topic",
@@ -506,6 +559,41 @@ class BrainPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries),1)
         self.assertEqual(entries[0].args[4]["facts"],1)
         self.assertNotIn("喜欢蓝白色",str(entries))
+
+    async def test_prior_reflection_only_in_next_deep_cycle_and_respects_toggle(self):
+        note="整理数据线时确认条件不足，需要继续核对"
+        db=self.bot._ensure_brain()
+        db.apply(PRIVATE,"saved-reflection",[entry("PRE1")],
+                 {"reflection":note},now=time.time()-3*3600)
+        messages=[host_msg(f"cycle-{i}",text=f"准备检查第{i}根数据线的标签")
+                  for i in range(1,5)]
+        self.bot.ctx.message.get_recent.return_value=messages
+        self.bot.ctx.llm.generate.return_value={"content":"{}"}
+        self.bot.config.brain_memory.enable_metacognition=True
+        # 测试要满足正常的深度周期门槛；默认 12 小时，本例旧记录距今 3 小时。
+        self.bot.config.brain_memory.interval_hours=1
+        self.assertEqual(await self.bot._reflect_brain(),1)
+        self.assertIn(note,self.bot.ctx.llm.generate.await_args.args[0])
+        self.assertNotIn(note,db.hint(PRIVATE))
+        # 轻量更新必须看到新增 QQ 消息；内容不变时本来就应被限频保护跳过。
+        self.bot.ctx.message.get_recent.return_value=[
+            *messages, host_msg("cycle-5",text="刚贴完最后一根数据线的标签")
+        ]
+        self.bot.ctx.llm.generate.reset_mock()
+        self.assertEqual(await self.bot._reflect_brain(quick=True),1)
+        self.assertNotIn(note,self.bot.ctx.llm.generate.await_args.args[0])
+        # 即使笔记存在，关闭元认知也不能将其读取为模型提示。
+        self.bot.ctx.llm.generate.reset_mock()
+        self.bot.config.brain_memory.enable_metacognition=False
+        self.bot.config.brain_memory.interval_hours=1
+        new_msgs=[host_msg(f"new-cycle-{i}",text=f"再次检查第{i}根数据线")
+                  for i in range(1,5)]
+        self.bot.ctx.message.get_recent.return_value=new_msgs
+        db.con.execute("UPDATE brain_runs SET last_attempt=0,last_success=0 WHERE scope=?",
+                       (PRIVATE,))
+        db.con.commit()
+        self.assertEqual(await self.bot._reflect_brain(),1)
+        self.assertNotIn(note,self.bot.ctx.llm.generate.await_args.args[0])
 
     async def test_model_reflection_and_switches(self):
         messages=[host_msg(f"m{i}",text=f"今天在练习第{i}次RNN网络训练") for i in range(1,5)]
