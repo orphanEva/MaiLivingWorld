@@ -191,13 +191,26 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
                           "criterion":"已经购买裙子",
                           "next_action":"wait","evidence_ids":["MIG1"]}]},now=time.time())
             brain.close()
-            mind=MindStore(directory/"mind.sqlite3");mind.close()
-            cog=CognitiveStore(directory/"cognition.sqlite3");cog.close()
-            exp=ExperienceLoop(directory/"experience_loop.sqlite3");exp.close()
-            feedback=ProactiveFeedback(directory/"proactive_feedback.sqlite3");feedback.close()
+            # 每个独立 SQLite 子库都创建非空数据，检验全部模块的真实复制。
+            now=time.time()
+            mind=MindStore(directory/"mind.sqlite3")
+            mind.mark_attempt("12345678",now)
+            mind.close()
+            cog=CognitiveStore(directory/"cognition.sqlite3")
+            self.assertGreater(cog.begin(now,1),0)
+            cog.close()
+            exp=ExperienceLoop(directory/"experience_loop.sqlite3")
+            self.assertTrue(exp.begin(200,"12345678","session-one","explore","topic",now=now))
+            exp.close()
+            feedback=ProactiveFeedback(directory/"proactive_feedback.sqlite3")
+            self.assertGreater(feedback.begin("qq:private:12345678","session-one",now),0)
+            feedback.close()
             rows,missing=snapshot(directory)
             self.assertEqual(missing,[])
             self.assertEqual(len(rows),len(ALL_TABLES))
+            for table in ("stories","attempts","story_attempts","brain_goals",
+                          "mind_runs","cognitive_cycles","experience_actions","proactive_events"):
+                self.assertGreater(len(rows[table]),0,table)
             self.assertEqual(apply(rows,self.migration)["stories"],1)
             self.assertEqual(apply.__name__,"apply")
             with self.assertRaisesRegex(ValueError,"目标表非空"):
