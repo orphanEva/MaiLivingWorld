@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import re
 import time
+
+from .sql_logging import SQLAudit, SQLMySQLCursor
 from typing import Any
 
 
@@ -20,6 +22,9 @@ class MySQLStore:
         database: str,
         table_prefix: str = "mlw_",
         connect_timeout: int = 5,
+        *,
+        logger=None,
+        sql_debug: bool = False,
     ) -> None:
         # 标识符不能使用 SQL 值占位符；白名单校验后才允许拼进 SQL。
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,20}", table_prefix):
@@ -30,6 +35,7 @@ class MySQLStore:
             import pymysql
         except ImportError as exc:
             raise RuntimeError("MySQL 模式依赖 PyMySQL，请检查插件依赖是否安装成功") from exc
+        self._sql_audit = SQLAudit(logger=logger, enabled=sql_debug, backend="mysql")
         self.tables = {name: f"`{table_prefix}{name}`" for name in ("stories", "attempts", "story_attempts")}
         self.con = pymysql.connect(
             host=host, port=int(port), user=user, password=password,
@@ -79,7 +85,7 @@ class MySQLStore:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='每个聊天目标对每条资讯的分享去重'""",
         ]
         try:
-            with self.con.cursor() as cur:
+            with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
                 for stmt in ddl:
                     cur.execute(stmt)
             self.con.commit()
@@ -96,7 +102,7 @@ class MySQLStore:
         added = 0
         try:
             self.con.begin()
-            with self.con.cursor() as cur:
+            with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
                 now = time.time()
                 for story in stories:
                     added += cur.execute(
@@ -118,7 +124,7 @@ class MySQLStore:
         self._ping()
         s, sa = self.tables["stories"], self.tables["story_attempts"]
         cutoff = now - max_age_hours * 3600
-        with self.con.cursor() as cur:
+        with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
             cur.execute(
                 f"SELECT s.* FROM {s} s LEFT JOIN {sa} a ON s.`key`=a.story_key AND a.target=%s "
                 "WHERE a.story_key IS NULL AND s.first_seen >= %s "
@@ -131,7 +137,7 @@ class MySQLStore:
     def may_contact(self, target: str, now: float, day_start: float, min_gap_seconds: float, max_daily: int) -> tuple[bool, str]:
         self._ping()
         a = self.tables["attempts"]
-        with self.con.cursor() as cur:
+        with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
             cur.execute(
                 f"SELECT MAX(created_at) AS last_at, "
                 f"SUM(CASE WHEN created_at >= %s THEN 1 ELSE 0 END) AS day_count FROM {a} WHERE target=%s",
@@ -151,7 +157,7 @@ class MySQLStore:
         a, sa = self.tables["attempts"], self.tables["story_attempts"]
         try:
             self.con.begin()
-            with self.con.cursor() as cur:
+            with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
                 cur.execute(f"INSERT INTO {a}(target,created_at,story_key,kind) VALUES(%s,%s,%s,%s)",
                             (target, now, story_key, kind))
                 if story_key:
@@ -166,7 +172,7 @@ class MySQLStore:
         self._ping()
         try:
             self.con.begin()
-            with self.con.cursor() as cur:
+            with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
                 cur.execute(f"UPDATE {self.tables['stories']} SET memory_saved=1 WHERE `key`=%s", (key,))
             self.con.commit()
         except Exception:
@@ -175,7 +181,7 @@ class MySQLStore:
 
     def statistics(self) -> dict[str, int]:
         self._ping()
-        with self.con.cursor() as cur:
+        with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
             cur.execute(f"SELECT COUNT(*) AS n FROM {self.tables['stories']}")
             stories = cur.fetchone()["n"]
             cur.execute(f"SELECT COUNT(*) AS n FROM {self.tables['attempts']}")
@@ -186,7 +192,7 @@ class MySQLStore:
 
     def recent(self, limit: int = 15) -> list[dict[str, Any]]:
         self._ping()
-        with self.con.cursor() as cur:
+        with SQLMySQLCursor(self.con.cursor(), self._sql_audit) as cur:
             cur.execute(
                 f"SELECT `key`,source,title,url,first_seen,memory_saved FROM {self.tables['stories']} "
                 "ORDER BY first_seen DESC LIMIT %s", (limit,),

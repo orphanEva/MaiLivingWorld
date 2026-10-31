@@ -36,7 +36,7 @@ if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(manifest["version"])):
 version = manifest["version"]
 required = (
     "__init__.py", "_manifest.json", "plugin.py", "policy.py", "explore.py",
-    "bilibili.py", "store.py", "mysql_store.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "config.example.toml", "README.md", "LICENSE",
+    "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "config.example.toml", "README.md", "LICENSE",
 )
 for name in required:
     if not (ROOT / name).is_file():

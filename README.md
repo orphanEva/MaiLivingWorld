@@ -265,18 +265,46 @@ mysql_password = "填写自己的强密码" # 不要上传日志或提交到 Git
 mysql_database = "mai_living_world"
 mysql_table_prefix = "mlw_"
 mysql_connect_timeout = 5
+sql_debug = false              # 开启 MyBatis 风格脱敏 SQL 日志，默认关闭
 ```
 
 4. **保存并重载插件/重启 MaiBot**，查看日志出现 `storage=mysql`。只有当前后端被选中；不会双写。
 5. 没有运行 MySQL 时，保持 `backend = "sqlite"`，ZIP 仍可安装。MySQL 连接失败会报错而不会自动退回 SQLite，防止记录错乱。
 
-**数据迁移：** 切换后不会自动把旧 SQLite 的内容写入 MySQL。首次测试若 SQLite 已有真实记录，请先停止插件、备份数据库，再使用源码仓库中的 `scripts/migrate_sqlite_to_mysql.py` 进行一次性迁移；只支持**空的目标 MySQL 表**，以避免错误覆盖。迁移前从环境变量传入 `MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE`，以及可选的 `MLW_MYSQL_PREFIX`，执行：
+**数据迁移：** MySQL 切换**不会自动移动任何 SQLite 数据**。外部资讯和主动尝试使用 `living_world.sqlite3`，另外五个 SQLite 文件（`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`）仍由本地模块使用。SQL 日志开关统一生效，但它**不会把这五套账本变为 MySQL**。要做到完全 MySQL 化，需要分别适配事务、索引和迁移。
+
+在首次启用 MySQL 主库前，先**停止 MaiBot/禁用插件写入**，备份 `living_world.sqlite3`（含 WAL 变化）及其他账本，再准备**完全空的专用 MySQL 表**。迁移脚本默认只输出数量，不连接 MySQL：
 
 ```bash
 python scripts/migrate_sqlite_to_mysql.py --sqlite /path/to/living_world.sqlite3
 ```
 
-当前 MySQL 接入通过模拟连接测试，**尚未连接实际数据库做端到端验收**。如果你使用现有的 cap MySQL，请用单独的 `mai_living_world` 库，或至少不同表前缀，防止和 cap 的表混用。配置文件可能保存明文数据库密码，请限制文件权限并避免提交到仓库。
+核对源库数量，使用环境变量设置 `MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE` 及可选 `MLW_MYSQL_PREFIX`。密码不要写进脚本或 Git 仓库。**正式导入需要两重确认**：
+
+```bash
+python scripts/migrate_sqlite_to_mysql.py \
+  --sqlite /path/to/living_world.sqlite3 \
+  --apply --confirm MIGRATE_EMPTY_TARGET
+```
+
+脚本仅允许目标三张业务表全部为空，先用事务写入，再校验三个表的数量及资讯长期记忆标记总数；有异常则回滚。完成后核对 MySQL 中数据及真实连接，再切换 `storage.backend="mysql"` 并重启。
+
+### MyBatis 风格 SQL 排查日志
+
+设置 `[storage] sql_debug = true` 并重载插件，在 MaiBot 日志中可看到类似输出（为示意，敏感参数始终隐藏）：
+
+```text
+[MaiLivingWorld][SQL][mysql] ==> Preparing: SELECT ... WHERE target=%s
+[MaiLivingWorld][SQL][mysql] ==> Parameters: [str(***)]
+[MaiLivingWorld][SQL][mysql] <== Executed (0.41 ms)
+[MaiLivingWorld][SQL][sqlite] ==> Preparing: UPDATE brain_goals SET status=? WHERE id=?
+[MaiLivingWorld][SQL][sqlite] ==> Parameters: [str(***), str(***)]
+[MaiLivingWorld][SQL][sqlite] <== Updates: 1 (0.22 ms)
+```
+
+SQLite 各账本及 MySQL 主库会使用同一开关，能显示 SQL 模板、参数**类型**、影响行数和耗时。**永不打印参数原值**，不含用户名密码、QQ 号、原始聊天或 Token。排障结束请设回 `sql_debug = false`，避免持续产生大量日志。
+
+当前 MySQL 主库接入通过模拟连接测试，**仍需在实际 MySQL 数据库中完成端到端验收**。如果你使用现有的 cap MySQL，请用单独的 `mai_living_world` 库，或至少不同表前缀，防止和 cap 的表混用。配置文件可能保存明文数据库密码，请限制文件权限并避免提交到仓库。
 
 ## GitHub 公开仓库与发布 ZIP
 

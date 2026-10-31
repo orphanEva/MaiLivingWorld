@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+
+from .sql_logging import connect_sqlite
 import time
 from pathlib import Path
 from typing import Any
@@ -49,9 +51,9 @@ def digest(value: str) -> str:
 class ExperienceLoop:
     """独立 SQLite 经验账本；仅存 QQ 主人私聊中主动发送的关联记录。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(str(path), timeout=10)
+        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
         self.con.execute("PRAGMA busy_timeout=10000")
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript("""

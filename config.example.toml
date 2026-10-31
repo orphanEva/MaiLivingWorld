@@ -35,6 +35,9 @@ mysql_database = "mai_living_world"
 mysql_table_prefix = "mlw_"
 # MySQL 连接超时（秒）
 mysql_connect_timeout = 5
+# 仅用于临时排查：MyBatis 风格 SQL 模板、脱敏参数类型、影响行数和耗时；默认关闭。
+# 绝不打印具体参数值（包括 QQ 号、私聊正文和数据库密码）。
+sql_debug = false
 
 # ====================================================================
 # 08 / 经验与行为反馈（绑定主人 QQ 的真实私聊；默认关闭）

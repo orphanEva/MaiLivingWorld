@@ -34,7 +34,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(set(parsed), set(defaults))
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
-        self.assertEqual(total_fields, 98)
+        self.assertEqual(total_fields, 99)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")

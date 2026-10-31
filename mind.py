@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import sqlite3
+
+from .sql_logging import connect_sqlite
 import time
 from pathlib import Path
 from typing import Any
@@ -127,9 +129,9 @@ def parse_reflection(response: Any, evidence: list[dict[str, str]], *, min_confi
 class MindStore:
     """每位主人独立存储；旧版无证据笔记保留但只供人工审查。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(str(path), timeout=15)
+        self.con = connect_sqlite(str(path), timeout=15, logger=logger, sql_debug=sql_debug)
         self.con.execute('PRAGMA journal_mode=WAL')
         self.con.execute('PRAGMA busy_timeout=15000')
         self.con.executescript('''
