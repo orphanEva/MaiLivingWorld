@@ -145,6 +145,8 @@ class MySQLCompatConnection:
         query = _MAX_TWO.sub(r"GREATEST(\1,", query)
         query = re.sub(r"\blast_insert_rowid\s*\(\s*\)", "LAST_INSERT_ID()", query, flags=re.I)
         query = query.replace("?", "%s")
+        # SQLite rowid 用于旧目标时间线的稳定同时间排序；MySQL 无隐式 rowid。
+        query = re.sub(r"\browid\b", "message_digest", query, flags=re.I)
         # MySQL rejects LIMIT directly inside an IN subquery.
         limited = re.compile(
             r"\bNOT\s+IN\s*\(\s*(SELECT\s+.*?\bLIMIT\s+(?:%s|\d+))\s*\)",
@@ -183,6 +185,17 @@ class MySQLCompatConnection:
         if re.match(r"\s*PRAGMA\s+(?:journal_mode|busy_timeout|foreign_keys)\b",sql,re.I):
             return Result(rows=[])
         return self._raw(sql, parameters)
+
+    def executemany(self, sql: str, seq_of_parameters):
+        cursor = self.con.cursor()
+        try:
+            query = self._sql(sql)
+            # 批量参数可能是生成器，不展开、更不输出数据。
+            self.audit.run(query, None, lambda: cursor.executemany(query, seq_of_parameters))
+            return Result(cursor)
+        except BaseException:
+            cursor.close()
+            raise
 
     def executescript(self, script: str):
         for stmt in script.split(";"):
