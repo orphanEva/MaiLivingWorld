@@ -1,6 +1,13 @@
-# MaiLivingWorld · 麦麦的小世界 v0.9.1（渐进记忆与动态认知）
+# MaiLivingWorld · 麦麦的小世界 v0.10.0（统一 MySQL 持久化）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+
+## v0.10.0 · 六套 SQLite/MySQL 同后端及完整迁移
+
+- `[storage] backend="mysql"` 统一控制外部资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback 六套持久化，不再只切换资讯库。
+- `sql/mysql.sql` 包含总计 29 张表，建议 MySQL 8.4，保留原始作用域、身份、主键、历史审核状态和证据表。
+- `scripts/migrate_all_sqlite_to_mysql.py` 支持一次性只读预览；正式导入必须目标为空、数据库字段完全匹配、全部表校验通过且原子提交。确实没有启用某个模块时，正式迁移需显式加 `--allow-missing`。
+- SQLite 仍为可选后端；MyBatis 风格的脱敏 SQL 日志共用 `storage.sql_debug`。**线上迁移前必须停止写入并完整备份，不会自动双写。**
 
 ## v0.9.1 · 事实与目标未入库的隐私安全诊断
 
@@ -253,7 +260,7 @@ SQLite 和 MySQL 实现相同的资讯与尝试记录接口；SQLite 零配置�
 
 1. 使用**独立的、尚无业务数据的** MySQL 数据库，建议 MySQL 8.4；仓库 `sql/mysql.sql` 包含三张资讯表和 26 张内部账本表，共 **29 张**，可在数据库客户端执行。MySQL 需要支持 InnoDB、utf8mb4。已有的旧版三张表可保留，不需清空。
 2. **先停止 MaiLivingWorld 的所有写入**，备份六个 SQLite 文件和原插件配置。SQLite 使用 WAL 时必须一并处理 `-wal` 文件，建议对每个库运行 `sqlite3.Connection.backup()` 得到一致快照；不要只复制正在写入的主数据库。迁移不保证六个库在并发写入时自动取得同一时刻的快照。
-3. 将完整快照放在一个独立目录，例如 `/mnt/mlw-backup-20261101/`，包含（如存在）：`living_world.sqlite3`、`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`。少数模块未启用时允许缺失，但未启用不代表已经完成迁移。
+3. 将完整快照放在一个独立目录，例如 `/mnt/mlw-backup-20261101/`，包含（如存在）：`living_world.sqlite3`、`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`。少数模块未启用时允许缺失；正式执行时须加 `--allow-missing`，避免漏备份被当成空账本。
 4. 在拥有迁移脚本和 Python 依赖的环境下先预览，不连接 MySQL、不修改文件：
 
 ```bash
