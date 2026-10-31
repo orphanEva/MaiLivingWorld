@@ -85,17 +85,14 @@ class Result:
 def mysql_create_table(sql: str) -> str:
     """将限定范围内的 SQLite CREATE TABLE 定义变成 MySQL 8.4 InnoDB DDL。"""
     lines = []
+    def replace_text(match):
+        column = match.group(1).lower()
+        # 索引/主键一律短字符串，较长的私聊摘要等用 TEXT。
+        typ = ("LONGTEXT" if column == "payload" else "TEXT") if column in LONG_TEXT else "VARCHAR(191)"
+        return match.group(1) + " " + typ
+
     for line in sql.strip().splitlines():
-        m = re.match(r"(\s*)(\w+)\s+TEXT\b(.*)$", line, re.I)
-        if m:
-            indent, column, tail = m.groups()
-            if column.lower() in LONG_TEXT and "DEFAULT" not in tail.upper():
-                sqltype = "LONGTEXT" if column.lower() == "payload" else "TEXT"
-            elif column.lower() in LONG_TEXT:
-                sqltype = "VARCHAR(1024)"
-            else:
-                sqltype = "VARCHAR(191)"
-            line = indent + column + " " + sqltype + tail
+        line = re.sub(r"\b(\w+)\s+TEXT\b", replace_text, line, flags=re.I)
         line = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
                       "BIGINT PRIMARY KEY AUTO_INCREMENT", line, flags=re.I)
         line = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "BIGINT PRIMARY KEY", line, flags=re.I)
