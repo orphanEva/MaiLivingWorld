@@ -9,6 +9,8 @@ import hashlib
 import json
 import re
 import sqlite3
+
+from .sql_logging import connect_sqlite
 import time
 from pathlib import Path
 from typing import Any
@@ -87,9 +89,9 @@ def parse_cognition(result: Any, sources: list[dict[str, Any]], existing: list[d
 class CognitiveStore:
     """独立 SQLite，只保存公开信息的元数据、来源链接、候选问题和审核事件。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, logger=None, sql_debug: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con = sqlite3.connect(str(path), timeout=10)
+        self.con = connect_sqlite(str(path), timeout=10, logger=logger, sql_debug=sql_debug)
         self.con.execute("PRAGMA busy_timeout=10000")
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript("""
