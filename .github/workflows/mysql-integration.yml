@@ -1,0 +1,38 @@
+name: MySQL integration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  mysql-live:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-test-root-only
+          MYSQL_DATABASE: mai_living_world_test
+          MYSQL_USER: mlw_test
+          MYSQL_PASSWORD: ci-test-only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MLW_LIVE_MYSQL: "1"
+      MLW_MYSQL_HOST: "127.0.0.1"
+      MLW_MYSQL_PORT: "3306"
+      MLW_MYSQL_USER: "mlw_test"
+      MLW_MYSQL_PASSWORD: "ci-test-only"
+      MLW_MYSQL_DATABASE: "mai_living_world_test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'PyMySQL>=1.1,<2.0'
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_live.py' -v
