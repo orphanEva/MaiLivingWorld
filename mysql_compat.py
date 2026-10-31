@@ -36,26 +36,21 @@ _EXCLUDED = re.compile(r"\bexcluded\.(\w+)", re.IGNORECASE)
 _MAX_TWO = re.compile(r"\bMAX\s*\(\s*(\w+)\s*,", re.IGNORECASE)
 
 
-class CompatRow:
-    """兼容 SQLite Row 的 [0]/['column']/keys()/迭代元组用法。"""
-    def __init__(self, data: dict[str, Any]):
-        self.data = data
-        self.values = tuple(data.values())
+class CompatRow(tuple):
+    """保持 SQLite Row 的序列兼映射行为，支持 json.dumps 和 dict(row)。"""
+    def __new__(cls, data: dict[str, Any]):
+        obj = super().__new__(cls, data.values())
+        obj._names = tuple(data.keys())
+        return obj
 
     def __getitem__(self, key):
-        return self.values[key] if isinstance(key, int) else self.data[key]
-
-    def __iter__(self):
-        return iter(self.values)
-
-    def __len__(self):
-        return len(self.values)
+        if isinstance(key, str):
+            return super().__getitem__(self._names.index(key))
+        return super().__getitem__(key)
 
     def keys(self):
-        return self.data.keys()
+        return self._names
 
-    def __repr__(self):
-        return repr(self.data)
 
 
 class Result:
@@ -88,7 +83,12 @@ def mysql_create_table(sql: str) -> str:
     def replace_text(match):
         column = match.group(1).lower()
         # 索引/主键一律短字符串，较长的私聊摘要等用 TEXT。
-        typ = ("LONGTEXT" if column == "payload" else "TEXT") if column in LONG_TEXT else "VARCHAR(191)"
+        rest = sql[match.end():].split(",", 1)[0]
+        if column in LONG_TEXT:
+            typ = ("VARCHAR(1024)" if re.search(r"\\bDEFAULT\\b", rest, re.I)
+                   else "LONGTEXT" if column == "payload" else "TEXT")
+        else:
+            typ = "VARCHAR(191)"
         return match.group(1) + " " + typ
 
     for line in sql.strip().splitlines():
