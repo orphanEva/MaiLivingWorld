@@ -236,6 +236,118 @@ class BrainBookTests(unittest.TestCase):
         self.assertNotIn("密码12345678",prompt)
         self.assertIn("仍需核实是否真的完成了数据线整理",prompt)
 
+    def test_goal_progress_timeline_relates_shared_events_and_facts(self):
+        # 用户提出“贴编号并拍照”，随后分两次汇报工作；前两轮不能提前结案。
+        self.db.apply(PRIVATE,"timeline-origin",[entry("T1",txt="我要给数据线贴编号标签并拍照")],
+                      {"goals":[{"owner_id":OWNER,"title":"整理数据线",
+                                 "criterion":"全部贴编号标签并拍照",
+                                 "next_action":"follow_up","evidence_ids":["T1"]}]},
+                      now=self.now)
+        goal=self.db.recall(PRIVATE)["goals"][0]
+        gid=goal["id"]
+
+        stage=[entry("T2",txt="我已经给数据线贴了一些编号标签，拍照还没做")]
+        payload={
+            "events":[{"actor_id":OWNER,"kind":"experience","summary":"已经开始给数据线贴编号",
+                       "importance":2,"evidence_ids":["T2"]}],
+            "facts":[{"subject_id":OWNER,"attribute":"数据线整理进度",
+                      "value":"正在贴编号标签","confidence":.9,"evidence_ids":["T2"]}],
+            "progress":[{"goal_id":gid,"state":"in_progress","evidence_ids":["T2"]}]
+        }
+        counts=self.db.apply(PRIVATE,"timeline-stage-1",stage,payload,now=self.now+10)
+        self.assertEqual((counts["events"],counts["facts"],counts["progress"]),(1,1,1))
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"],"open")
+        trace=self.db.goal_trace(PRIVATE,gid)
+        self.assertTrue(trace["found"])
+        self.assertEqual([x["kind"] for x in trace["timeline"]],["origin","in_progress"])
+        milestone=trace["timeline"][1]
+        self.assertEqual(milestone["relation"],"shared_verified_message")
+        self.assertEqual(milestone["events"][0]["summary"],"已经开始给数据线贴编号")
+        self.assertEqual(milestone["facts"][0]["attribute"],"数据线整理进度")
+        # 后续深度整理应看见此目标的历史阶段，但绝不将其视为新消息证据。
+        existing=self.db.recall(PRIVATE)
+        self.assertEqual(len(existing["milestones"]),1)
+        self.assertEqual(existing["milestones"][0]["stage"],"in_progress")
+        later=build_prompt(PRIVATE,[entry("NEXT")],existing)
+        self.assertIn("milestones",later)
+        self.assertIn("已经开始给数据线贴编号",later)
+        self.assertIn("不代表语义必然相关",later)
+        # 不返回未经筛选的聊天原文或证据摘要标识符。
+        self.assertNotIn("hash:T2",str(trace))
+        self.assertNotIn("拍照还没做",str(trace))
+        revision=self.db.recall(PRIVATE)["goals"][0]["revision"]
+        second=self.db.apply(PRIVATE,"timeline-duplicate",stage,{
+            "progress":[{"goal_id":gid,"state":"in_progress","evidence_ids":["T2"]}]
+        },now=self.now+11)
+        self.assertEqual(second["progress"],0)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["revision"],revision)
+
+        # 来源正确且完整满足条件的后续独立消息才真正结案。
+        done=self.db.apply(PRIVATE,"timeline-done",
+            [entry("T3",txt="我已经全部贴编号标签并拍照了")],
+            {"progress":[{"goal_id":gid,"state":"done","evidence_ids":["T3"]}]},
+            now=self.now+30)
+        self.assertEqual(done["progress"],1)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"],"done")
+        self.assertEqual([x["kind"] for x in self.db.goal_trace(PRIVATE,gid)["timeline"]],
+                         ["origin","in_progress","done"])
+
+    def test_goal_trace_scope_protection_and_no_invented_association(self):
+        self.db.apply(PRIVATE,"g1",[entry("A1")],{
+            "goals":[{"owner_id":OWNER,"title":"给数据线贴标签",
+                      "criterion":"全部贴完并拍照","next_action":"wait",
+                      "evidence_ids":["A1"]}]},now=self.now)
+        gid=self.db.recall(PRIVATE)["goals"][0]["id"]
+        # 仅同消息同发言者才建立来源关联；另一条消息不应自动关联。
+        self.db.apply(PRIVATE,"unrelated",[entry("B1")],{
+            "events":[{"actor_id":OWNER,"kind":"experience","summary":"今天散步去了",
+                       "importance":2,"evidence_ids":["B1"]}]},now=self.now+10)
+        self.db.apply(GROUP_SCOPE,"cross",[entry("A1",who=OTHER)],{
+            "events":[{"actor_id":OTHER,"kind":"experience","summary":"群里有人谈论数据线",
+                       "importance":2,"evidence_ids":["A1"]}]},now=self.now+10)
+        timeline=self.db.goal_trace(PRIVATE,gid)["timeline"]
+        self.assertEqual(len(timeline),1)
+        self.assertEqual(timeline[0]["events"],[])
+        self.assertEqual(timeline[0]["facts"],[])
+        self.assertFalse(self.db.goal_trace(GROUP_SCOPE,gid)["found"])
+        self.assertFalse(self.db.goal_trace("private:../bad",gid)["found"])
+        self.assertFalse(self.db.goal_trace(PRIVATE,"nonexistent")["found"])
+        self.assertEqual(self.db.recent_goal_milestones(GROUP_SCOPE),[])
+        # 模拟传入的错误作用域历史也不得被模型提示引用。
+        fake={"milestones":[
+            {"scope":GROUP_SCOPE,"goal_id":"Gfake","stage":"in_progress",
+             "event_hint":"群聊内部讨论的秘密事件"},
+            {"scope":PRIVATE,"goal_id":gid,"stage":"in_progress",
+             "event_hint":"密码12345678不应回灌"},
+        ]}
+        prompt=build_prompt(PRIVATE,[entry("NEXT")],fake)
+        self.assertNotIn("群聊内部讨论的秘密事件",prompt)
+        self.assertNotIn("密码12345678",prompt)
+        # 其他人的消息不能更新目标阶段。
+        denied=self.db.apply(PRIVATE,"cross-user",[entry("Z1",who=OTHER,txt="正在贴标签")],{
+            "progress":[{"goal_id":gid,"state":"in_progress","evidence_ids":["Z1"]}]
+        },now=self.now+20)
+        self.assertEqual(denied["progress"],0)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"],"open")
+
+    def test_goal_progress_does_not_accept_future_plans(self):
+        self.db.apply(PRIVATE,"origin",[entry("A1")],{
+            "goals":[{"owner_id":OWNER,"title":"整理书房桌面",
+                      "criterion":"桌面彻底清理干净","next_action":"wait",
+                      "evidence_ids":["A1"]}]},now=self.now)
+        gid=self.db.recall(PRIVATE)["goals"][0]["id"]
+        for i,text in enumerate(("我打算明天开始整理书房",
+                                 "如果已经开始整理就告诉你",
+                                 "准备开始整理桌面"),1):
+            eid="P"+str(i)
+            rows=[entry(eid,txt=text)]
+            n=self.db.apply(PRIVATE,"not-progress-"+str(i),rows,{
+                "progress":[{"goal_id":gid,"state":"in_progress","evidence_ids":[eid]}]
+            },now=self.now+i)["progress"]
+            self.assertEqual(n,0,text)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"],"open")
+        self.assertEqual([x["kind"] for x in self.db.goal_trace(PRIVATE,gid)["timeline"]],["origin"])
+
     def test_conflict_requires_explicit_review(self):
         def p(value, i):
             return {"facts":[{"subject_id":OWNER,"attribute":"study_current_topic",

@@ -405,7 +405,7 @@ class BrainBook:
         gid = proposal.get("goal_id")
         state = proposal.get("state")
         ids = proposal.get("evidence_ids")
-        if not isinstance(gid,str) or state not in {"done","abandoned"} or not isinstance(ids,list):
+        if not isinstance(gid,str) or state not in {"in_progress","done","abandoned"} or not isinstance(ids,list):
             return _record_reject(diagnostics, "progress", "invalid_fields")
         row=self.con.execute("SELECT * FROM brain_goals WHERE scope=? AND id=? AND status='open'",
                              (scope,gid)).fetchone()
@@ -425,12 +425,32 @@ class BrainBook:
             return _record_reject(diagnostics, "progress", "no_new_owner_evidence")
         if state == "done" and not _goal_completion_proven(row["criterion"], fresh):
             return _record_reject(diagnostics, "progress", "criterion_not_proven")
+        if state == "in_progress":
+            # 阶段进展不等于完成。必须是主人明确描述的正在进行/阶段性行动，
+            # 不能将单纯的未来打算、反问或假设当作现实进展。
+            if not any(
+                isinstance(item.get("text"),str)
+                and not any(x in item["text"] for x in
+                            ("如果","假如","计划","打算","准备","想要","可能","大概",
+                             "将来","明天","之后","以后","还没开始","尚未开始","没有开始",
+                             "吗？","吗?","？","?"))
+                and any(x in item["text"] for x in
+                        ("已经","正在","目前","开始","做了","完成了","弄了","处理了","刚刚","还在","进展","进度","已"))
+                for item in fresh
+            ):
+                return _record_reject(diagnostics, "progress", "progress_not_proven")
         # 只保留来自目标主人的新证据；不能单凭模型输出状态完成目标。
         for item in fresh:
             self.con.execute("INSERT OR IGNORE INTO brain_goal_events VALUES (?,?,?,?)",
                              (gid,item["digest"],state,now))
-        self.con.execute("""UPDATE brain_goals SET status=?,closed_at=?,updated=?,revision=revision+1
-                             WHERE id=?""",(state,now,now,gid))
+        if state == "in_progress":
+            # 保持 open，只追加阶段记录；后续仍需新的明确完成证据才允许 done。
+            self.con.execute("""UPDATE brain_goals SET updated=?,revision=revision+1
+                                 WHERE scope=? AND id=? AND status='open'""",(now,scope,gid))
+        else:
+            self.con.execute("""UPDATE brain_goals SET status=?,closed_at=?,updated=?,revision=revision+1
+                                 WHERE scope=? AND id=? AND status='open'""",
+                             (state,now,now,scope,gid))
         return True
 
     def apply(self, scope: str, history_hash: str, evidence: list[dict[str,Any]],
@@ -545,8 +565,67 @@ class BrainBook:
             "events":rows("SELECT id,actor_id,kind,summary,importance,happened FROM brain_events WHERE scope=? ORDER BY happened DESC LIMIT ?"),
             "facts":rows("SELECT id,subject_id,attribute,value,confidence,status,seen_count,updated FROM brain_facts WHERE scope=? ORDER BY updated DESC LIMIT ?"),
             "goals":rows("SELECT id,owner_id,title,criterion,next_action,status,revision FROM brain_goals WHERE scope=? ORDER BY updated DESC LIMIT ?"),
+            "milestones":self.recent_goal_milestones(scope,limit=n),
             "actions":rows("SELECT feedback_event_id,action,reason,outcome,user_feedback,recorded,finished FROM brain_decisions WHERE scope=? ORDER BY id DESC LIMIT ?"),
             "reflections":rows("SELECT source_count,added_events,added_facts,updated_goals,reflection,created,cycle_kind FROM brain_cycles WHERE scope=? ORDER BY id DESC LIMIT ?")}
+
+    def recent_goal_milestones(self, scope: str, *, limit: int = 6) -> list[dict[str, Any]]:
+        """返回同作用域目标的近期阶段标记；相关事件仍是待核实线索。"""
+        if not valid_scope(scope):
+            return []
+        n=max(1,min(int(limit),12))
+        rows=self.con.execute("""SELECT ge.goal_id,ge.message_digest,ge.kind,ge.recorded,
+                 g.owner_id,g.status
+            FROM brain_goal_events ge JOIN brain_goals g ON g.id=ge.goal_id
+            WHERE g.scope=? AND ge.kind IN ('in_progress','done','abandoned')
+            ORDER BY ge.recorded DESC,ge.rowid DESC LIMIT ?""",(scope,n)).fetchall()
+        out=[]
+        for row in rows:
+            ev=self.con.execute("""SELECT e.summary FROM brain_event_evidence x
+                JOIN brain_events e ON e.id=x.event_id
+                WHERE x.message_digest=? AND e.scope=? AND e.actor_id=?
+                ORDER BY e.created DESC LIMIT 1""",
+                (row["message_digest"],scope,row["owner_id"])).fetchone()
+            out.append({"scope":scope,"goal_id":row["goal_id"],
+                        "stage":row["kind"],"recorded":row["recorded"],
+                        "event_hint":ev["summary"] if ev else ""})
+        return out
+
+    def goal_trace(self, scope: str, goal_id: str, *, limit: int = 30) -> dict[str, Any]:
+        """按真实证据关联目标阶段与同消息事件/事实；只读，不推断语义因果。"""
+        if not valid_scope(scope) or not isinstance(goal_id,str) or not goal_id:
+            return {"found": False}
+        goal = self.con.execute("""SELECT id,owner_id,title,criterion,status,revision
+            FROM brain_goals WHERE scope=? AND id=?""",(scope,goal_id)).fetchone()
+        if goal is None:
+            return {"found": False}
+        n=max(1,min(int(limit),50))
+        history=self.con.execute("""SELECT message_digest,kind,recorded
+            FROM brain_goal_events WHERE goal_id=?
+            ORDER BY recorded DESC,rowid DESC LIMIT ?""",(goal_id,n)).fetchall()
+        history=list(reversed(history))
+        timeline=[]
+        for stage in history:
+            # 同一证据可能涉及多件事：这里只表示消息来源重合，不声称语义相同。
+            related_events=self.con.execute("""SELECT e.id,e.kind,e.summary,e.happened
+                FROM brain_event_evidence x
+                JOIN brain_events e ON e.id=x.event_id
+                WHERE x.message_digest=? AND e.scope=? AND e.actor_id=?
+                ORDER BY e.created DESC LIMIT 8""",
+                (stage["message_digest"],scope,goal["owner_id"])).fetchall()
+            related_facts=self.con.execute("""SELECT f.id,f.attribute,f.value,f.status
+                FROM brain_fact_evidence x
+                JOIN brain_facts f ON f.id=x.fact_id
+                WHERE x.message_digest=? AND f.scope=? AND f.subject_id=?
+                ORDER BY f.updated DESC LIMIT 8""",
+                (stage["message_digest"],scope,goal["owner_id"])).fetchall()
+            timeline.append({
+                "kind":stage["kind"],"recorded":stage["recorded"],
+                "relation":"shared_verified_message",
+                "events":[dict(e) for e in related_events],
+                "facts":[dict(f) for f in related_facts],
+            })
+        return {"found":True,"scope":scope,"goal":dict(goal),"timeline":timeline}
 
     def recent_reflections(self, scope: str, *, now: float | None = None,
                            limit: int = 2, max_age_days: int = 30) -> list[dict[str, Any]]:
