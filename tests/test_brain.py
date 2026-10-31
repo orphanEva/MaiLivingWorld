@@ -155,6 +155,34 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(counts["progress"], 1)
         self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "done")
 
+    def test_goal_completion_rejects_hypothetical_questions_and_partial_claims(self):
+        self.db.apply(PRIVATE, "goal-skirt", [entry("S1", txt="我想选个裙子款式")], {
+            "goals": [{"owner_id": OWNER, "title": "选定裙子款式",
+                       "criterion": "确定裙子款式",
+                       "next_action": "follow_up", "evidence_ids": ["S1"]}]
+        }, now=self.now)
+        gid = self.db.recall(PRIVATE)["goals"][0]["id"]
+        for i, text in enumerate((
+            "如果我已经确定裙子款式了，会告诉你",
+            "我已经确定裙子款式了吗？",
+            "我已经准备确定裙子款式",
+            "我只是初步确定裙子款式",
+        ), 1):
+            eid = "S" + str(i + 1)
+            count = self.db.apply(PRIVATE, "skirt-hypothetical-" + str(i),
+                [entry(eid, txt=text)], {
+                    "progress": [{"goal_id": gid, "state": "done",
+                                  "evidence_ids": [eid]}]
+                }, now=self.now+i)["progress"]
+            self.assertEqual(count, 0, text)
+            self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "open")
+        count = self.db.apply(PRIVATE, "skirt-done",
+            [entry("S6", txt="裙子款式已经确定")], {
+                "progress": [{"goal_id": gid, "state": "done", "evidence_ids": ["S6"]}]
+            }, now=self.now+6)["progress"]
+        self.assertEqual(count, 1)
+        self.assertEqual(self.db.recall(PRIVATE)["goals"][0]["status"], "done")
+
     def test_conflict_requires_explicit_review(self):
         def p(value, i):
             return {"facts":[{"subject_id":OWNER,"attribute":"study_current_topic",
