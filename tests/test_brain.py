@@ -201,6 +201,65 @@ class BrainBookTests(unittest.TestCase):
         self.assertEqual(by_value["目前学习Transformer结构"]["status"],"active")
         self.assertEqual(by_value["目前学习RNN基础"]["status"],"superseded")
 
+    def test_equivalent_rnn_facts_share_identity_and_do_not_conflict(self):
+        def fact(value, ids):
+            return {"facts": [{"subject_id": OWNER, "attribute": "study_current_topic",
+                               "value": value, "confidence": .96, "evidence_ids": ids}]}
+        self.db.apply(PRIVATE, "same-fact-1", [entry("A1"), entry("A2")],
+                      fact("正在学习RNN基础", ["A1", "A2"]), now=self.now)
+        first = self.db.recall(PRIVATE)["facts"]
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["status"], "active")
+        fid = first[0]["id"]
+
+        self.db.apply(PRIVATE, "same-fact-2", [entry("B1"), entry("B2")],
+                      fact("目前在学习循环神经网络基础", ["B1", "B2"]),
+                      now=self.now+10)
+        after = self.db.recall(PRIVATE)["facts"]
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["id"], fid)
+        self.assertEqual(after[0]["status"], "active")
+        self.assertEqual(after[0]["seen_count"], 4)
+        self.assertIn("学习", self.db.hint(PRIVATE))
+
+    def test_equivalent_facts_accumulate_independent_evidence_and_keep_scope(self):
+        def one(value, id_):
+            return {"facts": [{"subject_id": OWNER, "attribute": "学习进度",
+                               "value": value, "confidence": .96, "evidence_ids": [id_]}]}
+        self.db.apply(PRIVATE, "pend-1", [entry("A1")],
+                      one("正在学习RNN基础", "A1"), now=self.now)
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["status"], "pending")
+        self.db.apply(PRIVATE, "pend-2", [entry("A2")],
+                      one("目前在学习循环神经网络基础", "A2"),
+                      now=self.now+10)
+        self.assertEqual(len(self.db.recall(PRIVATE)["facts"]), 1)
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["status"], "active")
+        self.db.apply(GROUP_SCOPE, "group-equiv", [entry("G1")],
+                      one("目前在学习循环神经网络基础", "G1"),
+                      now=self.now+20)
+        self.assertEqual(self.db.recall(GROUP_SCOPE)["facts"][0]["status"], "pending")
+        self.assertEqual(self.db.recall(PRIVATE)["facts"][0]["seen_count"], 2)
+
+    def test_equivalence_preserves_meaningful_stage_conflicts_and_review(self):
+        def fact(value, prefix):
+            return {"facts": [{"subject_id": OWNER, "attribute": "study_current_topic",
+                               "value": value, "confidence": .96,
+                               "evidence_ids": [prefix+"1", prefix+"2"]}]}
+        self.db.apply(PRIVATE, "p1", [entry("A1"), entry("A2")],
+                      fact("正在学习RNN基础", "A"), now=self.now)
+        self.db.apply(PRIVATE, "p2", [entry("B1"), entry("B2")],
+                      fact("已经学完循环神经网络基础", "B"), now=self.now+10)
+        facts = self.db.recall(PRIVATE)["facts"]
+        self.assertEqual(len(facts), 2)
+        self.assertEqual({f["status"] for f in facts}, {"disputed"})
+        self.assertEqual(self.db.hint(PRIVATE), "")
+        # 冲突发生后不能凭重复同义消息绕过人工复核。
+        self.db.apply(PRIVATE, "p3", [entry("C1"), entry("C2")],
+                      fact("目前在学习循环神经网络基础", "C"), now=self.now+20)
+        facts = self.db.recall(PRIVATE)["facts"]
+        self.assertEqual(len(facts), 2)
+        self.assertEqual({f["status"] for f in facts}, {"disputed"})
+
     def test_private_group_isolation_and_clear(self):
         self.db.apply(PRIVATE,"p",[entry("E1")],{
             "events":[{"actor_id":OWNER,"kind":"experience","summary":"私人讨论深度学习方法","importance":3,
