@@ -12,7 +12,20 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# GitHub 下载源码 ZIP 的目录通常叫 MaiLivingWorld-main，且用户可以任意重命名。
+# 不能依赖父目录下恰好存在名为 MaiLivingWorld 的文件夹。
+ROOT = Path(__file__).resolve().parents[1]
+if ROOT.name == "MaiLivingWorld":
+    sys.path.insert(0, str(ROOT.parent))
+else:
+    # 通过稳定的内部包名导入相对模块，且不修改源目录、无须创建符号链接。
+    import types
+    package = types.ModuleType("MaiLivingWorld")
+    package.__package__ = "MaiLivingWorld"
+    package.__path__ = [str(ROOT)]
+    package.__file__ = str(ROOT / "__init__.py")
+    sys.modules.setdefault("MaiLivingWorld", package)
+
 from MaiLivingWorld.mysql_compat import TABLES
 from MaiLivingWorld.mysql_store import MySQLStore
 from MaiLivingWorld.brain_core import BrainBook
