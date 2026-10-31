@@ -1,6 +1,26 @@
-# MaiLivingWorld · 麦麦的小世界 v0.9.0（渐进记忆与动态认知）
+# MaiLivingWorld · 麦麦的小世界 v0.9.1（渐进记忆与动态认知）
 
 > 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+
+## v0.9.1 · 事实与目标未入库的隐私安全诊断
+
+针对 v0.9.0 实测中出现的「快速周期正常运行、但事实和目标数量为零」问题，增加独立 `[MaiLivingWorld][BRAIN-STAGES]` 日志，区分：
+
+- `model`：模型 JSON 中四类提案的数量；
+- `parsed`：通过证据 ID / 敏感字段格式验证的数量；
+- `attempted`、`accepted`：送入数据库与成功处理的数量；
+- `parse_rejected`、`store_rejected`：固定原因代码及计数，例如 `goals.invalid_action`、`facts.subject_evidence_mismatch`；
+- JSON 无效时仅记录 `parse_error`，不回显原文。
+
+不保存或打印聊天原文、事实值、模型输出、消息 ID、证据哈希；保持原有事实审核、目标完成规则和全部配置字段不变。
+
+升级后用以下命令筛选诊断日志：
+
+```bash
+docker logs --since 20m maibot 2>&1 | grep -E 'BRAIN-STAGES|BRAIN-QUICK'
+```
+
+**注意**：这次是诊断补丁，不表示事实提取或目标完成条件问题已修复；先根据新增统计定位根因再处理。旧 `brain_book.sqlite3` 保留，不要清库。升级原有私人配置时，将 `[plugin].config_version` 更新为 `"0.9.1"`。
 
 ## v0.9.0 · 五分钟快速记忆、证据修正与目标进展
 
