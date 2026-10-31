@@ -74,8 +74,11 @@ class SQLAudit:
             raise
         rows = result if isinstance(result, int) else getattr(result, "rowcount", None)
         if isinstance(rows, int) and rows >= 0:
-            self.logger.info("[MaiLivingWorld][SQL][%s] <== Updates: %d (%.2f ms)",
-                             self.backend, rows, (time.perf_counter()-start)*1000)
+            verb = "Total" if str(sql).lstrip().split(None, 1)[0].upper() in (
+                "SELECT", "SHOW", "EXPLAIN", "WITH"
+            ) else "Updates"
+            self.logger.info("[MaiLivingWorld][SQL][%s] <== %s: %d (%.2f ms)",
+                             self.backend, verb, rows, (time.perf_counter()-start)*1000)
         else:
             self.logger.info("[MaiLivingWorld][SQL][%s] <== Executed (%.2f ms)",
                              self.backend, (time.perf_counter()-start)*1000)
