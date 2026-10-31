@@ -41,6 +41,30 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
         return {"id":id,"digest":"sha:"+id,"actor_id":actor,
                 "timestamp":time.time(),"text":text}
 
+    def test_00_full_mysql_ddl_executes_cleanly(self):
+        import pymysql
+        ddl=(Path(__file__).resolve().parents[1]/"sql"/"mysql.sql").read_text(encoding="utf-8")
+        chunks=[item.strip() for item in ddl.split(";")]
+        tables=[chunk for chunk in chunks
+                if chunk and any(line.lstrip().startswith("CREATE TABLE IF NOT EXISTS")
+                                 for line in chunk.splitlines())]
+        self.assertEqual(len(tables),29)
+        connection=pymysql.connect(
+            host=self.settings["host"],port=self.settings["port"],user=self.settings["user"],
+            password=self.settings["password"],database=self.settings["database"],
+            charset="utf8mb4",autocommit=True,
+        )
+        try:
+            with connection.cursor() as cursor:
+                for chunk in tables:
+                    # SQL 文件前的注释在语句里也可保留。
+                    cursor.execute(chunk)
+                cursor.execute("SELECT COUNT(*) FROM information_schema.TABLES "
+                               "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'mlw_%'")
+                self.assertEqual(cursor.fetchone()[0],29)
+        finally:
+            connection.close()
+
     def test_01_brain_evidence_scopes_and_progress_reopen(self):
         scope="private:12345678"
         db=BrainBook(self.dir/"brain.db",mysql_settings=self.settings)
