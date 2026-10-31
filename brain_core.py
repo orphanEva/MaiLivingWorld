@@ -430,7 +430,10 @@ class BrainBook:
             # 不能将单纯的未来打算、反问或假设当作现实进展。
             if not any(
                 isinstance(item.get("text"),str)
-                and not any(x in item["text"] for x in ("如果","假如","计划","打算","将来","明天","吗？","吗?"))
+                and not any(x in item["text"] for x in
+                            ("如果","假如","计划","打算","准备","想要","可能","大概",
+                             "将来","明天","之后","以后","还没开始","尚未开始","没有开始",
+                             "吗？","吗?","？","?"))
                 and any(x in item["text"] for x in
                         ("已经","正在","目前","开始","做了","完成了","弄了","处理了","刚刚","还在","进展","进度","已"))
                 for item in fresh
