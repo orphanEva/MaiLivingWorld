@@ -38,6 +38,7 @@
 - 真实 MySQL 测试由 GitHub Actions 的临时 MySQL 8.4 服务运行，已新增 4 项成长专项测试；本机 Docker daemon 未启动，没有本机 MySQL 实例。发布后的实际运行结果以该分支 Actions 为准。
 - 发布包 `MaiLivingWorld-v0.12.0-WebUI.zip` 包含全部运行模块；构建后核验 ZIP 和源码一致，排除私人配置、密钥和数据库文件。
 - 发布目标为 `origin/feature/long-term-personality`，不合并 main。本机 Git 凭据程序在沙箱内无法启动，使用已连接 GitHub 工具发布 Git 对象与分支，再拉取并同步本地同一提交。以 Git 分支 HEAD 为交付版本。
+- 首轮远端 Python 测试通过；MySQL 成长功能断言通过，但迁移测试清理时先删父表触发外键保护。已调整为先删依赖子表，并由修复提交重新执行 CI。
 
 ## 剩余的外部能力边界
 

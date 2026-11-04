@@ -59,7 +59,8 @@ class GrowthMySQLLiveTests(unittest.TestCase):
             charset="utf8mb4", autocommit=True)
         try:
             with connection.cursor() as cursor:
-                for table in ALL_TABLES:
+                # Schema lists parents before dependents; drop child tables first.
+                for table in reversed(ALL_TABLES):
                     cursor.execute("DROP TABLE IF EXISTS `"+self.settings["table_prefix"]+table+"`")
         finally:
             connection.close()
