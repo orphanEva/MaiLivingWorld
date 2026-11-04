@@ -20,7 +20,7 @@ from .policy import extract_text
 LIMITS = {"interests": 2, "beliefs": 2, "knowledge": 2, "questions": 1, "traits": 2}
 SECTIONS = tuple(LIMITS) + ("mood",)
 TRAITS = {"curiosity", "sociability", "patience", "caution"}
-ORIGINAL_SOURCES = {"brain_fact", "brain_event", "brain_goal", "mind", "cognition", "story"}
+ORIGINAL_SOURCES = {"brain_fact", "brain_event", "brain_goal", "mind", "cognition", "story", "tool"}
 MAX_RECORDS = 12
 MAX_SOURCE_TEXT = 600
 MAX_RESPONSE = 12000

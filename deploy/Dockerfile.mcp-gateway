@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+# BuildKit named contexts cap_source/pixiv_source are supplied by compose.mcp.yml.
+FROM python:3.12-slim AS gateway-base
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONUTF8=1 PYTHONPATH=/opt
+RUN python -m venv /opt/gateway-venv \
+    && /opt/gateway-venv/bin/pip install --no-cache-dir "mcp==2.3.0" "uvicorn>=0.31,<1" \
+    && groupadd --gid 10001 gateway \
+    && useradd --uid 10001 --gid 10001 --create-home gateway
+WORKDIR /opt
+COPY __init__.py mcp_client.py mcp_policy.py /opt/MaiLivingWorld/
+COPY scripts/mcp_gateway.py /opt/MaiLivingWorld/scripts/mcp_gateway.py
+EXPOSE 8000
+ENTRYPOINT ["/opt/gateway-venv/bin/python", "-m", "MaiLivingWorld.scripts.mcp_gateway"]
+
+FROM gateway-base AS cap
+# Explicit source allowlist: no .env, nacos_config.yaml, bot plugins or user data.
+COPY --from=cap_source /requirements-mcp.txt /opt/cap/requirements-mcp.txt
+RUN python -m venv /opt/cap-venv \
+    && /opt/cap-venv/bin/pip install --no-cache-dir -r /opt/cap/requirements-mcp.txt
+COPY --from=cap_source /mcp_server.py /opt/cap/mcp_server.py
+COPY --from=cap_source /service/__init__.py /service/jm_service.py /service/file_transfer.py /service/progress.py /service/task_registry.py /service/task_store.py /opt/cap/service/
+COPY --from=cap_source /utils/file_util.py /opt/cap/utils/file_util.py
+COPY deploy/cap-option.example.yml /opt/cap/config/mcp-option.yml
+RUN mkdir -p /var/lib/cap/tasks /var/lib/cap/downloads /var/lib/cap/received \
+    && chown -R 10001:10001 /var/lib/cap
+USER 10001:10001
+
+FROM gateway-base AS pixiv
+# Only the stdio adapter is included; the HTTP backend/workers already run elsewhere.
+COPY --from=pixiv_source /requirements-mcp.txt /opt/pixiv/requirements-mcp.txt
+RUN python -m venv /opt/pixiv-venv \
+    && /opt/pixiv-venv/bin/pip install --no-cache-dir -r /opt/pixiv/requirements-mcp.txt
+COPY --from=pixiv_source /app/__init__.py /opt/pixiv/app/__init__.py
+COPY --from=pixiv_source /app/mcp/__init__.py /app/mcp/__main__.py /app/mcp/server.py /app/mcp/backend.py /app/mcp/config.py /app/mcp/library_tools.py /app/mcp/action_tools.py /opt/pixiv/app/mcp/
+USER 10001:10001

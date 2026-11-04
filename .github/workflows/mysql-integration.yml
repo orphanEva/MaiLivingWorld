@@ -34,8 +34,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pydantic 'PyMySQL>=1.1,<2.0'
+      - run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=2.3,<3' 'jsonschema>=4,<5'
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_ledgers_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_growth_mysql_live.py' -v
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_tool_mysql_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_schema_comments.py' -v

@@ -1,6 +1,83 @@
-# MaiLivingWorld · 麦麦的小世界 v0.12.0（统一心智与持续成长）
+# MaiLivingWorld · 麦麦的小世界 v0.13.0（统一成长与 MCP 工具）
 
-> 一份 ZIP，MaiBot WebUI 可直接上传安装。独立插件，既不改 MaiBot 本体，也不需要新的 Docker 容器。**初装关闭，打开后仍默认为演练模式。**
+> MaiBot WebUI 可上传 ZIP 安装，独立于 MaiBot 本体。主动联系默认关闭并保留演练模式；成长与 MCP 默认关闭。使用 MCP 时可另部署两个 Docker 网关，连接既有服务。
+
+## v0.13.0 · 工具、带来源的学习与 Docker 接入
+
+本版把 cap 和 Pixiv 缓存后端作为同一智能体的工具入口，新增工具观察账本、未解问题查阅和主动联系的统一表达判断。它们与 QQ 私聊、群聊和已有资讯共用内部记忆；来源场景决定表达限制，不把不同窗口拆成不同人格。
+
+- **固定工具目录**：模型先发现工具，再按参数 schema 调用。工具只来自管理员配置的 cap/Pixiv 服务与本插件允许目录的交集，远端说明或聊天文字不能授予新权限。
+- **逐项开启**：MCP、两个服务、群聊读取、写入、账户操作、文件传输、图片读取和后台研究都默认关闭；`owner_only=true`。`remember_results=true` 仅在 MCP 已启用且调用成功时生效。账户操作和文件传输还需同时打开写入总开关。
+- **工具结果成为观察**：可保存作品元数据与已读取的小说片段，附稳定来源、版本、时间和原场景。任务路径、凭据、签名链接和模型转述不入观察库；小说内容明确标为虚构文本。重复查阅不会伪装成新的独立经历，来源变化或撤回使旧派生结论暂停使用。
+- **有限自主查阅**：有效的未解问题可以轮流查询 Pixiv 的已有本地资料库；每轮最多一次检索和一次详情读取，不自动联网补库、归档或执行写工具。问题游标、间隔、日配额和失败退避持久化。新观察交给后续成长循环处理，不保证这一次就解决问题。
+- **主动联系统一表达**：统一心智 active 时，主动联系也经内部联想和表达审核，替代旧 Brain/Mind 直接注入。群聊主动联系没有当前发言者，不把某个群成员当成主人；原主动联系名单、免打扰、配额及主人拒绝状态继续生效。
+
+### Docker 部署与配置
+
+主插件仍用 WebUI ZIP 安装；使用 MCP 时另部署 `cap-mcp`、`pixiv-mcp` 两个轻量网关。Pixiv 原 HTTP 后端和 worker 继续沿用现有部署。本轮对接源码为 cap `feat/jm-mcp` 的 `58a555e`、pixiv-cache-backend `codex/mcp-server` 的 `55397d2`；构建前在两个目录核对这些包含 MCP 的分支，部署脚本不会替你切分支。
+
+完整步骤见 [Docker MCP 网关部署](deploy/README.md)，包括同一 Docker 网络、源码构建上下文、独立 cap 持久卷和 Pixiv 后端密钥。网关默认不发布宿主端口、不挂 Docker socket；容器内的 `127.0.0.1` 不代表其他服务。
+
+MaiBot 插件依赖 `mcp>=2.3,<3`、`jsonschema>=4,<5` 和既有 `PyMySQL>=1.1,<2.0`，已写入 manifest。网关有自己的镜像环境，cap 的 MCP 1.x 与网关/插件的 MCP 2.x 分开安装，不往同一个环境混装两代 SDK。没有新增主仓 `pyproject.toml`。
+
+先绑定可信主人、启用统一心智和需要的输入名单，再逐项合并；不要覆盖现有 QQ 身份、数据库或其他配置：
+
+```toml
+[mcp]
+enabled = true
+owner_only = true
+allow_group_reads = false
+allow_writes = false
+allow_account_actions = false
+allow_file_transfer = false
+media_enabled = false
+research_enabled = false
+
+[mcp_cap]
+enabled = true
+transport = "http"
+url = "http://cap-mcp:8000/mcp"
+token_env = "MLW_CAP_MCP_TOKEN"
+
+[mcp_pixiv]
+enabled = true
+transport = "http"
+url = "http://pixiv-mcp:8000/mcp"
+token_env = "MLW_PIXIV_MCP_TOKEN"
+```
+
+`token_env` 填的是 **MaiBot 容器内环境变量名**，不是密钥正文。Compose 示例的 `MLW_CAP_GATEWAY_TOKEN` / `MLW_PIXIV_GATEWAY_TOKEN` 是各网关的令牌来源；在 MaiBot 容器中将同样的值分别提供为 `MLW_CAP_MCP_TOKEN` / `MLW_PIXIV_MCP_TOKEN`，或明确把 `token_env` 改成实际变量名。它们与 Pixiv 后端 API Key 是不同凭据，不写进聊天、URL、仓库或 TOML。插件不自动读取其他项目的 `.env`。
+
+若开启图片读取，MaiBot 容器还需单独提供 `PIXIV_MCP_BACKEND_URL` 和 `PIXIV_MCP_API_KEY`；后者仅通过 `X-API-Key` 发给固定后端，不能拿网关 Bearer 令牌代替。默认最多读取一张 8 MiB 的当前版本缓存图，仅支持 JPEG/PNG/WebP/GIF，核对索引、页码、MIME 和文件签名，拒绝跳转与任意路径。图片交给模型观察，**不自动向 QQ 发送**，也不把图片或模型描述自动变成已证实记忆。
+
+HTTP 是 Docker 默认选项；同一环境可改用 `transport="stdio"`，由管理员填写独立解释器绝对路径、参数数组、工作目录和 `env_names`。cap 使用根目录 `mcp_server.py`，Pixiv 使用 `-m app.mcp`；只透传明确列出的现有环境变量，不从聊天提供 shell 命令。容器模式通常无需配置这些 stdio 字段。
+
+### AI 工具与管理 API
+
+| 入口 | 用途 |
+| --- | --- |
+| `living_world_mcp_tools(provider)` | 列出当前身份可用的 `cap` 或 `pixiv` 工具及参数 |
+| `living_world_mcp_call(provider, tool, arguments)` | 按已发现 schema 查询、创建任务或检查任务状态 |
+| `living_world_pixiv_image(pixiv_id, page_index=0)` | 主人私聊读取插画类作品的一张当前缓存图供模型观察，需额外媒体开关 |
+| `living_world_mcp_status()` | 管理端查看连接、调用和研究计数，不返回查询正文或密钥 |
+
+例如先发现 `pixiv` 目录，再调用 `get_library_work`，参数形如 `{"pixiv_id":12345678,"kind":"illust"}`（编号仅作示意，替换为明确目标）；小说正文需另调用 `read_novel_excerpt` 并使用偏移分页。查到标题不代表读过正文，读过一段不代表读完整本。cap 的查询从 `jm_get_album` 开始，下载后查看本插件创建的任务状态；`queued`/`running` 不代表完成。
+
+权限来自 Host 绑定的真实当前 QQ 消息，模型不能通过填入用户 ID 冒充主人。群聊需要精确回复目标；主动联系没有入站消息时不能借此调用互动工具。即使允许群读，也只开放 cap 作品元数据和 Pixiv 作品详情这两类固定读取；写入、账户和文件操作限定主人私聊，任务详情只接受本插件在对应主人私聊发起的任务。Pixiv 网关还默认 `PIXIV_MCP_READ_ONLY=true`；需要写入时，服务端和插件端的相应开关都须明确开启。
+
+`mcp.max_daily_calls` 持久限制工具与图片读取次数，失败也计数；`unified_mind.max_daily_model_calls` 限制内部模型与成长调用，两种预算分开。一次图片观察需详情读取与图片读取两个额度。相同消息的重复请求不会自动重试有副作用操作；超时或断连可能已经入队，先核实任务终态。
+
+`general.dry_run` 只控制原主动联系流程，不能代替 MCP 的权限开关。即使主动联系仍在演练，显式开启的 MCP 写工具也可能创建真实后端任务；先保持 `allow_writes=false` 做只读验收。
+
+### 工具记忆、研究和保留边界
+
+新增第九个 SQLite 库 `tool_memory.sqlite3`，MySQL 对应 `tool_observations`、`tool_calls`、`tool_tasks`、`tool_research`，统一 DDL 现为 **39 表**。工具观察进入统一检索，来源默认保留调用场景的个人属性；本地缓存不自动等于公开知识。后续成长仍须验证原始来源及其版本，模型自己的摘要不能成为自证来源。
+
+后台查阅还需 `growth.enabled=true`、`growth.mode="active"`、统一心智、MCP、Pixiv 服务与 `remember_results` 均启用。它会把问题主题送到管理员配置的本地缓存服务检索，不调用公共搜索引擎，不自动看图或读取小说全文，也不扩展到无限规划。仅有问题但库中没有相关资料时，可以持续未解决。`research_daily_limit` 默认 6 轮，`research_interval_seconds` 默认一小时；`general.enabled` 控制主动聊天，不是 MCP 或学习总开关。
+
+所有新能力默认关闭，未替换用户运行配置或真实账号凭据。验证使用临时数据库、离线模型/工具响应及模拟网络边界；真实容器、QQ、账号后端和模型效果仍需部署验收。持续状态与有限学习循环不等于人类意识、模型权重训练或隐藏思维链恢复。
+
+以下版本节保留历史演进；当前安装、配置和数据库数量以 v0.13.0 及后面的现行部署/迁移说明为准。
 
 ## v0.12.0 · 自身爱好、观点、性格和可恢复学习
 
@@ -38,7 +115,7 @@ interval_seconds = 3600
 
 同一档案的来源依赖只合并、不自动丢弃。原来源改版或累计超过 24 条时，不会偷偷替换证据以恢复表达；管理员可先在历史中检查原因，再用重建接口废弃该条旧推断。重建不清空整个记忆，也不重新消费已经使用过的证据。
 
-SQLite 备份新增 `growth.sqlite3`，连同原有七库保存；MySQL 统一 DDL 共 35 张表。旧六库/七库备份可直接使用迁移脚本，新成长库缺失时留空，不凭空创建旧身份。数据目录或数据库不变时，切换聊天和程序重启都不会清空已提交的成长档案。单次模型请求若中断，会重新执行任务，不从模型内部某一步续算。
+SQLite 备份新增 `growth.sqlite3`，连同原有七库保存；v0.12.0 的 MySQL DDL 共 35 张表。旧六库/七库备份可直接使用迁移脚本，新成长库缺失时留空，不凭空创建旧身份。数据目录或数据库不变时，切换聊天和程序重启都不会清空已提交的成长档案。单次模型请求若中断，会重新执行任务，不从模型内部某一步续算。
 
 目前外部输入复用已有资讯/RSS/B 站标题和简介；未实现小黑盒专用接入或观看视频。真实模型的成长质量、长期效果和语义表达判断仍需部署验收。
 
@@ -76,7 +153,7 @@ model_timeout_seconds = 8
 
 统一检索读取原账本，不把私聊内容复制成其他群的新事实。重启后，已有记忆、目标和自我身份继续存在；收到新的可信消息后建立当前听众对应关系，再使用这些记忆。临时表达缓存不会持久保存，未完成的模型请求重启后不续跑。
 
-SQLite 备份需包含原数据文件及新增 `self_state.sqlite3`。MySQL DDL 现在共有 31 张表；迁移程序支持原先没有身份库的六库备份，并在身份库存在时原样迁移身份和预算。不同智能体使用不同数据库/表前缀或数据目录；同一智能体各窗口共用这些数据。
+SQLite 备份需包含原数据文件及新增 `self_state.sqlite3`。v0.11.0 的 MySQL DDL 共 31 张表；迁移程序支持原先没有身份库的六库备份，并在身份库存在时原样迁移身份和预算。不同智能体使用不同数据库/表前缀或数据目录；同一智能体各窗口共用这些数据。
 
 表达复核由程序规则和两次分开的模型请求共同完成，语义匿名化仍可能判断错误，不能声称完全杜绝泄露。当前验证使用离线模型响应和 SDK 模拟；真实 MaiBot/QQ 会话及模型效果需要部署后验收，真实 MySQL 集成测试另由 CI 的临时服务运行。
 
@@ -214,7 +291,7 @@ event_limit = 200
 
 ## 功能与边界
 
-| 能力 | v0.6.0 状态 |
+| 能力 | 当前状态 |
 | --- | --- |
 | 统一主动聊天调度 | ✅ QQ 私聊/群聊白名单，既存会话，静默期、免打扰、冷却、日配额 |
 | B 站自主发现素材 | ✅ 尝试读取 B 站公开热门 API 的**标题、简介、链接** |
@@ -229,7 +306,8 @@ event_limit = 200
 | 真正读取 B 站字幕、音轨、视频画面或评论 | ❌ 未实现，下一阶段扩展；**不能声称“看完视频”** |
 | 小黑盒登录、回帖、B 站评论/点赞/投币/发布 | ❌ 不支持，第一版只读 |
 | 自动充值 Token / 访问支付 | ❌ 不支持 |
-| 人格长期成长、日程/睡眠模拟 | ❌ 尚未实现，暂不复制其他项目的模拟成长逻辑 |
+| 自身兴趣、观点与渐进性格 | ✅ v0.12.0 起持久保存并限幅更新；不含日程/睡眠模拟 |
+| cap / Pixiv 工具与观察记忆 | ✅ v0.13.0 可选接入，按身份、工具类别与预算限制 |
 
 ## 标准 [plugin] 配置节（v0.5.0 修复）
 
@@ -239,7 +317,7 @@ SDK Runner 校验插件配置时必须存在 `[plugin]`，其中要有 `config_v
 ```toml
 [plugin]
 enabled = true
-config_version = "0.9.0"
+config_version = "0.13.0"
 
 [general]
 enabled = false
@@ -250,9 +328,9 @@ dry_run = true
 - Runner 会自动生成 `config.toml`；发行 ZIP 不包含本地配置，避免覆盖主人 QQ 或数据库密码。
 - 已安装旧版并提示缺少 `[plugin]` 时，请先备份原始配置；可以在 WebUI 的原始 TOML 顶部补上上述 `[plugin]` 节，再安装修复版。不要删除插件数据目录中的 SQLite 数据库。
 
-## 中文注释版配置模板（v0.5.0）
+## 中文注释版配置模板
 
-仓库根目录的 `config.example.toml` 包含 **8 个分组、56 个变量**，每个变量都附有中文用途、限制和注意事项。WebUI ZIP 也附带这份示例文件作为本地备忘。
+仓库根目录的 `config.example.toml` 包含 **17 个分组、140 个字段**，每个变量都附有中文用途、限制和注意事项。WebUI ZIP 也附带这份示例文件作为本地备忘。
 
 **不要直接覆盖现有 `config.toml`。** MaiBot Runner 根据 `Config(PluginConfigBase)` 自动生成运行时配置，示例模板并不会自动加载。已经调通的配置（包括主人 QQ、私聊白名单、数据库、dry_run）应该先备份，并在 WebUI「原始 TOML」中对照添加中文注释即可。
 
@@ -269,13 +347,13 @@ enabled = false
 backend = "off"
 ```
 
-这只是参数说明与注释维护更新，**不改变插件运行逻辑**，不需要重新配置主人识别或主动聊天。
+v0.13.0 新增 MCP 三组共 31 个字段，默认不开启工具访问。新增字段时保留原有主人识别与主动聊天配置。
 
 ## 安装：WebUI 一键导入 ZIP
 
 1. 确保 MaiBot `>=1.3.10`，插件 SDK `>=2.12.0`。
 2. 打开 MaiBot WebUI：**插件扩展 → 更多操作 → 从 ZIP 安装插件**。
-3. 选择 `MaiLivingWorld-v0.5.0-WebUI.zip`（不需要手工解压）。
+3. 选择 `MaiLivingWorld-v0.13.0-WebUI.zip`（不需要手工解压）。
 4. 安装完成后到插件管理打开 **MaiLivingWorld · 麦麦的小世界**，在 WebUI 插件设置里调整配置。
 5. **如果之前安装了 `MaiProactive` 或其他会主动唤醒的插件，先禁用它们的主动发送功能。** 否则不同插件的频率限制互不知晓，可能重复打扰。
 6. ZIP 安装不会覆盖同 ID 已安装插件。升级本插件前先在 WebUI 备份配置和数据并按官方方式卸载或发布新版；勿直接覆盖数据库记录。
@@ -332,57 +410,34 @@ group_template = ""                # 留空使用预设
 
 SQLite 和 MySQL 实现相同的资讯与尝试记录接口；SQLite 零配置单机更简单，MySQL 方便与已有数据库集中维护，但**不提升语言模型的理解能力**。
 
-**六套库统一后端（全量 MySQL 开发分支）：** `storage.backend="mysql"` 现在让外部资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback 全部使用 MySQL；`storage.backend="sqlite"` 则保留原有六个 SQLite 数据库。不会同时双写，也不会自动迁移旧数据。旧 SQLite 保持不变以备回滚，但回滚前需先处理 MySQL 期间产生的新记录。
+**九套账本统一后端：** `storage.backend="mysql"` 控制资讯、BrainBook、Mind、Cognition、ExperienceLoop、ProactiveFeedback、持续身份、成长与工具记忆；`sqlite` 使用各自文件。不会双写或自动搬迁旧数据，不同智能体使用不同数据库/表前缀或数据目录。
 
-### MySQL 表结构中文注释（29 张表 / 183 字段）
+### MySQL 表结构与非破坏性升级
 
-- 新建 MySQL 数据库：执行仓库的 `sql/mysql.sql`，29 张表及字段均已附上中文 `COMMENT`，可以在 DataGrip 的表/字段详情中查看。
-- **已经运行过旧版 DDL**：不要删表重建。先备份已有数据库，再在业务低峰且插件停止写入时，使用 `sql/mysql_comments_existing.sql` 给现有 29 张表和 183 个字段补充注释。
-- MySQL 的 `CREATE TABLE IF NOT EXISTS` **不会改变已有表注释或列注释**；仅重新执行更新后的建表 SQL 无法达到补注释效果。
-- 注释更新脚本使用 `ALTER TABLE ... MODIFY COLUMN ... COMMENT`，不会主动增删业务行，但数据库可能申请元数据锁、执行表重建；执行前建议先在同版本的测试库验证，确认 `SHOW CREATE TABLE` 与仓库 DDL 的列定义一致。
-- 注释脚本可重复执行，不应与业务并发写入，且不会迁移 SQLite 或修改插件后端配置。
+- 新库可执行 `sql/mysql.sql`，当前共 39 张表，含中文表/字段注释，建议 MySQL 8.4、InnoDB、utf8mb4。
+- 已有数据库先备份并停止插件写入，再执行 DDL 创建缺少的身份、成长和工具表。不要删表重建；`CREATE TABLE IF NOT EXISTS` 不更新旧表注释。
+- 需要补旧表注释时先核对实际列定义，再执行 `sql/mysql_comments_existing.sql`。该脚本不修改业务行，但 `ALTER TABLE` 可能持有元数据锁；自定义字段不能直接套用。
 
-### 一次性迁移六个 SQLite 库
+### 一次性迁移九个 SQLite 库
 
-1. 使用**独立的、尚无业务数据的** MySQL 数据库，建议 MySQL 8.4；仓库 `sql/mysql.sql` 包含三张资讯表和 26 张内部账本表，共 **29 张**，可在数据库客户端执行。MySQL 需要支持 InnoDB、utf8mb4。已有的旧版三张表可保留，不需清空。
-2. **先停止 MaiLivingWorld 的所有写入**，备份六个 SQLite 文件和原插件配置。SQLite 使用 WAL 时必须一并处理 `-wal` 文件，建议对每个库运行 `sqlite3.Connection.backup()` 得到一致快照；不要只复制正在写入的主数据库。迁移不保证六个库在并发写入时自动取得同一时刻的快照。
-3. 将完整快照放在一个独立目录，例如 `/mnt/mlw-backup-20261101/`，包含（如存在）：`living_world.sqlite3`、`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`。少数模块未启用时允许缺失；正式执行时须加 `--allow-missing`，避免漏备份被当成空账本。
-4. 在拥有迁移脚本和 Python 依赖的环境下先预览，不连接 MySQL、不修改文件：
+1. 停止所有插件写入，备份原配置和数据。WAL 模式使用 SQLite backup API 获取一致快照，不要只复制仍在写入的主文件。
+2. 把存在的九库放入同一备份目录：`living_world.sqlite3`、`brain_book.sqlite3`、`mind.sqlite3`、`cognition.sqlite3`、`experience_loop.sqlite3`、`proactive_feedback.sqlite3`、`self_state.sqlite3`、`growth.sqlite3`、`tool_memory.sqlite3`。
+3. 在带有迁移脚本和依赖的环境先只读预览；此步骤不连接 MySQL、不修改源文件：
 
-```bash
-python scripts/migrate_all_sqlite_to_mysql.py --directory /mnt/mlw-backup-20261101
+```sh
+python scripts/migrate_all_sqlite_to_mysql.py --directory /mnt/mlw-backup
 ```
 
-5. 确认每个表的源库记录数后，把 MySQL 配置通过环境变量（`MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE`、`MLW_MYSQL_PREFIX`）安全提供给迁移进程。**只对空目标数据库/表前缀执行正式迁移**：
+4. 旧六库/七库/八库备份可以缺少后来新增的身份、成长和工具库；存在时必须完整迁移。原有六库缺失只有在确认模块从未启用时才显式加 `--allow-missing`。不要用此选项跳过未备份数据。
+5. 把 `MLW_MYSQL_HOST`、`MLW_MYSQL_PORT`、`MLW_MYSQL_USER`、`MLW_MYSQL_PASSWORD`、`MLW_MYSQL_DATABASE`、`MLW_MYSQL_PREFIX` 安全提供给迁移进程；目标数据库/表前缀的 39 张表必须全部为空，再执行：
 
-```bash
-python scripts/migrate_all_sqlite_to_mysql.py \
-  --directory /mnt/mlw-backup-20261101 \
-  --apply --confirm MIGRATE_ALL_EMPTY_TARGET
+```sh
+python scripts/migrate_all_sqlite_to_mysql.py --directory /mnt/mlw-backup --apply --confirm MIGRATE_ALL_EMPTY_TARGET
 ```
 
-正式迁移先核验目标 29 张表全部为空，再统一事务插入，逐表比较记录数和字段值 SHA-256；异常时回滚。旧 SQLite 文件与原配置均不删除。源库字段与目标不一致时默认拒绝，不偷偷遗漏字段；如果运行旧版 SQLite schema，请先在**备份副本**升级 schema 并核对后再迁。
+脚本统一事务写入并逐表核对记录数和字段值哈希，失败回滚，不删除旧 SQLite 或原配置；字段不匹配时拒绝静默遗漏。完成后才把插件 `storage.backend` 切换为 `mysql`，填写相同连接配置并重载，检查身份、成长版本、工具计数和原记忆。回退前先处理 MySQL 运行期间的新记录，避免丢失后续记忆。
 
-6. 成功后在 WebUI 配置中设置：
-
-```toml
-[storage]
-backend = "mysql"
-mysql_host = "mysql"
-mysql_port = 3306
-mysql_user = "mai_living_world"
-mysql_password = "填写本地安全密码"
-mysql_database = "mai_living_world"
-mysql_table_prefix = "mlw_"
-mysql_connect_timeout = 5
-sql_debug = false
-```
-
-重载/重启 MaiBot 后，从管理员接口查询事实、目标、历史反思和各模块状态，再做小范围 QQ 联调。**不要在迁移前切换生产插件配置**。MySQL 连接异常时抛出错误而不是静默切换回 SQLite，避免两边数据分叉。
-
-### 旧资讯库单独迁移
-
-仅迁移外部资讯、主动尝试的旧脚本 `scripts/migrate_sqlite_to_mysql.py` 仍保留，用于特定场景；需要完整切换时请使用上面的六库迁移脚本，**不要两个脚本依次对同一个 MySQL 数据库执行**。
+仅迁移原资讯库的 `scripts/migrate_sqlite_to_mysql.py` 继续保留；完整切换使用上面的全量脚本，不要先后对同一目标混用两个导入脚本。
 
 ### MyBatis 风格 SQL 排查日志
 
@@ -477,14 +532,14 @@ QQ 群聊需先在原 MaiBot / NapCat / 适配器里确保群消息可以正常�
 - 重启后仍能挡住重复分享和当天超额唤醒；所有真正的唤醒请求都**先记账再提交**，失败时不自动重复刷屏。
 - 仅对明确填入的 QQ 私聊用户和群号尝试唤醒，不会遍历并联系所有 QQ 好友。
 - 信息源仅允许配置的 HTTPS 白名单主机、不跟随 HTTP 重定向、限制响应体积和请求超时；但这不等于对外部网络和内容安全的绝对保证。不要添加不可信 RSS 地址。
-- 外部内容只作为素材交给 LLM，不应作为指令执行。模型仍可能误解内容，所以本插件不提供任何支付、社区发帖、账户更改等写操作。
-- 插件代码只依赖 Python 标准库及 MaiBot SDK 已提供的配置模型，未另行安装浏览器或 MCP 服务。
+- 外部内容作为资料而非指令。默认只读；MCP 可在独立开关与可信主人私聊授权下提交有限下载、归档、账户或文件任务，不提供支付能力。
+- 主插件依赖见 manifest；MCP 与 jsonschema 用于工具连接和参数校验。Docker 网关独立运行，不修改 MaiBot 本体，也不安装浏览器。
 
 ## 常见问题
 
 **ZIP 被 WebUI 拒绝？** 确认你选的是发行 ZIP、没有再二次打包；插件目录只有一层，顶层直接可看到 `MaiLivingWorld/_manifest.json` 与 `MaiLivingWorld/plugin.py`。同 ID 已存在时，WebUI 不允许重复安装。
 
-**显示安装成功但没有运行？** 在插件管理开启它，确认 `general.enabled=true`；查看 Runner 日志。若出现 SDK 或宿主版本不兼容，不能仅靠手工放宽清单版本来解决，应检查实际接口。
+**显示安装成功但没有运行？** 在插件管理开启它并检查对应功能开关；只有主动聊天需要 `general.enabled=true`。查看 Runner 日志。若出现 SDK 或宿主版本不兼容，不能仅靠手工放宽清单版本来解决，应检查实际接口。
 
 **B站接口返回 -412/403/429？** 可能是 B 站风控。插件按只读模式跳过，不尝试绕过。可只用可访问的 RSS/Atom。
 

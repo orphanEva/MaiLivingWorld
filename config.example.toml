@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.12.0 · 全字段中文注释配置模板
+# MaiLivingWorld v0.13.0 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.12.0"
+config_version = "0.13.0"
 
 # ====================================================================
 # 10 / 统一心智与唯一主人（沿用 brain_memory 的输入名单）
@@ -29,7 +29,7 @@ recall_limit = 12
 candidate_limit = 200
 # 新的联想周期最短间隔；同轮通用知识复核不等待但另算一次调用。
 min_interval_seconds = 30
-# 每日统一联想、表达复核、成长提案与成长复核共用上限；失败计数，重启不重置。
+# 回复/主动联系的联想、表达复核及成长模型共用每日上限；MCP另有调用预算。
 max_daily_model_calls = 60
 # 每次模型调用超时；一轮至多两次调用，失败不将私人原文直接送入回复。
 model_timeout_seconds = 8
@@ -98,9 +98,9 @@ quick_update = true
 quick_interval_minutes = 5
 # 绑定主人识别启用后，自动纳入其私聊；其他用户必须明确配置私聊白名单。
 include_owner = true
-# 额外允许建立独立私聊记忆的 QQ 用户 ID；默认没有。
+# 额外允许采集私聊记忆的 QQ 用户 ID；来源会保留，统一心智内部可跨入口联想。
 private_users = []
-# 允许建立群公共记忆的群号；群与私聊隔离，不会跨群读取。
+# 允许采集群聊记忆的群号；群内容不自动公开，统一心智按相关性读取并判断表达。
 group_ids = []
 # 模块一：提炼带时间、行为人、证据哈希的情景事件。
 enable_events = false
@@ -295,3 +295,80 @@ webui_port = 8001
 import_max_wait_seconds = 45
 # 旧版兼容字段；v0.6.0 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
 chat_id = "living_world_explore"
+
+# ====================================================================
+# 12 / MCP 工具与自主查阅
+# ====================================================================
+[mcp]
+# 连接 cap / Pixiv MCP；需统一心智与可信主人绑定，服务独立运行。
+enabled = false
+# 默认只有可信主人能调用；关闭后其他授权用户也仅能读取固定作品元数据。
+owner_only = true
+# 允许采集名单内群聊读取固定作品元数据；管理、写入与任务详情仍只在主人私聊。
+allow_group_reads = false
+# 允许主人私聊创建归档、下载或媒体任务；不自动授权账户变更或文件传输。
+allow_writes = false
+# 另行允许主人私聊进行持续订阅、远端收藏/关注和账户迁移。
+allow_account_actions = false
+# 另行允许主人私聊使用 cap 已配置的文件发布/接收服务。
+allow_file_transfer = false
+# 只保存成功返回的作品元数据/小说片段作为带来源观察，不保存任务路径、凭据或签名链接。
+remember_results = true
+# 所有 MCP 工具及图片读取共用的持久每日调用上限；失败计数。
+max_daily_calls = 100
+# 单次 MCP 请求超时；写入结果未知时不自动重试。
+timeout_seconds = 30
+# 解析后 MCP 结果大小上限；只连接管理员配置的可信服务。
+max_response_bytes = 262144
+# 未解问题可驱动 Pixiv 本地资料库查询，只读且不自动下载。
+research_enabled = false
+# 问题查阅全局最短间隔，重启保留游标与失败退避。
+research_interval_seconds = 3600
+# 每天自主查阅轮数上限，每轮最多检索和读取一个结果各一次。
+research_daily_limit = 6
+# 允许主人私聊将 Pixiv 缓存图片交给模型观察；需本进程有后端 URL/API Key 环境变量。
+media_enabled = false
+# 单张图片读取字节上限，禁止跨站重定向和任意文件路径。
+max_media_bytes = 8388608
+
+# ====================================================================
+# 13 / cap MCP 连接
+# ====================================================================
+[mcp_cap]
+# 启用 cap 的独立 MCP 连接。
+enabled = false
+# Docker 推荐受认证 HTTP 网关；同环境也可用 stdio。
+transport = "http"
+# HTTP MCP 网关地址，只由管理员配置。
+url = "http://cap-mcp:8000/mcp"
+# HTTP Bearer 密钥所在环境变量名，不填密钥正文。
+token_env = "MLW_CAP_MCP_TOKEN"
+# stdio 专用：MCP 独立 Python 可执行文件绝对路径。
+command = ""
+# stdio 专用：启动参数数组，连接根 mcp_server.py，不使用 ncatbot 的 MCP。
+args = []
+# stdio 专用：cap 源码工作目录。
+cwd = ""
+# stdio 专用：仅传递列出的宿主环境变量，任务数据库由插件独立指定。
+env_names = ["JM_CONFIG_PATH", "JM_FILE_SERVER_URL", "JM_FILE_API_TOKEN"]
+
+# ====================================================================
+# 14 / Pixiv MCP 连接
+# ====================================================================
+[mcp_pixiv]
+# 启用 Pixiv 缓存后端的独立 MCP 连接。
+enabled = false
+# Docker 推荐受认证 HTTP 网关；同环境也可用 stdio。
+transport = "http"
+# HTTP MCP 网关地址，不能填写普通后端 REST 地址。
+url = "http://pixiv-mcp:8000/mcp"
+# HTTP Bearer 密钥所在环境变量名，不填密钥正文。
+token_env = "MLW_PIXIV_MCP_TOKEN"
+# stdio 专用：Pixiv MCP 的 Python 3.12+ 独立解释器。
+command = ""
+# stdio 专用：Pixiv MCP 启动参数。
+args = ["-m", "app.mcp"]
+# stdio 专用：pixiv-cache-backend 源码工作目录。
+cwd = ""
+# stdio 专用：传给子进程的环境变量名；不自动读取 .env。
+env_names = ["PIXIV_MCP_BACKEND_URL", "PIXIV_MCP_API_KEY"]

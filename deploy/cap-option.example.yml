@@ -1,0 +1,18 @@
+# Gateway-owned safe defaults; this file contains no login/cookie or Nacos data.
+log: false
+client:
+  retry_times: 2
+  postman:
+    meta_data:
+      timeout: 30
+download:
+  cache: true
+  image:
+    decode: true
+    suffix: .jpg
+  threading:
+    image: 8
+    photo: 2
+dir_rule:
+  base_dir: /var/lib/cap/downloads
+  rule: Bd_Aid_Pindex

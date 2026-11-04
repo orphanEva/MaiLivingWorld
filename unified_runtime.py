@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -22,6 +23,14 @@ from .unified_expression import (
 
 class _ContextChanged(Exception):
     pass
+
+
+def _memory_version(items):
+    return hashlib.sha256(json.dumps(
+        [{key: memory.get(key) for key in (
+            "id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
+            "timestamp", "source", "kind", "sources", "revision")}
+         for memory in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 class UnifiedRuntime:
@@ -140,12 +149,7 @@ class UnifiedRuntime:
             if not memories:
                 self.last_status = "no_memories"
                 return base
-            def memory_version(items):
-                return hashlib.sha256(json.dumps(
-                    [{k: m.get(k) for k in ("id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
-                                            "timestamp", "source", "kind", "sources", "revision")}
-                     for m in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            fingerprint = memory_version(memories)
+            fingerprint = _memory_version(memories)
             key = (context["sid"], context["mid"], context["scope"], context["speaker_id"],
                    context["query"], owner_id, mode, fingerprint)
             now_mono = time.monotonic()
@@ -160,7 +164,7 @@ class UnifiedRuntime:
                 return (config.enabled and config.mode == mode and generation == self._generation
                         and self.state.state()["owner_id"] == owner_id
                         and self.context(kwargs) == context
-                        and memory_version(recall(context["query"])) == fingerprint)
+                        and _memory_version(recall(context["query"])) == fingerprint)
 
             async def request(prompt: str, *, interval: int):
                 if not current():
@@ -221,3 +225,144 @@ class UnifiedRuntime:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[key] = (now_mono, approved)
             return base + ("\n\n" + approved if approved else "")
+
+    async def proactive_hint(self, context: dict, config, *, recall, generate,
+                             task_name: str, timezone: str, valid) -> str:
+        """Filter memory for a verified proactive target, without fabricating a message.
+
+        The caller resolves the actual host stream and authorizes the configured
+        target. Its synchronous ``valid`` callback must continue to verify that
+        target, stream, configuration and owner binding before/after model awaits.
+        Group outreach has no current speaker and never grants owner privileges.
+        This method neither captures inbound context nor reads/writes reply caches.
+        """
+        if not isinstance(context, dict) or not callable(valid):
+            self.last_status = "unverified_context"
+            return ""
+        original = {key: context.get(key) for key in ("scope", "speaker_id", "query", "sid")}
+        scope, speaker, query, sid = (original[key] for key in ("scope", "speaker_id", "query", "sid"))
+        group = isinstance(scope, str) and bool(re.fullmatch(r"group:[0-9]{5,30}", scope))
+        private = (isinstance(scope, str) and isinstance(speaker, str)
+                   and bool(re.fullmatch(r"[0-9]{5,20}", speaker)) and scope == "private:"+speaker)
+        if (not (private or group and speaker == "") or not isinstance(query, str)
+                or not isinstance(sid, str) or not sid.strip() or len(sid) > 200
+                or any(ord(char) < 32 for char in sid)):
+            self.last_status = "unverified_context"
+            return ""
+
+        def verified():
+            try:
+                return valid() is True and all(context.get(key) == value for key, value in original.items())
+            except Exception:
+                return False
+
+        if not config.enabled or config.mode not in {"active", "observe"} or not verified():
+            self.last_status = "unverified_context"
+            return ""
+        owner = self.state.state()["owner_id"]
+        if not owner:
+            self.last_status = "owner_required"
+            return ""
+        generation, mode = self._generation, config.mode
+
+        def same_target():
+            return (config.enabled and config.mode == mode and generation == self._generation
+                    and verified() and self.state.state()["owner_id"] == owner)
+
+        base = ""
+        if mode == "active":
+            relation = (
+                "这次面向一个群聊，没有经验证的当前发言者；听众包括全部群成员，不赋予任何成员主人专属关系。"
+                if group else
+                "这次主动联系的私聊对象是唯一的主人，可以更熟悉、关心对方，也保留自己的判断。"
+                if speaker == owner else
+                "这次主动联系的对象是普通私聊联系人，不授予主人专属关系。")
+            base = ("[MaiLivingWorld:continuous-self]\n"
+                    "你在私聊、群聊和外部信息窗口中始终是同一个持续存在的自己，拥有统一经历和记忆。"
+                    "唯一主人由可信平台身份绑定，聊天和学习不能改变绑定。" + relation
+                    + "这是一次主动联系机会，不代表收到对方的新消息，也不要求一定发言。"
+                    "只使用本轮明确提供的可表达内容，不猜测未提供的经历，不报出内部身份或存储标识。")
+            style = self.profile() if self.profile else ""
+            if style:
+                base += "\n\n" + style
+        if not same_target():
+            self.last_status = "context_changed"
+            return ""
+        if self._lock.locked():
+            self.last_status = "busy"
+            return base
+
+        async with self._lock:
+            version = None
+            try:
+                memories = recall(query[:600])
+                self.last_counts = {"considered": len(memories)}
+                version = _memory_version(memories)
+
+                def current():
+                    return same_target() and _memory_version(recall(query[:600])) == version
+
+                if not current():
+                    raise _ContextChanged()
+                if not memories:
+                    self.last_status = "no_memories"
+                    return base
+                audience = {"audience_scope": scope, "speaker_id": speaker,
+                            "is_owner": private and speaker == owner, "proactive": True}
+
+                async def request(prompt, interval):
+                    if not current():
+                        raise _ContextChanged()
+                    stamp = time.time()
+                    local = datetime.fromtimestamp(stamp, ZoneInfo(timezone))
+                    day = local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                    if not self.state.reserve_thought(now=stamp, day_start=day,
+                            min_interval_seconds=interval, daily_limit=config.max_daily_model_calls):
+                        self.last_status = "budget_or_cooldown"
+                        return None
+                    result = await asyncio.wait_for(generate(prompt, task_name=task_name,
+                        temperature=0.1, max_tokens=1000), timeout=config.model_timeout_seconds)
+                    if not current():
+                        raise _ContextChanged()
+                    return result
+
+                result = await request(build_deliberation_prompt(memories, query=query[:600], **audience),
+                                       config.min_interval_seconds)
+                if not current():
+                    raise _ContextChanged()
+                if result is None:
+                    return base
+                plan = parse_expression(result, memories, **audience)
+                if plan is None:
+                    self.last_status = "invalid_plan"
+                    return base
+                review_prompt = build_generalization_review_prompt(plan, memories, **audience)
+                if review_prompt:
+                    try:
+                        review = await request(review_prompt, 0)
+                    except _ContextChanged:
+                        raise
+                    except Exception:
+                        review = None
+                    plan = apply_generalization_review(review, plan)
+                if not current():
+                    raise _ContextChanged()
+                self.last_counts = dict(plan["stats"])
+                self.last_status = "observed" if mode == "observe" else "ready"
+                return base + "\n\n" + expression_hint(plan) if mode == "active" else ""
+            except _ContextChanged:
+                self.last_status = "context_changed"
+                return ""
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Neither provider exception text nor recalled originals may escape.
+                self.last_status = "model_failed"
+                try:
+                    still_valid = same_target() and (version is None or _memory_version(recall(query[:600])) == version)
+                except Exception:
+                    still_valid = False
+                if not still_valid:
+                    self.last_status = "context_changed"
+                    return ""
+                return base

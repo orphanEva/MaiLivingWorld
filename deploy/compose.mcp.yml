@@ -1,0 +1,97 @@
+# Compose 2.17+ / BuildKit. Existing MaiBot and Pixiv backend remain separately managed.
+services:
+  cap-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp-gateway
+      target: cap
+      additional_contexts:
+        cap_source: ${CAP_SOURCE_DIR:-../../cap}
+    image: mailivingworld-cap-mcp:local
+    init: true
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    environment:
+      MLW_MCP_GATEWAY_PROVIDER: cap
+      MLW_MCP_GATEWAY_TOKEN: ${MLW_CAP_GATEWAY_TOKEN:?Set a unique 32+ character cap gateway token}
+      MLW_MCP_GATEWAY_COMMAND: /opt/cap-venv/bin/python
+      MLW_MCP_GATEWAY_ARGS: '["/opt/cap/mcp_server.py", "--download-dir", "/var/lib/cap/downloads"]'
+      MLW_MCP_GATEWAY_CWD: /opt/cap
+      MLW_MCP_GATEWAY_ALLOWED_HOSTS: '["cap-mcp:8000"]'
+      MLW_MCP_GATEWAY_TIMEOUT_SECONDS: '90'
+      JM_CONFIG_PATH: /opt/cap/config/mcp-option.yml
+      JM_TASK_DB_PATH: /var/lib/cap/tasks/tasks.sqlite3
+      JM_MAX_CONCURRENT_DOWNLOADS: '2'
+      JM_FILE_SERVER_URL: ${JM_FILE_SERVER_URL:-}
+      JM_FILE_API_TOKEN: ${JM_FILE_API_TOKEN:-}
+      JM_FILE_DOWNLOAD_BASE_URL: ${JM_FILE_DOWNLOAD_BASE_URL:-}
+      JM_FILE_RECEIVE_DIR: /var/lib/cap/received
+    volumes:
+      - cap_data:/var/lib/cap
+    networks: [maibot]
+    healthcheck:
+      test: [CMD, /opt/gateway-venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  pixiv-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp-gateway
+      target: pixiv
+      additional_contexts:
+        pixiv_source: ${PIXIV_SOURCE_DIR:-../../pixiv-cache-backend}
+    image: mailivingworld-pixiv-mcp:local
+    init: true
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    environment:
+      MLW_MCP_GATEWAY_PROVIDER: pixiv
+      MLW_MCP_GATEWAY_TOKEN: ${MLW_PIXIV_GATEWAY_TOKEN:?Set a unique 32+ character pixiv gateway token}
+      MLW_MCP_GATEWAY_COMMAND: /opt/pixiv-venv/bin/python
+      MLW_MCP_GATEWAY_ARGS: '["-m", "app.mcp"]'
+      MLW_MCP_GATEWAY_CWD: /opt/pixiv
+      MLW_MCP_GATEWAY_ALLOWED_HOSTS: '["pixiv-mcp:8000"]'
+      MLW_MCP_GATEWAY_PIXIV_KEY_FILE: /run/secrets/pixiv_backend_key
+      MLW_MCP_GATEWAY_TIMEOUT_SECONDS: '90'
+      PIXIV_MCP_BACKEND_URL: ${PIXIV_MCP_BACKEND_URL:?Set the existing backend URL reachable from this network}
+      PIXIV_MCP_TIMEOUT_SECONDS: '60'
+      PIXIV_MCP_MAX_RESPONSE_BYTES: '1048576'
+      PIXIV_MCP_READ_ONLY: ${PIXIV_MCP_READ_ONLY:-true}
+    secrets: [pixiv_backend_key]
+    networks: [maibot]
+    healthcheck:
+      test: [CMD, /opt/gateway-venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+networks:
+  maibot:
+    external: true
+    name: ${MAIBOT_DOCKER_NETWORK:?Set the actual existing MaiBot network name}
+volumes:
+  cap_data:
+    name: ${MLW_CAP_DATA_VOLUME:-mailivingworld_cap_mcp_data}
+secrets:
+  pixiv_backend_key:
+    file: ${PIXIV_API_KEY_FILE:?Set the path to a file containing only the existing Pixiv backend API key}

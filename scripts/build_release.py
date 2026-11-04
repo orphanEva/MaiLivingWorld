@@ -36,7 +36,9 @@ if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(manifest["version"])):
 version = manifest["version"]
 required = (
     "__init__.py", "_manifest.json", "plugin.py", "policy.py", "explore.py",
-    "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "mysql_compat.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "self_state.py", "unified_memory.py", "unified_expression.py", "unified_runtime.py", "growth_store.py", "growth_model.py", "growth_runtime.py", "config.example.toml", "README.md", "LICENSE",
+    "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "mysql_compat.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "self_state.py", "unified_memory.py", "unified_expression.py", "unified_runtime.py", "growth_store.py", "growth_model.py", "growth_runtime.py", "tool_store.py", "mcp_client.py", "mcp_policy.py", "mcp_runtime.py", "mcp_media.py",
+    "scripts/mcp_gateway.py", "deploy/README.md", "deploy/compose.mcp.yml", "deploy/Dockerfile.mcp-gateway", "deploy/mcp.example.env", "deploy/cap-option.example.yml",
+    "CHANGELOG.md", "config.example.toml", "README.md", "LICENSE",
 )
 for name in required:
     if not (ROOT / name).is_file():

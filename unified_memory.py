@@ -80,7 +80,7 @@ def _sensitivity(scope: str, text: str) -> str:
     return "unknown"
 
 
-def _sources(brain: Any, mind: Any, cognition: Any, stories: Any, now: float) -> list[_Source]:
+def _sources(brain: Any, mind: Any, cognition: Any, stories: Any, now: float, tools: Any = None) -> list[_Source]:
     sources: list[_Source] = []
     if brain is not None:
         sources.extend((
@@ -110,6 +110,10 @@ def _sources(brain: Any, mind: Any, cognition: Any, stories: Any, now: float) ->
             ("key", "source", "title", "summary", "url", "published_at", "first_seen"),
             ("title", "summary", "source"), "first_seen", "",
             "published_at IS NULL OR published_at<=?", (now+21600,)))
+    if tools is not None:
+        sources.append(_Source(tools, "tool", "tool_observations",
+            ("id", "provider", "text", "scope", "subject_id", "sensitivity", "url", "origin_key", "timestamp", "active"),
+            ("text", "subject_id", "provider"), "timestamp", "subject_id", "active=1"))
     return sources
 
 
@@ -157,6 +161,9 @@ def _read(source: _Source, terms: list[str], owner_id: str, limit: int) -> list[
 
 
 def _record(source: str, row: dict[str, Any]) -> dict[str, Any] | None:
+    if source == "tool":
+        from .tool_store import observation_record
+        return observation_record(row)
     scope = _text(row.get("scope"), 100) if source.startswith("brain_") else "public"
     subject = _text(row.get("subject_id") or row.get("actor_id") or row.get("owner_id"), 100)
     stamp = _stamp(row.get("updated") or row.get("updated_at"))
@@ -194,7 +201,7 @@ def _record(source: str, row: dict[str, Any]) -> dict[str, Any] | None:
     return record
 
 
-def collect_memories(*, brain=None, mind=None, cognition=None, stories=None,
+def collect_memories(*, brain=None, mind=None, cognition=None, stories=None, tools=None,
                      owner_id: str = "", query: str = "", limit: int = 12,
                      scan_limit: int = 200, now: float | None = None) -> list[dict[str, Any]]:
     """Return global internal candidates, retaining provenance and review status.
@@ -218,7 +225,7 @@ def collect_memories(*, brain=None, mind=None, cognition=None, stories=None,
         raise ValueError("now must be a finite timestamp")
     limit, remaining = min(limit, MAX_RESULTS), min(scan_limit, MAX_SCAN)
     terms = _terms(query)
-    sources = _sources(brain, mind, cognition, stories, float(current))
+    sources = _sources(brain, mind, cognition, stories, float(current), tools)
     records: dict[str, dict[str, Any]] = {}
     for index, source in enumerate(sources):
         if remaining <= 0:
@@ -245,6 +252,8 @@ def _source_id(identity: Any) -> tuple[str, tuple[str, ...]]:
     """Parse only identifiers emitted for original records, never derived memory."""
     if not isinstance(identity, str) or len(identity) > 240:
         raise ValueError("invalid original memory id")
+    if re.fullmatch(r"tool:observation:[0-9a-f]{64}", identity):
+        return "tool", (identity,)
     token = r"([A-Za-z0-9][A-Za-z0-9_-]{0,127})"
     for prefix, source in (("brain:fact:", "brain_fact"),
                            ("brain:event:", "brain_event"),
@@ -260,7 +269,7 @@ def _source_id(identity: Any) -> tuple[str, tuple[str, ...]]:
     raise ValueError("invalid original memory id")
 
 
-def resolve_memories(ids, *, brain=None, mind=None, cognition=None, stories=None,
+def resolve_memories(ids, *, brain=None, mind=None, cognition=None, stories=None, tools=None,
                      now: float | None = None) -> dict[str, dict[str, Any]]:
     """Re-read exact original IDs and their current validity, without a scope filter.
 
@@ -276,7 +285,7 @@ def resolve_memories(ids, *, brain=None, mind=None, cognition=None, stories=None
     if isinstance(current, bool) or not isinstance(current, (int, float)) or not math.isfinite(current):
         raise ValueError("now must be a finite timestamp")
     found: dict[str, dict[str, Any]] = {}
-    for source in _sources(brain, mind, cognition, stories, float(current)):
+    for source in _sources(brain, mind, cognition, stories, float(current), tools):
         identities = [parts for name, parts in parsed.values() if name == source.name]
         if not identities:
             continue

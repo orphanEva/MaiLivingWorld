@@ -23,6 +23,7 @@ TABLES = (
     "experience_opt_out", "proactive_targets", "proactive_events",
     "self_identity", "self_owner_history",
     "growth_state", "growth_jobs", "growth_history", "growth_consumed",
+    "tool_observations", "tool_calls", "tool_tasks", "tool_research",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 八套数据共 35 表（含持续自我与成长）
+-- MaiLivingWorld MySQL 8.4 九套数据共 39 表（含持续自我、成长与工具记忆）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -312,3 +312,62 @@ CREATE TABLE IF NOT EXISTS `mlw_growth_consumed` (
     job_id VARCHAR(191) NOT NULL COMMENT '首次消费该记录的成长任务ID',
     consumed DOUBLE NOT NULL COMMENT '首次应用变化的时间，Unix秒'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='经历消费去重账本，回滚及重建不会补充已消费的成长次数';
+
+CREATE TABLE IF NOT EXISTS `mlw_tool_observations` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '提供者与规范资源键的稳定观察ID',
+    provider VARCHAR(191) NOT NULL COMMENT '受信工具提供者标识',
+    resource_key VARCHAR(191) NOT NULL COMMENT '提供者内的规范资源键，不含凭据',
+    text TEXT NOT NULL COMMENT '最多600字符的工具原始元数据观察，不是模型总结',
+    scope VARCHAR(191) NOT NULL COMMENT '来源场合，跨场合保守合并且不用于内部检索隔离',
+    subject_id VARCHAR(191) NOT NULL COMMENT '可信来源关联用户，混合来源时可为空',
+    sensitivity VARCHAR(191) NOT NULL COMMENT '保守合并的保密级别，不能由重复公开读取降低',
+    url TEXT NOT NULL COMMENT '可选公开来源链接，禁止凭据及查询参数',
+    origin_key VARCHAR(191) NOT NULL COMMENT '提供者和原始资源的规范哈希，用于独立证据去重',
+    timestamp DOUBLE NOT NULL COMMENT '内容或约束实际变化时间，重复读取不更新',
+    active BIGINT NOT NULL DEFAULT 1 COMMENT '1为可用观察，0为已撤回',
+    created DOUBLE NOT NULL COMMENT '首次观察时间，Unix秒',
+    KEY `idx_tool_observations_active` (active,timestamp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='受信工具的原始观察记忆，更新或撤回会使旧派生结论失效';
+
+CREATE TABLE IF NOT EXISTS `mlw_tool_calls` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '提供者工具参数摘要与可信消息上下文的幂等调用ID',
+    provider VARCHAR(191) NOT NULL COMMENT '工具提供者标识',
+    tool VARCHAR(191) NOT NULL COMMENT '已批准的固定工具名称',
+    args_digest VARCHAR(191) NOT NULL COMMENT '调用参数SHA256摘要，不保存参数原文',
+    context_digest VARCHAR(191) NOT NULL COMMENT '可信消息ID场合和主体的摘要，不保存原请求键',
+    status VARCHAR(191) NOT NULL COMMENT 'reserved、succeeded、failed或uncertain，未知结果禁止重放',
+    scope VARCHAR(191) NOT NULL COMMENT '调用发起场合，用于授权追溯',
+    subject_id VARCHAR(191) NOT NULL COMMENT '可信调用发起主体',
+    budget_day DOUBLE NOT NULL COMMENT '独立全局工具日预算起点，失败和未知调用也计数',
+    payload LONGTEXT NOT NULL COMMENT '适配器生成的有界结果状态摘要，不保存密钥或原始响应',
+    created DOUBLE NOT NULL COMMENT '原子预留调用时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '调用状态最近变化时间，Unix秒',
+    KEY `idx_tool_calls_day` (budget_day,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='跨重启幂等调用及全局工具预算，独立于模型调用预算';
+
+CREATE TABLE IF NOT EXISTS `mlw_tool_tasks` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '提供者与任务ID的稳定哈希',
+    provider VARCHAR(191) NOT NULL COMMENT '任务所属工具提供者',
+    task_id VARCHAR(191) NOT NULL COMMENT '提供者返回的任务ID，不是URL或文件路径',
+    scope VARCHAR(191) NOT NULL COMMENT '任务首次创建的可信场合，禁止重新绑定',
+    subject_id VARCHAR(191) NOT NULL COMMENT '任务首次创建的可信主体，禁止重新绑定',
+    operation VARCHAR(191) NOT NULL COMMENT '原始工具操作名，查询或重试时重新检查权限',
+    created DOUBLE NOT NULL COMMENT '首次绑定时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '绑定记录时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='后台工具任务的主体场合绑定，不保存路径或签名下载地址';
+
+CREATE TABLE IF NOT EXISTS `mlw_tool_research` (
+    question_key VARCHAR(191) PRIMARY KEY COMMENT '待研究问题键或内部控制行标识，不保存问题正文',
+    status VARCHAR(191) NOT NULL DEFAULT 'idle' COMMENT 'idle、running、succeeded或failed',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '研究领取次数，控制行记录全局次数',
+    failures BIGINT NOT NULL DEFAULT 0 COMMENT '连续失败次数，用于指数退避',
+    last_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '最近领取时间，重启保留冷却和轮转顺序',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '允许下次研究该问题的时间，Unix秒',
+    last_finish DOUBLE NOT NULL DEFAULT 0 COMMENT '最近完成时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '研究租约令牌，本地轮转控制行保存上一问题键',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '研究租约截止时间，过期允许恢复',
+    interval_seconds BIGINT NOT NULL DEFAULT 0 COMMENT '领取时的研究冷却秒数',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '控制行的独立研究日预算起点',
+    daily_count BIGINT NOT NULL DEFAULT 0 COMMENT '控制行的当日研究预留次数，失败也计数',
+    updated DOUBLE NOT NULL DEFAULT 0 COMMENT '最近调度状态变化时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='跨重启研究轮转租约退避及独立预算，本地检索轮转不消耗网络额度';

@@ -34,9 +34,13 @@ from .brain_core import BrainBook, valid_scope
 from .brain_runtime import BRAIN_MARKER, evidence_from_qq, parse_proposal, build_prompt, inject_brain_prompt
 from .self_state import SelfState
 from .unified_memory import collect_memories, resolve_memories, derived_memories
-from .unified_runtime import UnifiedRuntime
+from .unified_runtime import UnifiedRuntime, _memory_version
 from .growth_store import GrowthStore, source_fingerprint
 from .growth_runtime import GrowthRuntime, style_hint
+from .tool_store import ToolStore
+from .mcp_client import StdioMCPClient, MCPError
+from .mcp_runtime import MCPBridge, outward_result, day_start as tool_day_start, digest as tool_digest
+from .mcp_policy import CATALOG
 
 
 class PluginSection(PluginConfigBase):
@@ -44,7 +48,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.12.0",
+        default="0.13.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -200,6 +204,48 @@ class Growth(PluginConfigBase):
     interval_seconds: int = Field(default=3600, ge=60, le=86400, description="新学习任务的最短间隔，任务与时间持久化；与统一联想共用每日模型预算")
 
 
+class MCPIntegration(PluginConfigBase):
+    __ui_label__ = "12 / MCP 工具与自主查阅"
+    enabled: bool = Field(default=False, description="连接 cap / Pixiv MCP；需统一心智与可信主人绑定，服务独立运行")
+    owner_only: bool = Field(default=True, description="默认只有可信主人能调用；关闭后其他授权用户也仅能读取固定作品元数据")
+    allow_group_reads: bool = Field(default=False, description="允许采集名单内群聊读取固定作品元数据；管理、写入与任务详情仍只在主人私聊")
+    allow_writes: bool = Field(default=False, description="允许主人私聊创建归档、下载或媒体任务；不自动授权账户变更或文件传输")
+    allow_account_actions: bool = Field(default=False, description="另行允许主人私聊进行持续订阅、远端收藏/关注和账户迁移")
+    allow_file_transfer: bool = Field(default=False, description="另行允许主人私聊使用 cap 已配置的文件发布/接收服务")
+    remember_results: bool = Field(default=True, description="只保存成功返回的作品元数据/小说片段作为带来源观察，不保存任务路径、凭据或签名链接")
+    max_daily_calls: int = Field(default=100, ge=0, le=2000, description="所有 MCP 工具及图片读取共用的持久每日调用上限；失败计数")
+    timeout_seconds: int = Field(default=30, ge=2, le=120, description="单次 MCP 请求超时；写入结果未知时不自动重试")
+    max_response_bytes: int = Field(default=262144, ge=4096, le=1048576, description="解析后 MCP 结果大小上限；只连接管理员配置的可信服务")
+    research_enabled: bool = Field(default=False, description="未解问题可驱动 Pixiv 本地资料库查询，只读且不自动下载")
+    research_interval_seconds: int = Field(default=3600, ge=60, le=86400, description="问题查阅全局最短间隔，重启保留游标与失败退避")
+    research_daily_limit: int = Field(default=6, ge=0, le=100, description="每天自主查阅轮数上限，每轮最多检索和读取一个结果各一次")
+    media_enabled: bool = Field(default=False, description="允许主人私聊将 Pixiv 缓存图片交给模型观察；需本进程有后端 URL/API Key 环境变量")
+    max_media_bytes: int = Field(default=8388608, ge=1024, le=33554432, description="单张图片读取字节上限，禁止跨站重定向和任意文件路径")
+
+
+class MCPCap(PluginConfigBase):
+    __ui_label__ = "13 / cap MCP 连接"
+    enabled: bool = Field(default=False, description="启用 cap 的独立 MCP 连接")
+    transport: Literal["http", "stdio"] = Field(default="http", description="Docker 推荐受认证 HTTP 网关；同环境也可用 stdio")
+    url: str = Field(default="http://cap-mcp:8000/mcp", description="HTTP MCP 网关地址，只由管理员配置")
+    token_env: str = Field(default="MLW_CAP_MCP_TOKEN", description="HTTP Bearer 密钥所在环境变量名，不填密钥正文")
+    command: str = Field(default="", description="stdio 专用：MCP 独立 Python 可执行文件绝对路径")
+    args: list[str] = Field(default_factory=list, description="stdio 专用：启动参数数组，连接根 mcp_server.py，不使用 ncatbot 的 MCP")
+    cwd: str = Field(default="", description="stdio 专用：cap 源码工作目录")
+    env_names: list[str] = Field(default_factory=lambda: ["JM_CONFIG_PATH", "JM_FILE_SERVER_URL", "JM_FILE_API_TOKEN"], description="stdio 专用：仅传递列出的宿主环境变量，任务数据库由插件独立指定")
+
+
+class MCPPixiv(MCPCap):
+    __ui_label__ = "14 / Pixiv MCP 连接"
+    enabled: bool = Field(default=False, description="启用 Pixiv 缓存后端的独立 MCP 连接")
+    url: str = Field(default="http://pixiv-mcp:8000/mcp", description="HTTP MCP 网关地址，不能填写普通后端 REST 地址")
+    token_env: str = Field(default="MLW_PIXIV_MCP_TOKEN", description="HTTP Bearer 密钥所在环境变量名，不填密钥正文")
+    command: str = Field(default="", description="stdio 专用：Pixiv MCP 的 Python 3.12+ 独立解释器")
+    args: list[str] = Field(default_factory=lambda: ["-m", "app.mcp"], description="stdio 专用：Pixiv MCP 启动参数")
+    cwd: str = Field(default="", description="stdio 专用：pixiv-cache-backend 源码工作目录")
+    env_names: list[str] = Field(default_factory=lambda: ["PIXIV_MCP_BACKEND_URL", "PIXIV_MCP_API_KEY"], description="stdio 专用：传给子进程的环境变量名；不自动读取 .env")
+
+
 class Storage(PluginConfigBase):
     __ui_label__ = "07 / 数据持久化（SQLite 或 MySQL）"
     backend: str = Field(default="sqlite", description="存储类型：sqlite 或 mysql。更换后须重载插件；不自动迁移旧数据")
@@ -227,6 +273,9 @@ class Config(PluginConfigBase):
     brain_memory: BrainMemory = Field(default_factory=BrainMemory)
     unified_mind: UnifiedMind = Field(default_factory=UnifiedMind)
     growth: Growth = Field(default_factory=Growth)
+    mcp: MCPIntegration = Field(default_factory=MCPIntegration)
+    mcp_cap: MCPCap = Field(default_factory=MCPCap)
+    mcp_pixiv: MCPPixiv = Field(default_factory=MCPPixiv)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -273,6 +322,11 @@ class MaiLivingWorld(MaiBotPlugin):
         self._unified: UnifiedRuntime | None = None
         self._growth: GrowthStore | None = None
         self._growth_runtime: GrowthRuntime | None = None
+        self._tool_store: ToolStore | None = None
+        self._mcp_bridge: MCPBridge | None = None
+        self._mcp_clients: dict[str, Any] = {}
+        self._mcp_generation = 0
+        self._mcp_calls: set[asyncio.Task] = set()
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -320,7 +374,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.12.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.13.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -336,6 +390,7 @@ class MaiLivingWorld(MaiBotPlugin):
             self._unified.reset()
         if self._growth_runtime:
             self._growth_runtime.reset()
+        await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
     async def _owner_session_id(self, sender):
@@ -734,6 +789,11 @@ class MaiLivingWorld(MaiBotPlugin):
             await asyncio.gather(*self._memory_jobs, return_exceptions=True)
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
+        await self._close_mcp()
+        if self._tool_store:
+            self._tool_store.close()
+            self._tool_store = None
+        self._mcp_bridge = None
         if self._growth_runtime:
             self._growth_runtime.reset()
             self._growth_runtime = None
@@ -853,7 +913,8 @@ class MaiLivingWorld(MaiBotPlugin):
         brain = self._ensure_brain() if self.config.brain_memory.enabled else None
         mind = self._ensure_mind() if self.config.mind.enabled else None
         cognition = self._ensure_cognition() if self.config.cognition.enabled else None
-        return dict(brain=brain, mind=mind, cognition=cognition, stories=self._store)
+        return dict(brain=brain, mind=mind, cognition=cognition, stories=self._store,
+                    tools=self._ensure_tool_store())
 
     def _collect_roots(self, query: str = "") -> list[dict[str, Any]]:
         cfg = self.config.unified_mind
@@ -920,7 +981,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not questions:
             return recent
         # Rotate unfinished questions; external collection continues through the existing explorer.
-        question = questions[state["revision"] % len(questions)]
+        key = self._ensure_tool_store().next_local_question([item["key"] for item in questions])
+        question = next(item for item in questions if item["key"] == key)
         related = self._collect_roots(question["topic"])
         candidates = recent[:6] + related + recent[6:]
         return list({item["id"]: item for item in candidates}.values())[:12]
@@ -935,6 +997,214 @@ class MaiLivingWorld(MaiBotPlugin):
                 allowed=lambda: bool(self.config.plugin.enabled and self.config.unified_mind.enabled
                     and self.config.owner.enabled and normalize_qq(self.config.owner.qq)
                     == self._self_state.state()["owner_id"]))
+
+    def _ensure_tool_store(self):
+        if self._tool_store is None:
+            self._tool_store = ToolStore(Path(self.ctx.paths.data_dir) / "tool_memory.sqlite3",
+                                         **self._ledger_storage_options())
+        if self._mcp_bridge is None:
+            self._mcp_bridge = MCPBridge(self._tool_store)
+        return self._tool_store
+
+    async def _close_mcp(self):
+        self._mcp_generation += 1
+        clients, self._mcp_clients = list(self._mcp_clients.values()), {}
+        if clients:
+            await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
+        tasks = [task for task in self._mcp_calls if task is not asyncio.current_task() and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _mcp_server_config(self, provider):
+        return self.config.mcp_cap if provider == "cap" else self.config.mcp_pixiv if provider == "pixiv" else None
+
+    def _mcp_signature(self, provider):
+        server = self._mcp_server_config(provider)
+        return tool_digest({"config": self.config.mcp.model_dump(), "server": server.model_dump() if server else None,
+                            "owner": self.config.owner.model_dump(), "plugin": self.config.plugin.enabled,
+                            "unified": self.config.unified_mind.model_dump()})
+
+    def _mcp_client(self, provider):
+        if provider in self._mcp_clients:
+            if not self._mcp_clients[provider].retired:
+                return self._mcp_clients[provider]
+            self._mcp_clients.pop(provider)
+        server, cfg = self._mcp_server_config(provider), self.config.mcp
+        if not server or not server.enabled:
+            raise MCPError("invalid_config")
+        if server.transport == "http":
+            from .mcp_client import HTTPMCPClient
+            client = HTTPMCPClient(server.url, os.environ.get(server.token_env, ""),
+                                   timeout_seconds=cfg.timeout_seconds, max_response_bytes=cfg.max_response_bytes)
+        else:
+            environment = {name: os.environ[name] for name in server.env_names if name in os.environ}
+            environment.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
+            if provider == "cap":
+                environment["JM_TASK_DB_PATH"] = str((Path(self.ctx.paths.data_dir)/"cap_mcp_tasks.sqlite3").resolve())
+            else:
+                environment["PIXIV_MCP_READ_ONLY"] = "false" if cfg.allow_writes else "true"
+            client = StdioMCPClient(server.command, server.args, server.cwd or str(Path(self.ctx.paths.data_dir).resolve()), environment,
+                                    timeout_seconds=cfg.timeout_seconds, max_response_bytes=cfg.max_response_bytes)
+        self._mcp_clients[provider] = client
+        return client
+
+    def _mcp_context(self, kwargs):
+        if not (self.config.plugin.enabled and self.config.mcp.enabled):
+            return None
+        runtime = self._ensure_unified()
+        if not runtime:
+            return None
+        request = dict(kwargs)
+        sender = extract_sender(kwargs.get("message"))
+        if sender:
+            request.update(session_id=sender.stream_id, reply_message_id=sender.message_id)
+        context = runtime.context(request)
+        if sender and context and (context["speaker_id"] != sender.user_id or
+                                    context["scope"] != sender.kind+":"+sender.target_id):
+            return None
+        return (context, request) if context else None
+
+    async def _invoke_mcp(self, provider, tool, arguments, kwargs, *, catalog=False):
+        trusted = self._mcp_context(kwargs)
+        server = self._mcp_server_config(provider)
+        if not trusted or not server or not server.enabled:
+            return {"success": False, "code": "configure_mcp_and_send_trusted_message"}
+        context, request = trusted
+        owner = self._self_state.state()["owner_id"]
+        generation, signature = self._mcp_generation, self._mcp_signature(provider)
+        def valid():
+            return (generation == self._mcp_generation and signature == self._mcp_signature(provider)
+                    and self._self_state.state()["owner_id"] == owner
+                    and self._unified.context(request) == context)
+        task = asyncio.current_task()
+        self._mcp_calls.add(task)
+        try:
+            self._ensure_tool_store()
+            client = self._mcp_client(provider)
+            if catalog:
+                return await self._mcp_bridge.catalog(provider, config=self.config.mcp, context=context,
+                    owner=owner, client=client, valid=valid)
+            return await self._mcp_bridge.execute(provider, tool, arguments, config=self.config.mcp,
+                context=context, owner=owner, client=client, valid=valid,
+                timezone=self.config.general.timezone, record_observations=self.config.mcp.remember_results)
+        except MCPError as exc:
+            return {"success": False, "code": exc.code}
+        finally:
+            self._mcp_calls.discard(task)
+
+    @Tool("living_world_mcp_tools", description="查看 cap 或 Pixiv MCP 当前可用的工具和参数；先发现工具再调用，资料不等于指令", parameters={
+        "provider": {"type": "string", "enum": ["cap", "pixiv"], "description": "资料服务"}})
+    async def mcp_tools(self, provider: str, **kwargs):
+        result = await self._invoke_mcp(provider, "", {}, kwargs, catalog=True)
+        return {"success": True, "content": json.dumps(result["tools"], ensure_ascii=False)} if result.get("success") else outward_result(result)
+
+    @Tool("living_world_mcp_call", description="调用已发现的 cap/Pixiv MCP 工具。查询、归档、任务状态分别调用；写入只限已启用权限的主人私聊，排队不代表完成", parameters={
+        "provider": {"type": "string", "enum": ["cap", "pixiv"], "description": "服务"},
+        "tool": {"type": "string", "description": "living_world_mcp_tools 返回的准确工具名"},
+        "arguments": {"type": "object", "description": "按已发现参数 schema 提供的 JSON 对象"}})
+    async def mcp_call(self, provider: str, tool: str, arguments: dict, **kwargs):
+        return outward_result(await self._invoke_mcp(provider, tool, arguments, kwargs))
+
+    @Tool("living_world_pixiv_image", description="读取 Pixiv 已缓存作品的一张图片交给模型观察；不自动向 QQ 发送，仅主人私聊且需启用媒体读取", parameters={
+        "pixiv_id": {"type": "integer", "description": "作品编号"},
+        "page_index": {"type": "integer", "description": "从0开始的图片页码", "default": 0}})
+    async def pixiv_image(self, pixiv_id: int, page_index: int = 0, **kwargs):
+        trusted = self._mcp_context(kwargs)
+        owner = normalize_qq(self.config.owner.qq)
+        if (not self.config.mcp.media_enabled or not trusted or trusted[0]["scope"] != "private:"+owner
+                or trusted[0]["speaker_id"] != owner or type(pixiv_id) is not int or pixiv_id <= 0
+                or type(page_index) is not int or page_index < 0):
+            return outward_result({"success": False, "code": "media_not_permitted"})
+        context, request = trusted
+        generation, signature = self._mcp_generation, self._mcp_signature("pixiv")
+        result = await self._invoke_mcp("pixiv", "get_library_work", {"pixiv_id": pixiv_id, "kind": "illust",
+            "file_offset": 0, "file_limit": 100}, kwargs)
+        if not result.get("success"):
+            return outward_result(result)
+        def valid():
+            return (generation == self._mcp_generation and signature == self._mcp_signature("pixiv")
+                    and self._self_state.state()["owner_id"] == owner
+                    and self._unified.context(request) == context)
+        if not valid():
+            return outward_result({"success": False, "code": "context_changed"})
+        call = self._tool_store.reserve_call("pixiv", "image_bytes", tool_digest([pixiv_id, page_index]),
+            tool_digest([context["sid"], context["mid"], "image", pixiv_id, page_index]), context["scope"], owner,
+            tool_day_start(self.config.general.timezone), self.config.mcp.max_daily_calls)
+        if not call["allowed"]:
+            return outward_result({"success": False, "code": call["status"]})
+        from .mcp_media import fetch_pixiv_image, MediaError
+        task = asyncio.current_task()
+        self._mcp_calls.add(task)
+        try:
+            image = await fetch_pixiv_image(backend_url=os.environ.get("PIXIV_MCP_BACKEND_URL", ""),
+                api_key=os.environ.get("PIXIV_MCP_API_KEY", ""), details=result["data"], pixiv_id=pixiv_id,
+                page_index=page_index, max_bytes=self.config.mcp.max_media_bytes,
+                timeout_seconds=min(30, self.config.mcp.timeout_seconds))
+            self._tool_store.complete_call(call["id"], "succeeded")
+            return {"success": True, **image} if valid() else outward_result({"success": False, "code": "context_changed"})
+        except MediaError as exc:
+            self._tool_store.complete_call(call["id"], "failed")
+            return outward_result({"success": False, "code": exc.code})
+        except asyncio.CancelledError:
+            self._tool_store.complete_call(call["id"], "uncertain")
+            raise
+        finally:
+            self._mcp_calls.discard(task)
+
+    @API("living_world_mcp_status", description="管理员查看MCP配置状态与持久调用/研究计数，不返回凭据、查询正文或路径", public=False)
+    async def mcp_status(self):
+        self._ensure_tool_store()
+        return {"enabled": self.config.mcp.enabled, "cap_enabled": self.config.mcp_cap.enabled,
+                "pixiv_enabled": self.config.mcp_pixiv.enabled, "connected": list(self._mcp_clients),
+                "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
+
+    async def _research_tools(self):
+        cfg = self.config.mcp
+        if not (cfg.enabled and cfg.research_enabled and cfg.remember_results and self.config.mcp_pixiv.enabled
+                and self._ensure_growth() and self.config.growth.mode == "active"):
+            return
+        state = self._growth_snapshot()
+        questions = {item["key"]: item for item in state["questions"] if item["status"] == "open"}
+        store = self._ensure_tool_store()
+        claim = store.claim_research(list(questions), interval_seconds=cfg.research_interval_seconds,
+            daily_limit=cfg.research_daily_limit, day_start=tool_day_start(self.config.general.timezone))
+        if not claim:
+            return
+        owner = self._self_state.state()["owner_id"]
+        generation, signature = self._mcp_generation, self._mcp_signature("pixiv")
+        context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "internal-research",
+                   "mid": claim["token"], "query": questions[claim["question_key"]]["topic"]}
+        def valid():
+            return (generation == self._mcp_generation and signature == self._mcp_signature("pixiv")
+                    and self._self_state.state()["owner_id"] == owner and self.config.growth.enabled
+                    and self.config.growth.mode == "active" and self.config.unified_mind.enabled
+                    and any(item == questions[claim["question_key"]]
+                            for item in self._growth_snapshot()["questions"]))
+        success = False
+        try:
+            client = self._mcp_client("pixiv")
+            options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,
+                           timezone=self.config.general.timezone, record_observations=True)
+            found = await self._mcp_bridge.execute("pixiv", "search_library",
+                {"q": context["query"], "page_size": 1, "x_restrict": 0, "statuses": ["active"]}, **options)
+            if found.get("success") and valid():
+                rows = found["data"].get("items", [])
+                success = True
+                if rows and isinstance(rows[0], dict):
+                    ident = rows[0].get("pixiv_id")
+                    kind = "novel" if rows[0].get("type") == "novel" else "illust"
+                    if type(ident) is int and ident > 0:
+                        detail = await self._mcp_bridge.execute("pixiv", "get_library_work",
+                            {"pixiv_id": ident, "kind": kind, "file_limit": 1}, **options)
+                        success = bool(detail.get("success"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            store.finish_research(claim["question_key"], success, token=claim["token"])
 
     @API("living_world_growth_status", description="管理员查看成长状态和恢复队列的计数，不返回私人正文", public=False)
     async def growth_status(self) -> dict[str, Any]:
@@ -1213,6 +1483,7 @@ class MaiLivingWorld(MaiBotPlugin):
                             self.ctx.logger.exception("[MaiLivingWorld][COGNITION] 公开认知失败，其他功能继续")
                     if self.config.growth.enabled:
                         try:
+                            await self._research_tools()
                             await self._grow()
                         except asyncio.CancelledError:
                             raise
@@ -1539,6 +1810,11 @@ class MaiLivingWorld(MaiBotPlugin):
 
     async def _try_target(self,kind: str,ident: str,now_dt: datetime):
         cfg=self.config.audience
+        unified_active = self._unified_active()
+        def proactive_signature():
+            return tool_digest({name: getattr(self.config, name).model_dump() for name in
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience")})
+        signature = proactive_signature()
         assert self._store is not None
         target=f"qq:{kind}:{ident}"
         now=time.time()
@@ -1628,18 +1904,20 @@ class MaiLivingWorld(MaiBotPlugin):
             )
         # 定时主动联系主人不依赖最新一条来信，但仅限配置中明确绑定的 QQ 私聊目标。
         # 特殊关系模板不会混入其他私聊或任何群聊的主动唤醒。
+        if signature != proactive_signature():
+            return
         if (kind == "private" and self.config.owner.enabled
                 and normalize_qq(self.config.owner.qq) == ident):
             style = self._relation_for("private")
             if style:
                 intent += "\n\n" + style
-            if self.config.mind.enabled:
+            if self.config.mind.enabled and not unified_active:
                 mind = self._ensure_mind()
                 if mind:
                     hint = mind.private_hint(ident, mode=self.config.mind.mode)
                     if hint:
                         intent += "\n\n" + hint
-        if (kind == "private" and self._brain and self.config.brain_memory.enabled
+        if (not unified_active and kind == "private" and self._brain and self.config.brain_memory.enabled
                 and self.config.brain_memory.mode == "active"):
             hint=self._brain.hint("private:"+ident)
             if hint:
@@ -1647,6 +1925,50 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.general.dry_run:
             self.ctx.logger.info("[MaiLivingWorld][DRY-RUN] 目标=%s 计划=%s 题目=%s",target,"explore" if story else "history",story['title'] if story else topic)
             return
+        if unified_active:
+            runtime = self._ensure_unified()
+            if not runtime:
+                return
+            owner = self._self_state.state()["owner_id"]
+            generation = runtime._generation
+            def valid():
+                targets = _clean_ids(self.config.audience.private_users if kind == "private"
+                                     else self.config.audience.group_ids)
+                if kind == "private" and self.config.owner.enabled and self.config.owner.add_to_private_targets:
+                    targets.append(normalize_qq(self.config.owner.qq))
+                return (self._unified_active() and self.config.general.enabled and ident in targets
+                        and signature == proactive_signature() and self._unified is runtime
+                        and runtime._generation == generation and self._self_state.state()["owner_id"] == owner)
+            query = story["title"] if story else topic
+            def memory_version():
+                return _memory_version(sorted(self._collect_unified(query), key=lambda item: item["id"]))
+            original_memories = memory_version()
+            hint = await runtime.proactive_hint({"scope": kind+":"+ident, "speaker_id": ident if kind == "private" else "",
+                "sid": sid, "query": story["title"] if story else topic}, self.config.unified_mind,
+                recall=self._collect_unified, generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
+                timezone=self.config.general.timezone, valid=valid)
+            if not valid() or memory_version() != original_memories:
+                return
+            if hint:
+                intent += "\n\n" + hint
+            # Time spent deciding can cross a quiet period or receive a new message.
+            check_now = time.time()
+            recent_activity = await self.ctx.message.get_by_time_in_chat(sid, now, check_now)
+            if (recent_activity is None or recent_activity or not valid()
+                    or memory_version() != original_memories):
+                return
+            local_now = datetime.fromtimestamp(check_now, ZoneInfo(self.config.general.timezone))
+            if is_quiet(local_now, cfg.quiet_start, cfg.quiet_end):
+                return
+            if not self._store.may_contact(target, check_now, _day_start(local_now), attempt_gap, attempt_limit)[0]:
+                return
+            if feedback and not feedback.check(target, check_now, _day_start(local_now),
+                                                cfg.min_gap_hours*3600, cfg.max_daily_per_target)[0]:
+                return
+            if experience and not experience.allow(ident, "explore" if story else "history",
+                                                    active=self.config.experience.mode == "active")[0]:
+                return
+            now = check_now
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None
