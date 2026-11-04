@@ -21,6 +21,8 @@ TABLES = (
     "cognitive_evidence", "cognitive_events",
     "experience_actions", "experience_evidence", "experience_policy",
     "experience_opt_out", "proactive_targets", "proactive_events",
+    "self_identity", "self_owner_history",
+    "growth_state", "growth_jobs", "growth_history", "growth_consumed",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",
@@ -119,12 +121,15 @@ class MySQLCompatConnection:
             raise ValueError("非法的 MySQL 表名前缀")
         import pymysql
         self.prefix = table_prefix
-        self.con = pymysql.connect(
+        self._connect_kwargs = dict(
             host=host, port=int(port), user=user, password=password,
             database=database, charset="utf8mb4", autocommit=False,
             connect_timeout=int(connect_timeout), read_timeout=10, write_timeout=10,
             cursorclass=pymysql.cursors.DictCursor,
         )
+        self._read_connection = None
+        self._closed = False
+        self.con = pymysql.connect(**self._connect_kwargs)
         self.audit = SQLAudit(logger=logger, enabled=sql_debug, backend="mysql")
         self.row_factory = None
         self._in_block = False
@@ -166,6 +171,53 @@ class MySQLCompatConnection:
         except BaseException:
             cursor.close()
             raise
+
+    def fetch_readonly(self, sql: str, parameters=()) -> list[CompatRow]:
+        """在专用 autocommit 连接读取已提交数据，不触碰账本的写事务。
+
+        只供仓库固定 SELECT 模板使用；所有运行值必须通过 parameters 传入。
+        每次查询拥有独立的读视图，避免写连接的长事务快照隐藏新记忆。
+        出错时丢弃读连接，当前请求不重试，也不提交或回滚主连接。
+        """
+        if (not isinstance(sql, str) or not re.match(r"^\s*SELECT\b", sql, re.I)
+                or ";" in sql
+                or re.search(r"\b(?:FOR\s+(?:UPDATE|SHARE)|LOCK\s+IN\s+SHARE\s+MODE|INTO)\b", sql, re.I)):
+            raise ValueError("只读查询仅接受单条无锁 SELECT 模板")
+        if getattr(self, "_closed", False):
+            raise RuntimeError("MySQL 账本连接已关闭")
+        if self._read_connection is None:
+            import pymysql
+            self._read_connection = pymysql.connect(**{**self._connect_kwargs, "autocommit": True})
+        reader = self._read_connection
+        cursor = None
+        try:
+            cursor = reader.cursor()
+            query = self._sql(sql)
+            self.audit.run(query, parameters, lambda: cursor.execute(query, parameters))
+            rows = [CompatRow(row) for row in cursor.fetchall()]
+        except BaseException:
+            # 保留原查询错误，即使清理游标或断开的连接也失败。
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except BaseException:
+                    pass
+            self._read_connection = None
+            try:
+                reader.close()
+            except BaseException:
+                pass
+            raise
+        try:
+            cursor.close()
+        except BaseException:
+            self._read_connection = None
+            try:
+                reader.close()
+            except BaseException:
+                pass
+            raise
+        return rows
 
     def execute(self, sql: str, parameters=()):
         pragma = re.fullmatch(r"\s*PRAGMA\s+table_info\((\w+)\)\s*", sql, re.I)
@@ -251,7 +303,14 @@ class MySQLCompatConnection:
         self.con.rollback()
 
     def close(self):
-        self.con.close()
+        self._closed = True
+        reader = self._read_connection
+        self._read_connection = None
+        try:
+            if reader is not None:
+                reader.close()
+        finally:
+            self.con.close()
 
     @property
     def in_transaction(self):

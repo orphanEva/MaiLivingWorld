@@ -31,7 +31,12 @@ from .cognition import CognitiveStore, parse_cognition
 from .mind import MindStore, parse_reflection, evidence_from_messages
 from .experience_loop import ExperienceLoop
 from .brain_core import BrainBook, valid_scope
-from .brain_runtime import evidence_from_qq, parse_proposal, build_prompt, inject_brain_prompt
+from .brain_runtime import BRAIN_MARKER, evidence_from_qq, parse_proposal, build_prompt, inject_brain_prompt
+from .self_state import SelfState
+from .unified_memory import collect_memories, resolve_memories, derived_memories
+from .unified_runtime import UnifiedRuntime
+from .growth_store import GrowthStore, source_fingerprint
+from .growth_runtime import GrowthRuntime, style_hint
 
 
 class PluginSection(PluginConfigBase):
@@ -39,7 +44,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.10.0",
+        default="0.12.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -111,9 +116,9 @@ class Brain(PluginConfigBase):
 
 
 class Mind(PluginConfigBase):
-    """主人私聊自省和可修正的长期观察；与公开资讯记忆隔离。"""
+    """从主人私聊形成带证据的观察，统一心智可读取已生效笔记。"""
     __ui_label__ = "06 / 内在反思与关系成长"
-    enabled: bool = Field(default=False, description="启用主人私聊的独立本地观察笔记；不读群聊，不写入全局资讯记忆库")
+    enabled: bool = Field(default=False, description="从主人私聊整理带证据的观察笔记；统一心智开启后可参与跨场景内部联想")
     auto_reflect: bool = Field(default=False, description="是否定时用模型复盘最近私聊；默认关闭，打开才消耗模型Token")
     mode: Literal["observe", "active"] = Field(default="observe", description="observe=仅观察并记账，不影响回复；active=只注入有来源且已审核通过的笔记")
     interval_hours: int = Field(default=12, ge=1, le=168, description="同一主人两次反思调用的最小间隔（小时）；只有聊天内容变化才再次反思")
@@ -126,7 +131,7 @@ class Mind(PluginConfigBase):
 class Cognition(PluginConfigBase):
     """有限自主认知：只处理公开信息，不能自主执行动作。"""
     __ui_label__ = "07 / 有限自主认知（公开信息）"
-    enabled: bool = Field(default=False, description="公开资讯认知账本开关；默认关闭，和私人反思严格隔离")
+    enabled: bool = Field(default=False, description="从公开资讯整理关注问题；默认关闭，启用后可参与统一心智的内部联想")
     auto_think: bool = Field(default=False, description="定期调用现有模型提炼公开关注问题，会消耗Token")
     mode: Literal["observe", "active"] = Field(default="observe", description="observe只记录；active只将公开主题作为选题弱偏好，不增加主动聊天次数")
     interval_hours: int = Field(default=6, ge=1, le=168, description="两次认知模型尝试最小间隔小时数，失败也限频")
@@ -146,16 +151,16 @@ class Experience(PluginConfigBase):
 
 
 class BrainMemory(PluginConfigBase):
-    """按 QQ 用户/群作用域隔离的情景记忆、事实、目标、反馈和元认知。"""
+    """保留 QQ 用户/群来源的情景记忆、事实、目标、反馈和元认知。"""
     __ui_label__ = "09 / 可测试的记忆与认知闭环"
     enabled: bool = Field(default=False, description="所有新认知模块的总开关，默认关闭")
-    mode: Literal["observe", "active"] = Field(default="observe", description="observe=只记录，active=在对应会话注入已核实记忆及目标")
+    mode: Literal["observe", "active"] = Field(default="observe", description="未开启统一心智时：observe只记录，active在原会话使用记忆；统一表达由unified_mind.mode控制")
     auto_reflect: bool = Field(default=False, description="定时整理可信 QQ 文字证据，消耗少量模型 Token")
     quick_update: bool = Field(default=True, description="脑记忆启用自动反思后，额外进行低频快速事实/目标进展更新，不改变主动聊天频率")
     quick_interval_minutes: int = Field(default=5, ge=1, le=60, description="轻量更新最小间隔（分钟）；深度元认知仍按 interval_hours")
-    include_owner: bool = Field(default=True, description="允许已绑定 QQ 主人的私聊建立独立记忆（还需 owner.enabled）")
+    include_owner: bool = Field(default=True, description="采集已绑定 QQ 主人的私聊记忆（还需 owner.enabled），保留私聊来源")
     private_users: list[str] = Field(default_factory=list, description="额外允许记忆的私聊 QQ 用户白名单；不会自动私聊")
-    group_ids: list[str] = Field(default_factory=list, description="允许产生群公共记忆的 QQ 群白名单；默认空，不读其他群")
+    group_ids: list[str] = Field(default_factory=list, description="允许采集和使用记忆的 QQ 群名单；记录群来源，不自动认定群内容可公开")
     enable_events: bool = Field(default=False, description="模块一：生成带时间/来源的情景事件")
     enable_facts: bool = Field(default=False, description="模块二：提炼、去重、审核并修正具体事实")
     enable_goals: bool = Field(default=False, description="模块三：识别具体未完目标；不授予自动行动权限")
@@ -175,6 +180,24 @@ class Memory(PluginConfigBase):
     webui_port: int = Field(default=8001, ge=1, le=65535, description="MaiBot 主进程 WebUI 在本容器监听的端口；只允许连接 127.0.0.1")
     import_max_wait_seconds: int = Field(default=45, ge=5, le=120, description="最长等待导入任务完成的秒数；超时不标记成功")
     chat_id: str = Field(default="living_world_explore", description="旧版兼容字段：WebUI 导入模式使用全局公共素材，不使用此虚拟聊天 ID")
+
+
+class UnifiedMind(PluginConfigBase):
+    __ui_label__ = "10 / 统一心智与唯一主人"
+    enabled: bool = Field(default=False, description="统一记忆入口；需先启用并绑定唯一主人，沿用脑记忆的采集名单")
+    mode: Literal["observe", "active"] = Field(default="observe", description="observe=只进行内部联想并显示计数；active=让经过表达判断的记忆影响回复")
+    recall_limit: int = Field(default=12, ge=1, le=12, description="每轮内部联想的相关记忆数量上限，跨私聊/群聊/公开来源")
+    candidate_limit: int = Field(default=200, ge=12, le=1000, description="统一检索最多取回的候选行数，不等于数据库物理扫描行数")
+    min_interval_seconds: int = Field(default=30, ge=0, le=3600, description="新的内部联想最短间隔；同轮通用知识复核独立计费但不受此间隔限制")
+    max_daily_model_calls: int = Field(default=60, ge=0, le=1000, description="每日统一联想、表达复核、成长提案和成长复核共用模型调用上限；失败计数，重启不重置")
+    model_timeout_seconds: int = Field(default=8, ge=2, le=30, description="单次内部模型请求超时秒数；每轮最多联想和复核两次，超时不传递私人原文")
+
+
+class Growth(PluginConfigBase):
+    __ui_label__ = "11 / 长期兴趣与性格成长"
+    enabled: bool = Field(default=False, description="启用基于统一记忆的成长循环；需开启统一心智并绑定唯一主人")
+    mode: Literal["observe", "active"] = Field(default="observe", description="observe=验证并记录任务结果，不改变人格；active=持久更新兴趣、观点、知识、问题、性格与短期情绪")
+    interval_seconds: int = Field(default=3600, ge=60, le=86400, description="新学习任务的最短间隔，任务与时间持久化；与统一联想共用每日模型预算")
 
 
 class Storage(PluginConfigBase):
@@ -202,6 +225,8 @@ class Config(PluginConfigBase):
     cognition: Cognition = Field(default_factory=Cognition)
     experience: Experience = Field(default_factory=Experience)
     brain_memory: BrainMemory = Field(default_factory=BrainMemory)
+    unified_mind: UnifiedMind = Field(default_factory=UnifiedMind)
+    growth: Growth = Field(default_factory=Growth)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -244,6 +269,10 @@ class MaiLivingWorld(MaiBotPlugin):
         self._feedback: ProactiveFeedback | None = None
         self._experience: ExperienceLoop | None = None
         self._brain: BrainBook | None = None
+        self._self_state: SelfState | None = None
+        self._unified: UnifiedRuntime | None = None
+        self._growth: GrowthStore | None = None
+        self._growth_runtime: GrowthRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -286,8 +315,12 @@ class MaiLivingWorld(MaiBotPlugin):
             self._ensure_experience()
         if self.config.brain_memory.enabled:
             self._ensure_brain()
+        if self.config.unified_mind.enabled:
+            self._ensure_unified()
+        if self.config.growth.enabled:
+            self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.10.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.12.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -299,6 +332,10 @@ class MaiLivingWorld(MaiBotPlugin):
         self._pending_memory.clear()
         self._brain_recent_private.clear()
         self._brain_recent_group.clear()
+        if self._unified:
+            self._unified.reset()
+        if self._growth_runtime:
+            self._growth_runtime.reset()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
     async def _owner_session_id(self, sender):
@@ -412,6 +449,21 @@ class MaiLivingWorld(MaiBotPlugin):
         if len(self._brain_recent_group)>500:
             self._brain_recent_group = {k:v for k,v in self._brain_recent_group.items() if now-v[1]<120}
         return {"action":"continue"}
+
+    @HookHandler(
+        "chat.receive.after_process", name="living_world_unified_capture",
+        description="为同一个智能体记录当前可信交谈对象与临时问题，不按会话分割长期记忆",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def capture_unified(self, message: Any = None, **kwargs):
+        runtime = self._ensure_unified()
+        if runtime:
+            private = _clean_ids(self.config.brain_memory.private_users)
+            if self.config.brain_memory.include_owner:
+                private = list(dict.fromkeys(private + [normalize_qq(self.config.owner.qq)]))
+            runtime.capture(message, private_users=private,
+                            group_ids=_clean_ids(self.config.brain_memory.group_ids))
+        return {"action": "continue"}
 
     @HookHandler(
         "chat.receive.after_process", name="living_world_owner_experience_feedback",
@@ -559,13 +611,16 @@ class MaiLivingWorld(MaiBotPlugin):
         if hit[3] != normalize_qq(cfg.qq) or time.monotonic() - hit[0] > 90:
             return ""
         hint = owner_hint(cfg.title, "private", self._relation_for("private"))
-        if self.config.mind.enabled and self._mind:
+        if self.config.mind.enabled and self._mind and not self._unified_active():
             note = self._mind.private_hint(normalize_qq(cfg.qq), mode=self.config.mind.mode)
             if note:
                 hint += "\n\n" + note
         return hint
 
     def _brain_hint_for(self, kwargs: dict[str,Any]) -> str:
+        if self._unified_active():
+            # Unified expression is the sole memory-to-reply route in active mode.
+            return ""
         if not (self.config.plugin.enabled and self.config.brain_memory.enabled
                 and self.config.brain_memory.mode == "active" and self._brain):
             return ""
@@ -586,23 +641,46 @@ class MaiLivingWorld(MaiBotPlugin):
 
     @HookHandler(
         "maisaka.planner.before_request", name="living_world_brain_planner_hint",
-        description="仅对近期验证过的私人会话注入独立范围的有效记忆",
+        description="向可信私聊规划注入持续自我；未开启统一心智时沿用原记忆提示",
         mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
     )
     async def brain_planner_hint(self, **kwargs):
         # Planner 只带 session_id；群聊必须有明确 reply_message_id，因此不在这里注入。
         if kwargs.get("reply_message_id"):
             return {"action":"continue"}
+        if self._unified_active():
+            runtime = self._ensure_unified()
+            context = runtime.context(kwargs) if runtime else None
+            prompt = runtime.self_hint(context) if context else ""
+            updated = inject_brain_prompt(kwargs, BRAIN_MARKER + "\n" + prompt) if prompt else None
+            return {"action": "continue", "modified_kwargs": updated} if updated else {"action": "continue"}
         prompt = self._brain_hint_for(kwargs)
         updated = inject_brain_prompt(kwargs,prompt) if prompt else None
         return {"action":"continue","modified_kwargs":updated} if updated is not None else {"action":"continue"}
 
     @HookHandler(
         "maisaka.replyer.before_model_request", name="living_world_brain_reply_hint",
-        description="只按同一条可核验的 QQ 群消息或私人会话检索已确认记忆",
+        description="核验当前QQ交谈对象，按统一记忆与表达判断形成回复背景",
         mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
     )
     async def brain_reply_hint(self, **kwargs):
+        if self.config.unified_mind.enabled:
+            runtime = self._ensure_unified()
+            if runtime:
+                try:
+                    prompt = await runtime.reply_hint(
+                        kwargs, self.config.unified_mind, recall=self._collect_unified,
+                        generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
+                        timezone=self.config.general.timezone,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    prompt = ""
+                    runtime.last_status = "storage_or_context_failed"
+                if self._unified_active():
+                    updated = inject_brain_prompt(kwargs, BRAIN_MARKER + "\n" + prompt) if prompt else None
+                    return {"action": "continue", "modified_kwargs": updated} if updated else {"action": "continue"}
         prompt = self._brain_hint_for(kwargs)
         updated = inject_brain_prompt(kwargs,prompt) if prompt else None
         return {"action":"continue","modified_kwargs":updated} if updated is not None else {"action":"continue"}
@@ -645,6 +723,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._owner_group_messages.clear()
         self._brain_recent_private.clear()
         self._brain_recent_group.clear()
+        if self._unified:
+            self._unified.reset()
         self._pending_proactive.clear()
         self._pending_memory.clear()
         # 退出后不能继续访问可能已关闭的 SQLite/MySQL 连接。
@@ -654,6 +734,16 @@ class MaiLivingWorld(MaiBotPlugin):
             await asyncio.gather(*self._memory_jobs, return_exceptions=True)
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
+        if self._growth_runtime:
+            self._growth_runtime.reset()
+            self._growth_runtime = None
+        if self._growth:
+            self._growth.close()
+            self._growth = None
+        if self._self_state:
+            self._self_state.close()
+            self._self_state = None
+        self._unified = None
         if self._brain:
             self._brain.close()
             self._brain = None
@@ -722,7 +812,7 @@ class MaiLivingWorld(MaiBotPlugin):
         return {"ready": True, "targets": [self._feedback.status(t, day_start=day_start) for t in targets[:30]]}
 
     def _ledger_storage_options(self) -> dict[str, Any]:
-        """统一六套数据后端；配置为 MySQL 时任何子库都不得偷偷回退到 SQLite。"""
+        """统一所有账本后端；配置为 MySQL 时任何子库都不得偷偷回退到 SQLite。"""
         cfg=self.config.storage
         backend=str(cfg.backend).strip().lower()
         mysql_settings=None
@@ -737,6 +827,166 @@ class MaiLivingWorld(MaiBotPlugin):
             raise ValueError("存储类型只能是 sqlite 或 mysql")
         return {"logger":self.ctx.logger, "sql_debug":cfg.sql_debug,
                 "mysql_settings":mysql_settings}
+
+    def _unified_active(self) -> bool:
+        return bool(self.config.plugin.enabled and self.config.unified_mind.enabled
+                    and self.config.unified_mind.mode == "active")
+
+    def _ensure_unified(self) -> UnifiedRuntime | None:
+        if not (self.config.plugin.enabled and self.config.unified_mind.enabled
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq)):
+            return None
+        if self._self_state is None:
+            self._self_state = SelfState(Path(self.ctx.paths.data_dir) / "self_state.sqlite3",
+                                         **self._ledger_storage_options())
+        # This path reads administrator configuration only, never chat/model output.
+        previous = self._self_state.state()["owner_id"]
+        owner = normalize_qq(self.config.owner.qq)
+        self._self_state.configure_owner(owner)
+        if self._unified is None:
+            self._unified = UnifiedRuntime(self._self_state, profile=self._growth_style_hint)
+        elif previous != owner:
+            self._unified.reset()
+        return self._unified
+
+    def _memory_sources(self) -> dict[str, Any]:
+        brain = self._ensure_brain() if self.config.brain_memory.enabled else None
+        mind = self._ensure_mind() if self.config.mind.enabled else None
+        cognition = self._ensure_cognition() if self.config.cognition.enabled else None
+        return dict(brain=brain, mind=mind, cognition=cognition, stories=self._store)
+
+    def _collect_roots(self, query: str = "") -> list[dict[str, Any]]:
+        cfg = self.config.unified_mind
+        return collect_memories(**self._memory_sources(), owner_id=normalize_qq(self.config.owner.qq),
+                                query=query, limit=cfg.recall_limit, scan_limit=cfg.candidate_limit)
+
+    def _resolve_roots(self, ids) -> dict[str, dict]:
+        return resolve_memories(ids, **self._memory_sources())
+
+    def _growth_snapshot(self) -> dict:
+        state = self._growth.state()
+        refs = list(dict.fromkeys(ref["id"] for key in ("interests", "beliefs", "knowledge", "questions")
+                                 for item in state[key] for ref in item["sources"]))
+        # Bounded exact reads also re-check retractions/expiry of old evidence.
+        resolved = {}
+        for offset in range(0, len(refs), 128):
+            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        for key in ("interests", "beliefs", "knowledge", "questions"):
+            state[key] = [item for item in state[key] if item["sources"] and all(
+                ref["id"] in resolved and source_fingerprint(resolved[ref["id"]]) == ref["digest"]
+                for ref in item["sources"])]
+        return state
+
+    def _derived_memories(self, query="") -> list[dict]:
+        if not (self.config.growth.enabled and self.config.growth.mode == "active" and self._ensure_growth()):
+            return []
+        state = self._growth.state()
+        refs = list(dict.fromkeys(ref["id"] for key in ("interests", "beliefs", "knowledge", "questions")
+                                 for item in state[key] for ref in item["sources"]))
+        resolved = {}
+        for offset in range(0, len(refs), 128):
+            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        return derived_memories(state, resolved, fingerprint=source_fingerprint, query=query, limit=12)
+
+    def _collect_unified(self, query: str) -> list[dict[str, Any]]:
+        roots = self._collect_roots(query)
+        derived = self._derived_memories(query)
+        # Reserve room for both lived evidence and learned conclusions.
+        if not derived:
+            return roots
+        count = min(len(derived), max(1, self.config.unified_mind.recall_limit // 2))
+        return (derived[:count] + roots)[:self.config.unified_mind.recall_limit]
+
+    def _growth_style_hint(self) -> str:
+        if (self.config.growth.enabled and self.config.growth.mode == "active"
+                and self._unified_active() and self._growth):
+            return style_hint(self._growth.state())
+        return ""
+
+    def _ensure_growth(self) -> GrowthRuntime | None:
+        if not self.config.growth.enabled or not self._ensure_unified():
+            return None
+        if self._growth is None:
+            self._growth = GrowthStore(Path(self.ctx.paths.data_dir) / "growth.sqlite3",
+                                       **self._ledger_storage_options())
+        if self._growth_runtime is None:
+            self._growth_runtime = GrowthRuntime(self._growth, self._self_state)
+        return self._growth_runtime
+
+    def _growth_candidates(self) -> list[dict]:
+        recent = self._collect_roots()
+        state = self._growth_snapshot()
+        questions = [item for item in state["questions"] if item.get("status") == "open"]
+        if not questions:
+            return recent
+        # Rotate unfinished questions; external collection continues through the existing explorer.
+        question = questions[state["revision"] % len(questions)]
+        related = self._collect_roots(question["topic"])
+        candidates = recent[:6] + related + recent[6:]
+        return list({item["id"]: item for item in candidates}.values())[:12]
+
+    async def _grow(self):
+        runtime = self._ensure_growth()
+        if runtime:
+            await runtime.tick(self.config.growth, self.config.unified_mind,
+                collect=self._growth_candidates, resolve=self._resolve_roots, snapshot=self._growth_snapshot,
+                generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
+                timezone=self.config.general.timezone,
+                allowed=lambda: bool(self.config.plugin.enabled and self.config.unified_mind.enabled
+                    and self.config.owner.enabled and normalize_qq(self.config.owner.qq)
+                    == self._self_state.state()["owner_id"]))
+
+    @API("living_world_growth_status", description="管理员查看成长状态和恢复队列的计数，不返回私人正文", public=False)
+    async def growth_status(self) -> dict[str, Any]:
+        runtime = self._ensure_growth()
+        if not runtime:
+            return {"ready": False, "reason": "enable_growth_unified_mind_and_bind_owner"}
+        return {"ready": True, "mode": self.config.growth.mode, **self._growth.status(),
+                "last_status": runtime.last_status, "last_counts": runtime.last_counts}
+
+    @API("living_world_growth_profile", description="仅管理员查看成长档案和来源，包含可能敏感的推断，不可公开转发", public=False)
+    async def growth_profile(self) -> dict[str, Any]:
+        return self._growth_snapshot() if self._ensure_growth() else {"ready": False}
+
+    @API("living_world_growth_history", description="仅管理员查看可追溯的成长修订，可能包含敏感内容", public=False)
+    async def growth_history(self, limit: int = 20) -> dict[str, Any]:
+        return {"history": self._growth.history(limit=limit)} if self._ensure_growth() else {"ready": False}
+
+    @API("living_world_growth_rollback", description="管理员回滚最近一次成长；须给出当前版本和明确确认，不重置去重或主人", public=False)
+    async def growth_rollback(self, expected_revision: int, confirm: str = "") -> dict[str, Any]:
+        if confirm != "ROLLBACK_GROWTH" or not self._ensure_growth():
+            return {"ok": False, "reason": "confirmation_or_configuration_required"}
+        self._growth_runtime.reset()
+        self._unified.reset()
+        try:
+            state = self._growth.rollback(expected_revision=expected_revision)
+        except ValueError:
+            return {"ok": False, "reason": "revision_conflict_or_no_history"}
+        return {"ok": True, "revision": state["revision"]}
+
+    @API("living_world_growth_rebuild_item", description="管理员废弃指定旧推断以便按新证据重建；保留审计和证据去重，须明确确认", public=False)
+    async def growth_rebuild_item(self, key: str, expected_revision: int, confirm: str = "") -> dict[str, Any]:
+        if confirm != "REBUILD_GROWTH_ITEM" or not self._ensure_growth():
+            return {"ok": False, "reason": "confirmation_or_configuration_required"}
+        self._growth_runtime.reset()
+        self._unified.reset()
+        try:
+            state = self._growth.retire(key, expected_revision=expected_revision)
+        except ValueError:
+            return {"ok": False, "reason": "revision_conflict_or_missing_item"}
+        return {"ok": True, "revision": state["revision"]}
+
+    @API("living_world_unified_status", description="管理员查看持续身份、唯一主人绑定状态及统一联想计数，不返回记忆正文", public=False)
+    async def unified_status(self) -> dict[str, Any]:
+        runtime = self._ensure_unified()
+        if not runtime:
+            return {"ready": False, "reason": "enable_unified_mind_and_bind_owner"}
+        state = self._self_state.state()
+        return {"ready": True, "agent_id": state["agent_id"], "owner_bound": bool(state["owner_id"]),
+                "owner_revision": state["revision"], "mode": self.config.unified_mind.mode,
+                "last_status": runtime.last_status, "last_counts": dict(runtime.last_counts),
+                "budget_day": state["budget_day"], "model_calls": state["thought_count"],
+                "last_thought": state["last_thought"]}
 
     def _ensure_brain(self) -> BrainBook | None:
         if not (self.config.plugin.enabled and self.config.brain_memory.enabled):
@@ -961,6 +1211,13 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.exception("[MaiLivingWorld][COGNITION] 公开认知失败，其他功能继续")
+                    if self.config.growth.enabled:
+                        try:
+                            await self._grow()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld][GROWTH] 成长任务暂未完成，下轮重试")
                     if not self.config.general.enabled:
                         continue
                     if now-self._last_chat_check >= self.config.audience.check_interval_minutes*60:
@@ -1188,6 +1445,9 @@ class MaiLivingWorld(MaiBotPlugin):
                 # 旧反思在模型提示里是待核实线索，永不进入 QQ 回复注入。
                 past_reviews = (db.recent_reflections(scope,now=now)
                                 if cfg.enable_metacognition and not quick else [])
+                # Source-local extraction preserves evidence provenance. Cross-source
+                # associations run separately in UnifiedRuntime without rewriting
+                # private source material into another conversation's stored facts.
                 prompt=build_prompt(scope,evidence,existing,prior_reflections=past_reviews)
                 response=await self.ctx.llm.generate(prompt,task_name=self.config.brain.model_task,
                                                     temperature=0.2,max_tokens=1300)
@@ -1447,6 +1707,11 @@ class MaiLivingWorld(MaiBotPlugin):
             cognition = self._ensure_cognition()
             if cognition:
                 interest_hint = cognition.interest_hint(limit=3)
+        if self._unified_active():
+            public_interests = [item["topic"] for item in self._derived_memories()
+                                if item["kind"] == "interest" and item["sensitivity"] == "public"
+                                and item.get("weight", 0) > 0]
+            interest_hint = "、".join(([interest_hint] if interest_hint else []) + public_interests[:3])
         if not self.config.brain.use_llm_selection:
             # 公开认知兴趣仅作为选题弱偏好，不强制发消息。
             interests=[str(s).lower() for s in cfg.interests if str(s).strip()]

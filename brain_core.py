@@ -1,7 +1,8 @@
 """MaiLivingWorld 事件/事实/目标/反馈账本（独立于现有 A_Memorix）。
 
 刻意不实现“无限思维链”：每次反思有来源、成本预算和可审核状态。
-所有读取/修改都必须携带明确的 scope；绝不自动跨私聊、群聊合并。
+本模块写入和维护接口保留来源 scope；统一内部检索由 unified_memory 提供，
+不会将旧事实或证据改写为另一个来源场景。
 """
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
--- MaiLivingWorld v0.10.0 (MySQL 8.4 已验证) 六套数据共 29 表
--- 全部29张表及字段附中文COMMENT；新库直接执行本文件。
+-- MaiLivingWorld MySQL 8.4 八套数据共 35 表（含持续自我与成长）
+-- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
 
@@ -252,3 +252,63 @@ CREATE TABLE IF NOT EXISTS `mlw_proactive_events` (
           outcome VARCHAR(191) NOT NULL COMMENT '发送阶段或结果，如 submitted、planner_stop、reply_planned、send_confirmed、send_failed、unknown',
   KEY `idx_proactive_events_time` (target,created_at,outcome)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主动唤醒与回复规划器回执事件流水，区分计划和真实发送';
+
+-- self_state.py；只建空表，首次运行创建身份，迁移时保留原 agent_id。
+CREATE TABLE IF NOT EXISTS `mlw_self_identity` (
+    slot BIGINT PRIMARY KEY CHECK(slot=1) COMMENT '单例位置，恒为1；一个数据库命名空间只有一个智能体',
+    agent_id VARCHAR(191) NOT NULL UNIQUE COMMENT '持久智能体UUID，跨重启和聊天窗口保持不变',
+    owner_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '管理配置绑定的唯一主人平台用户ID，空值表示尚未绑定',
+    owner_platform VARCHAR(191) NOT NULL DEFAULT '' COMMENT '主人的可信身份平台，当前为qq',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '主人绑定修订号，首次绑定及显式更换时递增',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '思考预算当天起始时间，Unix秒',
+    thought_count BIGINT NOT NULL DEFAULT 0 COMMENT '当天已预留的思考次数，失败调用也计数',
+    last_thought DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次预留思考时间，Unix秒，用于跨重启冷却',
+    created DOUBLE NOT NULL COMMENT '身份创建时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近一次主人绑定变更时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='同一个智能体的稳定身份与唯一主人绑定，不按聊天会话分裂';
+
+CREATE TABLE IF NOT EXISTS `mlw_self_owner_history` (
+    revision BIGINT PRIMARY KEY COMMENT '对应主人绑定修订号，防止同一版本重复记录',
+    agent_id VARCHAR(191) NOT NULL COMMENT '发生绑定变更的持久智能体UUID',
+    previous_owner_id VARCHAR(191) NOT NULL COMMENT '变更前的主人平台用户ID，首次绑定为空',
+    owner_id VARCHAR(191) NOT NULL COMMENT '显式配置的新主人平台用户ID',
+    owner_platform VARCHAR(191) NOT NULL COMMENT '绑定的平台，当前为qq',
+    changed DOUBLE NOT NULL COMMENT '管理配置生效时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='唯一主人配置的修订审计，仅供管理端读取，不写入公开模型提示';
+
+-- growth_store.py；只创建空表，迁移时不生成或覆盖成长状态。
+CREATE TABLE IF NOT EXISTS `mlw_growth_state` (
+    slot BIGINT PRIMARY KEY CHECK(slot=1) COMMENT '单例位置，恒为1，对应当前智能体',
+    payload LONGTEXT NOT NULL COMMENT '有界兴趣观点知识问题性格情绪及变化额度的JSON状态',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '成长状态版本，成长回滚和显式重建时递增',
+    updated DOUBLE NOT NULL COMMENT '最近一次持久成长变更时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='持续成长的当前结构化档案，读取时计算情绪衰减且不改写原始状态';
+
+CREATE TABLE IF NOT EXISTS `mlw_growth_jobs` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '来源指纹及观察模式的稳定任务哈希，防止重复排队',
+    payload LONGTEXT NOT NULL COMMENT '来源ID指纹场景及保密属性的JSON引用，不存聊天原文',
+    status VARCHAR(191) NOT NULL COMMENT '任务状态：pending、running、done或failed',
+    mode VARCHAR(191) NOT NULL COMMENT '任务创建时模式：observe仅观察或active可应用',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '已消费的实际模型失败次数，达到三次停止',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前领取者的随机租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '租约过期时间，Unix秒，过期可重新领取',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许重试的时间，Unix秒',
+    created DOUBLE NOT NULL COMMENT '首次排队时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近任务状态变化时间，Unix秒',
+    error_code VARCHAR(191) NOT NULL DEFAULT '' COMMENT '固定错误码，不保存模型或聊天原文',
+    KEY `idx_growth_jobs_ready` (status,next_attempt,lease_until)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='跨重启恢复的学习任务队列，采用租约和有界失败退避';
+
+CREATE TABLE IF NOT EXISTS `mlw_growth_history` (
+    revision BIGINT PRIMARY KEY COMMENT '成长变更对应的全局版本号',
+    job_id VARCHAR(191) NOT NULL UNIQUE COMMENT '已提交任务或管理操作的唯一标识',
+    payload LONGTEXT NOT NULL COMMENT '变更前后状态及来源依赖的JSON审计记录',
+    created DOUBLE NOT NULL COMMENT '变更完成时间，Unix秒',
+    rolled_back BIGINT NOT NULL DEFAULT 0 COMMENT '是否已回滚或属于回滚记录，1表示是'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='可追溯的成长与管理操作历史，回滚保留源记忆和消费记录';
+
+CREATE TABLE IF NOT EXISTS `mlw_growth_consumed` (
+    source_id VARCHAR(191) PRIMARY KEY COMMENT '已用于兴趣性格或情绪变化的原始记录ID，改版也不重复累计',
+    job_id VARCHAR(191) NOT NULL COMMENT '首次消费该记录的成长任务ID',
+    consumed DOUBLE NOT NULL COMMENT '首次应用变化的时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='经历消费去重账本，回滚及重建不会补充已消费的成长次数';

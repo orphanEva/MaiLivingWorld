@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT.parent))
+from MaiLivingWorld.mysql_compat import TABLES
+
+EXPECTED_TABLES={"mlw_"+table for table in (*TABLES,"stories","attempts","story_attempts")}
 DDL=(ROOT/"sql/mysql.sql").read_text(encoding="utf-8")
 UPGRADE=(ROOT/"sql/mysql_comments_existing.sql").read_text(encoding="utf-8")
 CREATE=re.compile(r"CREATE TABLE IF NOT EXISTS \`(mlw_[a-z_]+)\` \([\s\S]*?\)\s+ENGINE=InnoDB[\s\S]*?;",re.I)
@@ -16,12 +21,12 @@ COLUMN_COMMENT=re.compile(r"\bCOMMENT\s+'(?:''|[^'])*'|\bCOMMENT='(?:''|[^'])*'"
 
 
 class SchemaCommentTests(unittest.TestCase):
-    def test_29_tables_have_comment_and_matching_update_statements(self):
+    def test_all_tables_have_comment_and_matching_update_statements(self):
         creates=CREATE.findall(DDL)
         alters=ALTER.findall(UPGRADE)
-        self.assertEqual(len(creates),29)
-        self.assertEqual(len(set(creates)),29)
-        self.assertEqual(len(alters),29)
+        self.assertEqual(set(creates),EXPECTED_TABLES)
+        self.assertEqual(len(creates),len(EXPECTED_TABLES))
+        self.assertEqual(len(alters),len(EXPECTED_TABLES))
         self.assertEqual(set(creates),set(alters))
         for match in CREATE.finditer(DDL):
             statement=match.group(0)
@@ -31,7 +36,7 @@ class SchemaCommentTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("MLW_LIVE_MYSQL")=="1",
                          "require temporary MySQL service")
-    def test_live_add_comments_to_preexisting_29_tables(self):
+    def test_live_add_comments_to_preexisting_tables(self):
         import pymysql
         connection=pymysql.connect(
             host=os.environ["MLW_MYSQL_HOST"],
@@ -60,12 +65,12 @@ class SchemaCommentTests(unittest.TestCase):
                     FROM information_schema.COLUMNS
                     WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'commentqa\\_%'""")
                 all_columns=cur.fetchall()
-                self.assertEqual(len(all_columns),183)
+                self.assertEqual(len(all_columns),len(re.findall(r"\bCOMMENT\s+'",DDL)))
                 self.assertTrue(all(row["COLUMN_COMMENT"] for row in all_columns))
                 cur.execute("""SELECT TABLE_COMMENT FROM information_schema.TABLES
                     WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'commentqa\\_%'""")
                 tables=cur.fetchall()
-                self.assertEqual(len(tables),29)
+                self.assertEqual(len(tables),len(EXPECTED_TABLES))
                 self.assertTrue(all(row["TABLE_COMMENT"] for row in tables))
                 # 再执行一次：可以重复运行，不应破坏现有注释。
                 for match in ALTER.finditer(UPGRADE):

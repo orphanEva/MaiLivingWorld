@@ -1,4 +1,5 @@
--- MaiLivingWorld v0.10.0 已建表补充中文注释专用脚本
+-- MaiLivingWorld 已建表补充中文注释专用脚本（含持续自我身份）
+-- 旧库升级请先执行 mysql.sql 创建缺失的身份与成长表，再运行本脚本。
 -- 先备份数据库并在低峰期执行。此脚本不删除、插入或更新业务行，
 -- 但 ALTER TABLE MODIFY COLUMN 可能获取元数据锁并重建部分表，请勿运行在高流量服务上。
 -- 仅适用于由 sql/mysql.sql 创建、字段结构一致的 MySQL 8.4 数据库；
@@ -304,3 +305,62 @@ ALTER TABLE `mlw_proactive_events`
   MODIFY COLUMN `created_at` DOUBLE NOT NULL COMMENT '事件创建时间，Unix秒',
   MODIFY COLUMN `updated_at` DOUBLE NOT NULL COMMENT '事件结果最近更新时间，Unix秒',
   MODIFY COLUMN `outcome` VARCHAR(191) NOT NULL COMMENT '发送阶段或结果，如 submitted、planner_stop、reply_planned、send_confirmed、send_failed、unknown';
+
+-- mlw_self_identity: 智能体身份与唯一主人绑定
+ALTER TABLE `mlw_self_identity`
+  COMMENT = '同一个智能体的稳定身份与唯一主人绑定，不按聊天会话分裂',
+  MODIFY COLUMN `slot` BIGINT NOT NULL COMMENT '单例位置，恒为1；一个数据库命名空间只有一个智能体',
+  MODIFY COLUMN `agent_id` VARCHAR(191) NOT NULL COMMENT '持久智能体UUID，跨重启和聊天窗口保持不变',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '管理配置绑定的唯一主人平台用户ID，空值表示尚未绑定',
+  MODIFY COLUMN `owner_platform` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '主人的可信身份平台，当前为qq',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '主人绑定修订号，首次绑定及显式更换时递增',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '思考预算当天起始时间，Unix秒',
+  MODIFY COLUMN `thought_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当天已预留的思考次数，失败调用也计数',
+  MODIFY COLUMN `last_thought` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次预留思考时间，Unix秒，用于跨重启冷却',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '身份创建时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近一次主人绑定变更时间，Unix秒';
+
+-- mlw_self_owner_history: 主人绑定配置审计
+ALTER TABLE `mlw_self_owner_history`
+  COMMENT = '唯一主人配置的修订审计，仅供管理端读取，不写入公开模型提示',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '对应主人绑定修订号，防止同一版本重复记录',
+  MODIFY COLUMN `agent_id` VARCHAR(191) NOT NULL COMMENT '发生绑定变更的持久智能体UUID',
+  MODIFY COLUMN `previous_owner_id` VARCHAR(191) NOT NULL COMMENT '变更前的主人平台用户ID，首次绑定为空',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '显式配置的新主人平台用户ID',
+  MODIFY COLUMN `owner_platform` VARCHAR(191) NOT NULL COMMENT '绑定的平台，当前为qq',
+  MODIFY COLUMN `changed` DOUBLE NOT NULL COMMENT '管理配置生效时间，Unix秒';
+
+ALTER TABLE `mlw_growth_state`
+  COMMENT = '持续成长的当前结构化档案，读取时计算情绪衰减且不改写原始状态',
+  MODIFY COLUMN `slot` BIGINT NOT NULL COMMENT '单例位置，恒为1，对应当前智能体',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界兴趣观点知识问题性格情绪及变化额度的JSON状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '成长状态版本，成长回滚和显式重建时递增',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近一次持久成长变更时间，Unix秒';
+
+ALTER TABLE `mlw_growth_jobs`
+  COMMENT = '跨重启恢复的学习任务队列，采用租约和有界失败退避',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '来源指纹及观察模式的稳定任务哈希，防止重复排队',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '来源ID指纹场景及保密属性的JSON引用，不存聊天原文',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '任务状态：pending、running、done或failed',
+  MODIFY COLUMN `mode` VARCHAR(191) NOT NULL COMMENT '任务创建时模式：observe仅观察或active可应用',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '已消费的实际模型失败次数，达到三次停止',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前领取者的随机租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '租约过期时间，Unix秒，过期可重新领取',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许重试的时间，Unix秒',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次排队时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近任务状态变化时间，Unix秒',
+  MODIFY COLUMN `error_code` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '固定错误码，不保存模型或聊天原文';
+
+ALTER TABLE `mlw_growth_history`
+  COMMENT = '可追溯的成长与管理操作历史，回滚保留源记忆和消费记录',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '成长变更对应的全局版本号',
+  MODIFY COLUMN `job_id` VARCHAR(191) NOT NULL COMMENT '已提交任务或管理操作的唯一标识',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '变更前后状态及来源依赖的JSON审计记录',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '变更完成时间，Unix秒',
+  MODIFY COLUMN `rolled_back` BIGINT NOT NULL DEFAULT 0 COMMENT '是否已回滚或属于回滚记录，1表示是';
+
+ALTER TABLE `mlw_growth_consumed`
+  COMMENT = '经历消费去重账本，回滚及重建不会补充已消费的成长次数',
+  MODIFY COLUMN `source_id` VARCHAR(191) NOT NULL COMMENT '已用于兴趣性格或情绪变化的原始记录ID，改版也不重复累计',
+  MODIFY COLUMN `job_id` VARCHAR(191) NOT NULL COMMENT '首次消费该记录的成长任务ID',
+  MODIFY COLUMN `consumed` DOUBLE NOT NULL COMMENT '首次应用变化的时间，Unix秒';

@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "带来源和作用域的情景记忆、事实巩固、目标管理、进展反馈与元认知；原有功能保持独立",
+  "description": "唯一主人、跨窗口统一记忆与持续成长；自己的兴趣和观点、渐变性格、可恢复学习及场景表达判断",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"

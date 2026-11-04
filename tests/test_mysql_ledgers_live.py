@@ -1,4 +1,4 @@
-"""真实 MySQL 8.4 验收五套持久化账本和 SQLite 29 表迁移（CI 专用）。"""
+"""真实 MySQL 8.4 验收持久化账本、自我身份和完整 SQLite 迁移（CI 专用）。"""
 from __future__ import annotations
 
 import os
@@ -13,6 +13,8 @@ from MaiLivingWorld.cognition import CognitiveStore
 from MaiLivingWorld.experience_loop import ExperienceLoop
 from MaiLivingWorld.proactive_feedback import ProactiveFeedback
 from MaiLivingWorld.store import Store
+from MaiLivingWorld.self_state import SelfState
+from MaiLivingWorld.unified_memory import collect_memories
 from MaiLivingWorld.explore import Story
 from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import snapshot, apply, ALL_TABLES
 
@@ -48,7 +50,7 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
         tables=[chunk for chunk in chunks
                 if chunk and any(line.lstrip().startswith("CREATE TABLE IF NOT EXISTS")
                                  for line in chunk.splitlines())]
-        self.assertEqual(len(tables),29)
+        self.assertEqual(len(tables),len(ALL_TABLES))
         connection=pymysql.connect(
             host=self.settings["host"],port=self.settings["port"],user=self.settings["user"],
             password=self.settings["password"],database=self.settings["database"],
@@ -61,7 +63,7 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
                     cursor.execute(chunk)
                 cursor.execute("SELECT COUNT(*) FROM information_schema.TABLES "
                                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'mlw_%'")
-                self.assertEqual(cursor.fetchone()[0],29)
+                self.assertEqual(cursor.fetchone()[0],len(ALL_TABLES))
         finally:
             connection.close()
 
@@ -237,13 +239,83 @@ class AllMySQLLedgersLiveTests(unittest.TestCase):
             feedback=ProactiveFeedback(directory/"proactive_feedback.sqlite3")
             self.assertGreater(feedback.begin("qq:private:12345678","session-one",now),0)
             feedback.close()
+            identity=SelfState(directory/"self_state.sqlite3")
+            before=identity.configure_owner("12345678",now=now)
+            identity.close()
             rows,missing=snapshot(directory)
             self.assertEqual(missing,[])
             self.assertEqual(len(rows),len(ALL_TABLES))
             for table in ("stories","attempts","story_attempts","brain_goals",
-                          "mind_runs","cognitive_cycles","experience_actions","proactive_events"):
+                          "mind_runs","cognitive_cycles","experience_actions","proactive_events",
+                          "self_identity","self_owner_history"):
                 self.assertGreater(len(rows[table]),0,table)
             self.assertEqual(apply(rows,self.migration)["stories"],1)
+            imported=SelfState(self.dir/"imported_self.db",mysql_settings=self.migration)
+            try:
+                self.assertEqual(imported.state(),before)
+                self.assertEqual(len(imported.history()),1)
+            finally:
+                imported.close()
             self.assertEqual(apply.__name__,"apply")
             with self.assertRaisesRegex(ValueError,"目标表非空"):
                 apply(rows,self.migration)
+
+    def test_07_self_identity_reopen_and_owner_audit(self):
+        db=SelfState(self.dir/"self.db",mysql_settings=self.settings)
+        first=db.configure_owner("12345678",now=100.0)
+        self.assertEqual(db.configure_owner("12345678",now=110.0),first)
+        self.assertEqual(len(db.history()),1)
+        db.close()
+        reopened=SelfState(self.dir/"self.db",mysql_settings=self.settings)
+        try:
+            self.assertEqual(reopened.state(),first)
+            second=reopened.configure_owner("87654321",now=120.0)
+            self.assertEqual(second["agent_id"],first["agent_id"])
+            self.assertEqual(second["revision"],2)
+            self.assertEqual(reopened.history()[0]["previous_owner_id"],"12345678")
+            budget={"day_start":1000.0,"min_interval_seconds":60,"daily_limit":1}
+            self.assertTrue(reopened.reserve_thought(now=1100.0,**budget))
+            self.assertFalse(reopened.reserve_thought(now=1200.0,**budget))
+        finally:
+            reopened.close()
+        budget_store=SelfState(self.dir/"self.db",mysql_settings=self.settings)
+        try:
+            self.assertEqual(budget_store.state()["thought_count"],1)
+            self.assertFalse(budget_store.reserve_thought(now=1300.0,**budget))
+            self.assertTrue(budget_store.reserve_thought(now=88000.0,**{**budget,"day_start":87400.0}))
+        finally:
+            budget_store.close()
+
+    def test_08_unified_reads_see_external_commit_without_finishing_writer_transaction(self):
+        settings={**self.settings,"table_prefix":"visibility_"}
+        reader=BrainBook(self.dir/"reader.db",mysql_settings=settings)
+        writer=BrainBook(self.dir/"writer.db",mysql_settings=settings)
+        try:
+            now=time.time()
+            with writer.con:
+                writer.con.execute("""INSERT INTO brain_facts
+                    (id,scope,subject_id,attribute,value,confidence,status,created,updated)
+                    VALUES ('F-visible','private:12345678','12345678','知识',?,1,'active',?,?)""",
+                    ("初始知识内容",now,now))
+            with self.assertRaisesRegex(RuntimeError,"rollback marker"),reader.con:
+                original=reader.con.execute("SELECT value FROM brain_facts WHERE id='F-visible'").fetchone()[0]
+                self.assertEqual(original,"初始知识内容")
+                with writer.con:
+                    writer.con.execute("UPDATE brain_facts SET value=? WHERE id='F-visible'",("外部提交的新知识",))
+                # Unified recall gets a fresh committed read despite the main
+                # ledger connection retaining its older REPEATABLE READ view.
+                memories=collect_memories(brain=reader,query="知识")
+                self.assertTrue(any("外部提交的新知识" in row["text"] for row in memories))
+                self.assertEqual(reader.con.execute(
+                    "SELECT value FROM brain_facts WHERE id='F-visible'").fetchone()[0],original)
+                reader.con.execute("INSERT INTO brain_runs(scope,history_hash) VALUES (?,?)",
+                                   ("private:87654321","pending-uncommitted"))
+                collect_memories(brain=reader,query="知识")
+                self.assertTrue(reader.con.in_transaction)
+                raise RuntimeError("rollback marker")
+            writer.con.rollback()
+            self.assertIsNone(writer.con.execute(
+                "SELECT scope FROM brain_runs WHERE scope='private:87654321'").fetchone())
+        finally:
+            reader.close()
+            writer.close()

@@ -62,6 +62,7 @@ class MindTests(unittest.TestCase):
             with sqlite3.connect(path) as con:
                 con.execute('CREATE TABLE mind_notes(owner_id TEXT,note_key TEXT,kind TEXT,text TEXT,basis TEXT,confidence REAL,seen_count INTEGER,first_seen REAL,last_seen REAL,PRIMARY KEY(owner_id,note_key))')
                 con.execute('INSERT INTO mind_notes VALUES (?,?,?,?,?,?,?,?,?)',(OWNER,'k','preference','历史未证明的主人喜好','user_explicit',1.,30,time.time(),time.time()))
+            con.close()  # sqlite's context manager commits but does not close; Windows locks the file.
             store=MindStore(path)
             self.assertEqual(store.notes(OWNER)[0]['status'],'legacy')
             self.assertEqual(store.private_hint(OWNER,mode='active'),'')

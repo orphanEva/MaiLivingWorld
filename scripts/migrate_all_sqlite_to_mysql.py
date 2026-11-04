@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""迁移六套 SQLite 账本到全新空 MySQL。默认只读预览；切换之前停掉插件。"""
+"""迁移 SQLite 账本到全新空 MySQL；兼容尚无自我身份或成长库的旧版备份。"""
 from __future__ import annotations
 
 import argparse
@@ -33,6 +33,8 @@ from MaiLivingWorld.mind import MindStore
 from MaiLivingWorld.cognition import CognitiveStore
 from MaiLivingWorld.experience_loop import ExperienceLoop
 from MaiLivingWorld.proactive_feedback import ProactiveFeedback
+from MaiLivingWorld.self_state import SelfState
+from MaiLivingWorld.growth_store import GrowthStore
 
 
 LEDGERS = {
@@ -42,8 +44,11 @@ LEDGERS = {
     "cognition.sqlite3": tuple(t for t in TABLES if t.startswith("cognitive_")),
     "experience_loop.sqlite3": tuple(t for t in TABLES if t.startswith("experience_")),
     "proactive_feedback.sqlite3": tuple(t for t in TABLES if t.startswith("proactive_")),
+    "self_state.sqlite3": tuple(t for t in TABLES if t.startswith("self_")),
+    "growth.sqlite3": tuple(t for t in TABLES if t.startswith("growth_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -52,7 +57,9 @@ def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
     for file, names in LEDGERS.items():
         source=directory/file
         if not source.is_file():
-            missing.append(file)
+            # v0.10 及之前没有身份库：迁移旧备份不要求凭空生成新的身份。
+            if file not in OPTIONAL_LEDGERS:
+                missing.append(file)
             for table in names:
                 result[table]=[]
             continue
@@ -86,7 +93,8 @@ def ensure_schema(config: dict, workdir: Path) -> None:
     top.close()
     for name,cls in (("brain_book",BrainBook),("mind",MindStore),
                      ("cognition",CognitiveStore),("experience_loop",ExperienceLoop),
-                     ("proactive_feedback",ProactiveFeedback)):
+                     ("proactive_feedback",ProactiveFeedback),("self_state",SelfState),
+                     ("growth",GrowthStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 
@@ -173,7 +181,7 @@ def apply(source_rows: dict[str,list[dict]], config: dict) -> dict[str,int]:
 
 
 def main(argv=None):
-    parser=argparse.ArgumentParser(description="一次性迁移 MaiLivingWorld 六个 SQLite 库（29张表）")
+    parser=argparse.ArgumentParser(description="一次性迁移 MaiLivingWorld SQLite 账本及可选自我身份/成长库")
     parser.add_argument("--directory",required=True,type=Path,help="只读备份目录")
     parser.add_argument("--apply",action="store_true",help="实际写入空 MySQL")
     parser.add_argument("--allow-missing",action="store_true",
