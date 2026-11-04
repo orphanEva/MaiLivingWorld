@@ -80,27 +80,48 @@ class ToolMySQLLiveTests(unittest.TestCase):
         writer.retract_observation("pixiv", "illust:1", now=103)
         self.assertEqual(resolve_memories([first["id"]], tools=reader), {})
 
-    def test_global_call_budget_is_atomic_for_competing_connections(self):
-        self.store()
+    def competing_call_budgets(self, *, existing_control):
+        db = self.store()
+        if existing_control:
+            db.put_observation("pixiv", "illust:seed", "Seed the control row", "public", now=1)
+        # Each connection remains open across days. Every round must see the
+        # preceding winner's commit, while a new day allows exactly one call.
         barrier = threading.Barrier(3)
+        rounds = 6
 
         def worker(index):
-            db = ToolStore(self.path / "worker.sqlite3", mysql_settings=self.settings)
+            contender = ToolStore(self.path / "worker.sqlite3", mysql_settings=self.settings)
             try:
-                barrier.wait(timeout=10)
-                return self.reserve(db, "message"+str(index), maximum=1)
+                results = []
+                for round_index in range(rounds):
+                    barrier.wait(timeout=10)
+                    day = round_index * 86400
+                    results.append(self.reserve(
+                        contender, "message-"+str(round_index)+"-"+str(index),
+                        maximum=1, now=day+100, day=day))
+                return results
             finally:
-                db.close()
+                contender.close()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(worker, range(3)))
-        self.assertEqual(sum(row["allowed"] for row in results), 1)
-        db = self.store()
-        winner = next(row for row in results if row["allowed"])
-        db.complete_call(winner["id"], "uncertain", now=101)
-        self.assertFalse(self.reserve(db, "new-message", maximum=1)["allowed"])
-        self.assertTrue(self.reserve(db, "tomorrow", maximum=1, now=86500, day=86400)["allowed"])
+        for round_index in range(rounds):
+            with self.subTest(existing_control=existing_control, round=round_index):
+                rows = [worker_results[round_index] for worker_results in results]
+                self.assertEqual(sum(row["allowed"] for row in rows), 1)
+                self.assertEqual(sum(row["status"] == "budget_exhausted" for row in rows), 2)
+        day = (rounds-1) * 86400
+        winner = next(worker_results[-1] for worker_results in results if worker_results[-1]["allowed"])
+        db.complete_call(winner["id"], "uncertain", now=day+101)
+        self.assertFalse(self.reserve(db, "new-message", maximum=1, now=day+102, day=day)["allowed"])
+        self.assertTrue(self.reserve(db, "tomorrow", maximum=1, now=day+86500, day=day+86400)["allowed"])
         self.assertEqual(db.status()["call_budget"]["count"], 1)
+
+    def test_global_call_budget_is_atomic_for_competing_connections(self):
+        self.competing_call_budgets(existing_control=False)
+
+    def test_global_call_budget_is_atomic_with_existing_control_row(self):
+        self.competing_call_budgets(existing_control=True)
 
     def test_research_counter_resets_by_day_and_rollback_keeps_budget_unspent(self):
         db = self.store()

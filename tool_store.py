@@ -150,7 +150,16 @@ class ToolStore:
 
     def _lock(self):
         # Lazy initialization keeps a freshly constructed migration target empty.
-        # INSERT itself serializes competing creators; UPDATE serializes later writes.
+        if isinstance(self.con, MySQLCompatConnection):
+            # INSERT IGNORE takes a shared lock on a duplicate InnoDB key. A
+            # subsequent UPDATE lets competing callers deadlock upgrading it.
+            # The translated upsert acquires an exclusive lock in one statement,
+            # before any consistent read establishes this transaction's snapshot.
+            self.con.execute(
+                "INSERT INTO tool_research(question_key) VALUES (?) "
+                "ON CONFLICT(question_key) DO UPDATE SET updated=updated", (_CONTROL,))
+            return
+        # SQLite serializes competing writers at the initial INSERT.
         self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (_CONTROL,))
         self.con.execute("UPDATE tool_research SET updated=updated WHERE question_key=?", (_CONTROL,))
 

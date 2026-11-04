@@ -146,9 +146,12 @@ class MCPBridge:
             if item:
                 self.store.put_observation(provider=provider, **item, scope=context["scope"],
                     subject_id=context["speaker_id"], sensitivity="personal")
-            elif provider == "pixiv" and tool == "get_library_work" and (
-                    result.get("accessible") is False or result.get("status") in {"private", "deleted", "auth_required"}):
-                self.store.retract_origin(provider, "work:"+args["kind"]+":"+str(args["pixiv_id"]))
+            elif provider == "pixiv" and result.get("pixiv_id") == args.get("pixiv_id") and (
+                    (tool == "get_library_work" and (result.get("accessible") is False
+                        or result.get("status") in {"private", "deleted", "auth_required"}))
+                    or (tool == "read_novel_excerpt" and result.get("content_available") is False)):
+                kind = "novel" if tool == "read_novel_excerpt" else args["kind"]
+                self.store.retract_origin(provider, "work:"+kind+":"+str(args["pixiv_id"]))
                 result = {"available": False, "reason": "source_unavailable"}
             result = self._filter_task_list(provider, tool, result, context)
             self.store.complete_call(call["id"], "succeeded")

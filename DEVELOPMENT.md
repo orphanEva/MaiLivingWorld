@@ -34,11 +34,13 @@
 - Docker 默认地址为 `http://cap-mcp:8000/mcp` / `http://pixiv-mcp:8000/mcp`。插件默认从 MaiBot 容器 `MLW_CAP_MCP_TOKEN` / `MLW_PIXIV_MCP_TOKEN` 取 Bearer 值；映射到 Compose 的两份 gateway token。图片另需 MaiBot 容器的 `PIXIV_MCP_BACKEND_URL` / `PIXIV_MCP_API_KEY`。不读取其他仓库 .env，不记录真实凭据。
 - 主插件 manifest/CI 依赖 `mcp>=2.3,<3`、`jsonschema>=4,<5` 及原 PyMySQL；网关和 cap/Pixiv stdio 使用独立镜像虚拟环境。完整部署说明维护在 `deploy/README.md`。
 
-v0.13.0 本地完整回归 425 项：404 项通过、21 项真实 MySQL 测试按环境开关跳过，无失败。包括官方 MCP 2.3 SDK 的 stdio/HTTP 协议验证、真实 ASGI 网关、SQLite 持久化以及模拟宿主/模型的插件集成。Docker Compose 用虚拟凭据完成配置解析与结构检查：两个服务，无宿主端口、无 Docker socket 挂载。网关源码与两个指定分支的依赖、导入和 CLI 参数已静态核对；Pixiv 分支更新到 55397d2，相关 MCP 源码与初次检查的 3646bcb 一致。
+v0.13.0 本地完整回归 428 项：406 项通过、22 项真实 MySQL 测试按环境开关跳过，无失败。包括官方 MCP 2.3 SDK 的 stdio/HTTP 协议验证、真实 ASGI 网关、SQLite 持久化以及模拟宿主/模型的插件集成。Docker Compose 用虚拟凭据完成配置解析与结构检查：两个服务，无宿主端口、无 Docker socket 挂载。网关源码与两个指定分支的依赖、导入和 CLI 参数已静态核对；Pixiv 分支更新到 55397d2，相关 MCP 源码与初次检查的 3646bcb 一致。
 
 发布包为 `MaiLivingWorld-v0.13.0-WebUI.zip`，固定包含 41 个运行代码、manifest、配置示例与部署说明文件；排除私人配置、凭据和数据库。真实 MySQL 8.4 与 Linux Python 3.12 由推送后的 Actions 验证，最终状态以分支 HEAD 对应运行记录为准。
 
 本次没有启动实际 Docker 服务、使用真实账号、访问 QQ 或更改用户运行配置；本机 Docker daemon 未运行。离线测试通过不代表线上容器、真实模型与账号已经验收。
+
+首轮 Linux Python CI 通过；真实 MySQL 8.4 的工具预算竞争测试暴露 `INSERT IGNORE` 后升级排他锁的死锁。工具账本现改为单语句 upsert 获取控制行排他锁，SQLite 路径不变；增加新建/已存在控制行、三个长连接跨六天竞争的验证，不自动重试事务或工具写入。旧账本、工具观察/撤回、九库迁移与研究事务测试首轮已通过，修复后重跑全套 MySQL CI。
 
 ## 已确定的关键约束
 

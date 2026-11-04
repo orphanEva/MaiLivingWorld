@@ -242,6 +242,17 @@ class MCPBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.execute("pixiv", "archive_work", equivalent))["success"])
         self.assertEqual(len(self.client.calls), 1)
 
+    async def test_missing_novel_text_retracts_previously_read_excerpts(self):
+        self.client.response = {"pixiv_id": 123, "kind": "novel", "content_available": True,
+                                "text": "Fictional dialogue.", "version": 1, "offset": 0}
+        self.assertTrue((await self.execute("pixiv", "read_novel_excerpt", {"pixiv_id": 123}))["success"])
+        self.assertEqual(len(self.store.observations()), 1)
+        self.next_message()
+        self.client.response = {"pixiv_id": 123, "kind": "novel", "content_available": False, "text": None}
+        result = await self.execute("pixiv", "read_novel_excerpt", {"pixiv_id": 123})
+        self.assertEqual(result["data"]["reason"], "source_unavailable")
+        self.assertEqual(self.store.observations(), [])
+
     async def test_task_binding_persists_and_cannot_be_accessed_by_other_owner_or_group(self):
         self.config.allow_writes = True
         self.client.response = {"task_id": TASK, "state": "running"}

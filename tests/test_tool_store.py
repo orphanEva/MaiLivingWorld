@@ -176,6 +176,13 @@ class ToolStoreTests(unittest.TestCase):
         self.assertFalse(self.reserve(request_key="clock-backward", max_daily=99)["allowed"])
 
     def test_concurrent_call_budget_has_one_winner(self):
+        self.competing_call_budget()
+
+    def test_concurrent_call_budget_with_existing_controller_has_one_winner(self):
+        self.observe()
+        self.competing_call_budget()
+
+    def competing_call_budget(self):
         barrier = threading.Barrier(4)
 
         def worker(index):
