@@ -58,10 +58,14 @@ V20_LEDGERS = MappingProxyType({**V19_LEDGERS,
     "projects.sqlite3": ("projects_control", "projects_items", "projects_audit"),
     "shared_reading.sqlite3": ("shared_reading_control", "shared_reading_sessions", "shared_reading_receipts"),
 })
+V21_LEDGERS = MappingProxyType({**V20_LEDGERS,
+    "advice.sqlite3": ("advice_control", "advice_items", "advice_inputs", "advice_receipts"),
+    "reference.sqlite3": ("reference_control", "reference_receipts"),
+})
 CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS, "v0.16": V16_LEDGERS,
                            "v0.17": V17_LEDGERS, "v0.18": V18_LEDGERS, "v0.19": V19_LEDGERS,
-                           "v0.20": V20_LEDGERS})
-CURRENT_CATALOG = "v0.20"
+                           "v0.20": V20_LEDGERS, "v0.21": V21_LEDGERS})
+CURRENT_CATALOG = "v0.21"
 LEDGERS = CATALOGS[CURRENT_CATALOG]
 TABLES = tuple(table for tables in LEDGERS.values() for table in tables)
 MAX_MANIFEST = 1024 * 1024

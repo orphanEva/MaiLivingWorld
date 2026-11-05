@@ -33,6 +33,8 @@ TABLES = (
     "followthrough_control", "followthrough_items", "followthrough_receipts", "followthrough_sources",
     "projects_control", "projects_items", "projects_audit",
     "shared_reading_control", "shared_reading_sessions", "shared_reading_receipts",
+    "advice_control", "advice_items", "advice_inputs", "advice_receipts",
+    "reference_control", "reference_receipts",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

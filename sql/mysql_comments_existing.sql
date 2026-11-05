@@ -793,3 +793,66 @@ ALTER TABLE `mlw_shared_reading_receipts`
   MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '可信操作或实际送达回执类型',
   MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '命令或已发送正文摘要，仅供幂等与冲突核验',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '操作或成功回执确认时间，Unix秒';
+
+ALTER TABLE `mlw_advice_control`
+  COMMENT = '实际送达建议的反馈学习预算与租约，不从沉默推断结果',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '建议反馈所属可信主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '建议反馈控制状态的乐观锁版本',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '反馈整理额度所属日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的建议反馈整理次数',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近反馈整理批次的预留时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '建议反馈整理的独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '建议反馈整理租约的失效时间，Unix秒',
+  MODIFY COLUMN `lease_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前租约绑定的反馈输入标识',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '控制记录首次建立时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态更新时间，Unix秒';
+
+ALTER TABLE `mlw_advice_items`
+  COMMENT = '实际送达的建议与主人明确报告的效果，不作为客观因果证明',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '建议记录的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '建议的可信主人收件人',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '建议当前草稿、有效、停止或遗忘状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '建议内容与主人反馈的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '建议正文、来源、实际送达与主人报告结果JSON，遗忘后清正文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次准备建议时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近建议或反馈更新时间，Unix秒';
+
+ALTER TABLE `mlw_advice_inputs`
+  COMMENT = '自然建议反馈的有限队列和重试状态，完成后清除临时正文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '建议反馈输入的稳定指纹',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '输入所属可信主人',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始输入文本摘要，防重复与编辑冲突',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '反馈输入的整理状态',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '反馈整理已尝试次数',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前处理该输入的租约令牌',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许重试时间，Unix秒',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '临时反馈输入到期时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有限期限的反馈原话、消息依据与候选建议JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '反馈输入接收时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近处理状态更新时间，Unix秒';
+
+ALTER TABLE `mlw_advice_receipts`
+  COMMENT = '建议真实发送、反馈和遗忘的防重放记录，不存出站全文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '建议操作或实际送达回执的稳定指纹',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '操作或回执所属可信主人',
+  MODIFY COLUMN `item_id` VARCHAR(191) NOT NULL COMMENT '对应建议记录标识',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '实际送达或主人明确控制操作类型',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '操作或实际消息内容摘要，仅供幂等检查',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '操作确认时间，Unix秒';
+
+ALTER TABLE `mlw_reference_control`
+  COMMENT = '持久且有时限的真实讨论来源引用，新话题或清除使旧指代失效',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '话题承接所属可信主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '话题来源引用的乐观锁版本',
+  MODIFY COLUMN `last_input` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '最新可信输入的防重放指纹',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '实际成功讨论的话题来源引用JSON，不保存聊天全文',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL DEFAULT 0 COMMENT '当前话题引用失效时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近话题控制更新时间，Unix秒';
+
+ALTER TABLE `mlw_reference_receipts`
+  COMMENT = '话题承接的防重放回执，清除后不因旧事件恢复',
+  MODIFY COLUMN `receipt_id` VARCHAR(191) NOT NULL COMMENT '可信输入或成功送达回执的稳定指纹',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '该输入或回执所属可信主人',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '可信输入或真实送达的回执类型',
+  MODIFY COLUMN `text_digest` VARCHAR(191) NOT NULL COMMENT '输入或已发送文本摘要，仅用于幂等检查',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '回执入账时间，Unix秒';

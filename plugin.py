@@ -50,6 +50,8 @@ from .habits_runtime import HabitsRuntime
 from .followthrough_runtime import FollowthroughRuntime
 from .projects_runtime import ProjectsRuntime
 from .shared_reading_runtime import SharedReadingRuntime, resource_key as shared_resource_key
+from .advice_runtime import AdviceRuntime
+from .reference_runtime import ReferenceRuntime
 from .recall_query import expand_query, rank_records
 
 
@@ -58,7 +60,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.20.0",
+        default="0.21.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -348,6 +350,20 @@ class SharedReading(PluginConfigBase):
     enabled: bool = Field(default=False, description="记录主人明确确认的阅读位置和真实已发送讨论；分段或分页，不猜章节。保护已绑定作品的插件证据出口，内部阅读继续")
 
 
+class Advice(PluginConfigBase):
+    __ui_label__ = "28 / 建议效果反馈"
+    enabled: bool = Field(default=False, description="跟进实际送达的建议及主人明确报告的尝试结果；需统一心智active，沉默不算成功，不代主人执行")
+    auto_feedback: bool = Field(default=True, description="明确定位建议的私聊反馈经逐字依据与独立复核后保存；含糊指代不猜测")
+    interval_seconds: int = Field(default=600, ge=60, le=86400, description="反馈整理批次最小间隔秒数，重启保留")
+    max_daily_batches: int = Field(default=4, ge=0, le=24, description="每天最多反馈整理批次；遵守共享模型额度及前台预留，每批最多两次调用")
+
+
+class Reference(PluginConfigBase):
+    __ui_label__ = "29 / 话题承接"
+    enabled: bool = Field(default=False, description="依据实际送达内容的来源引用接续简短指代；需统一心智active，多义时先澄清，不猜事件结果")
+    ttl_hours: int = Field(default=24, ge=1, le=72, description="已确认话题焦点的最长有效小时数；新话题、遗忘、来源变化和时效到期均停止沿用")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -375,6 +391,8 @@ class Config(PluginConfigBase):
     followthrough: Followthrough = Field(default_factory=Followthrough)
     projects: Projects = Field(default_factory=Projects)
     shared_reading: SharedReading = Field(default_factory=SharedReading)
+    advice: Advice = Field(default_factory=Advice)
+    reference: Reference = Field(default_factory=Reference)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -436,6 +454,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._followthrough: FollowthroughRuntime | None = None
         self._projects: ProjectsRuntime | None = None
         self._shared_reading: SharedReadingRuntime | None = None
+        self._advice: AdviceRuntime | None = None
+        self._reference: ReferenceRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -483,7 +503,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.20.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.21.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -513,6 +533,10 @@ class MaiLivingWorld(MaiBotPlugin):
             self._projects.reset()
         if self._shared_reading:
             self._shared_reading.reset()
+        if self._advice:
+            self._advice.reset()
+        if self._reference:
+            self._reference.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -706,6 +730,20 @@ class MaiLivingWorld(MaiBotPlugin):
         shared = self._ensure_shared_reading()
         changed = bool(projects and projects.capture(message))
         changed = bool(shared and shared.capture(message)) or changed
+        advice = self._ensure_advice()
+        if advice:
+            try:
+                advice_changed, queued = advice.capture(message)
+                changed = advice_changed or changed
+                if queued:
+                    job = asyncio.create_task(self._process_advice())
+                    self._memory_jobs.add(job)
+                    job.add_done_callback(self._memory_jobs.discard)
+            except (ValueError, TypeError):
+                self.ctx.logger.info("[MaiLivingWorld][ADVICE] 反馈未通过核验，保留原状态")
+        reference = self._ensure_reference()
+        if reference:
+            changed = reference.capture(message) or changed
         if changed and runtime:
             runtime.reset()
             runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
@@ -872,6 +910,38 @@ class MaiLivingWorld(MaiBotPlugin):
                 self.ctx.logger.info("[MaiLivingWorld][SHARED-READING] 回执未完成核验，未推进讨论位置")
         return {"action": "continue"}
 
+    @HookHandler(
+        "send_service.after_send", name="living_world_advice_receipt",
+        description="核验主人私聊建议实际送达，不将草稿计为已建议",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def advice_send_feedback(self, **kwargs):
+        runtime = self._ensure_advice()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][ADVICE] 回执未完成核验，未确认送达")
+        return {"action": "continue"}
+
+    @HookHandler(
+        "send_service.after_send", name="living_world_reference_receipt",
+        description="依据真实发送的内容核验当前话题，不将召回候选计为已讨论",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def reference_send_feedback(self, **kwargs):
+        runtime = self._ensure_reference()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][REFERENCE] 回执未完成核验，未更新话题")
+        return {"action": "continue"}
+
     def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
@@ -983,9 +1053,25 @@ class MaiLivingWorld(MaiBotPlugin):
                     if attention:
                         await attention.prepare_dialogue(kwargs)
                     recollection = self._ensure_recollection()
+                    reference = self._ensure_reference()
+                    reference_signature = reference.signature() if reference else None
+                    recalled = []
                     def recall(query):
-                        records = self._collect_unified(query)
+                        nonlocal recalled
+                        resolved = reference.resolve(kwargs) if reference else None
+                        if resolved and resolved["status"] in {"ambiguous", "unavailable"}:
+                            records = []
+                        elif resolved and resolved["status"] == "resolved":
+                            focus = resolved["records"]
+                            ids = {row["id"] for row in focus}
+                            related = [row for row in self._collect_unified(resolved["query"])
+                                       if row["id"] not in ids and any(
+                                           ref.get("id") in ids for ref in row.get("sources", []) if isinstance(ref, dict))]
+                            records = (focus + related)[:self.config.unified_mind.recall_limit]
+                        else:
+                            records = self._collect_unified(query)
                         records = self._expression_records(records, runtime.context(kwargs))
+                        recalled = records
                         return recollection.with_questions(records) if recollection and recollection.trusted(kwargs) else records
                     prompt = await runtime.reply_hint(
                         kwargs, self.config.unified_mind, recall=recall,
@@ -1021,6 +1107,19 @@ class MaiLivingWorld(MaiBotPlugin):
                         extra = shared.hint(kwargs) if shared else ""
                         if extra:
                             prompt += "\n\n" + extra
+                        advice = self._ensure_advice()
+                        extra = advice.hint(kwargs) if advice else ""
+                        if extra:
+                            prompt += "\n\n" + extra
+                        if reference:
+                            if reference.signature() != reference_signature:
+                                prompt = ""
+                            else:
+                                extra = reference.resolve(kwargs)["hint"]
+                                if extra:
+                                    prompt += "\n\n" + extra
+                                if prompt:
+                                    reference.stage(kwargs, recalled)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1046,6 +1145,10 @@ class MaiLivingWorld(MaiBotPlugin):
                 prompt += "\n\n" + extra
             shared = self._ensure_shared_reading()
             extra = shared.hint(kwargs) if shared else ""
+            if extra:
+                prompt += "\n\n" + extra
+            advice = self._ensure_advice()
+            extra = advice.hint(kwargs) if advice else ""
             if extra:
                 prompt += "\n\n" + extra
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
@@ -1112,6 +1215,12 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._shared_reading:
             self._shared_reading.close()
             self._shared_reading = None
+        if self._advice:
+            self._advice.close()
+            self._advice = None
+        if self._reference:
+            self._reference.close()
+            self._reference = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -1236,7 +1345,7 @@ class MaiLivingWorld(MaiBotPlugin):
         elif previous != owner:
             self._unified.reset()
         self._unified.latest_private_only = bool(self.config.followthrough.enabled or self.config.shared_reading.enabled or
-            self.config.projects.enabled or
+            self.config.projects.enabled or self.config.advice.enabled or self.config.reference.enabled or
             (self.config.attention.enabled or self.config.recollection.enabled or self.config.habits.enabled) and self._unified_active())
         return self._unified
 
@@ -1319,10 +1428,14 @@ class MaiLivingWorld(MaiBotPlugin):
     def _collect_unified(self, query: str) -> list[dict[str, Any]]:
         roots = self._collect_roots(query)
         derived = self._derived_memories(query)
+        advice = self._ensure_advice()
+        if advice:
+            derived += advice.records(query)
         projects = self._ensure_projects()
         if projects:
-            derived = rank_records(derived + projects.records(query), query, now=time.time(),
-                                   timezone=self.config.general.timezone)
+            derived += projects.records(query)
+        if advice or projects:
+            derived = rank_records(derived, query, now=time.time(), timezone=self.config.general.timezone)
         # Reserve room for both lived evidence and learned conclusions.
         if not derived:
             return roots
@@ -1483,6 +1596,46 @@ class MaiLivingWorld(MaiBotPlugin):
             return value
         data = scrub(result.get("data"))
         return self._shared_boundary_result() if data is blocked else {**result, "data": data}
+
+    def _ensure_advice(self):
+        if not (self.config.plugin.enabled and self.config.advice.enabled and self._unified_active()
+                and self._ensure_unified()):
+            return None
+        if self._advice is None:
+            self._advice = AdviceRuntime(self)
+        return self._advice
+
+    def _ensure_reference(self):
+        if not (self.config.plugin.enabled and self.config.reference.enabled and self._unified_active()
+                and self._ensure_unified()):
+            return None
+        if self._reference is None:
+            self._reference = ReferenceRuntime(self)
+        return self._reference
+
+    async def _process_advice(self):
+        try:
+            runtime = self._ensure_advice()
+            if runtime:
+                await runtime.process()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld][ADVICE] 本轮反馈整理未完成，保留原状态")
+
+    @Tool("living_world_advice", description="主人私聊用sources查看本轮允许引用的原始资料，prepare准备建议，list查跟进；真实发送后才跟进效果，不代主人确认尝试或结果", parameters={
+        "action": {"type": "string", "enum": ["list", "sources", "prepare"]},
+        "topic": {"type": "string", "default": ""}, "advice": {"type": "string", "default": ""},
+        "source_ids": {"type": "array", "items": {"type": "string"}, "default": []}})
+    async def advice(self, action: str, topic: str = "", advice: str = "", source_ids: list[str] | None = None, **kwargs):
+        runtime = self._ensure_advice()
+        return await runtime.tool(action, topic=topic, advice=advice, source_ids=source_ids, kwargs=kwargs) if runtime else {
+            "success": False, "code": "advice_disabled"}
+
+    @Tool("living_world_reference", description="主人私聊只读查看话题承接状态；焦点来自实际发送与有效来源，歧义时不猜测")
+    async def reference(self, **kwargs):
+        runtime = self._ensure_reference()
+        return runtime.inspect(kwargs) if runtime else {"success": False, "code": "reference_disabled"}
 
     async def _process_habits(self):
         try:
@@ -2249,6 +2402,8 @@ class MaiLivingWorld(MaiBotPlugin):
                         await self._process_recollection()
                     if self.config.habits.enabled:
                         await self._process_habits()
+                    if self.config.advice.enabled:
+                        await self._process_advice()
                     followthrough = self._ensure_followthrough()
                     if followthrough:
                         try:
@@ -2624,7 +2779,7 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             config = {name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection", "habits", "followthrough", "projects", "shared_reading")}
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection", "habits", "followthrough", "projects", "shared_reading", "advice", "reference")}
             bond = self._ensure_bond()
             config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
             continuity = self._ensure_continuity()

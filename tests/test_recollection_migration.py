@@ -64,8 +64,8 @@ class RecollectionMigrationTests(unittest.TestCase):
         self.assertEqual(migration.LEDGERS["recollection.sqlite3"], RECOLLECTION_TABLES)
         self.assertEqual(set(migration.ALL_TABLES), set(backup.TABLES))
         self.assertEqual(set(TABLES) | {"stories", "attempts", "story_attempts"}, set(backup.TABLES))
-        self.assertEqual(len(backup.TABLES), 72)
-        self.assertEqual(len(backup.LEDGERS), 18)
+        self.assertEqual(len(backup.TABLES), 78)
+        self.assertEqual(len(backup.LEDGERS), 20)
         self.assertIn("recollection.sqlite3", migration.OPTIONAL_LEDGERS)
         self.assertNotIn("recollection.sqlite3", backup.V17_LEDGERS)
 
@@ -124,10 +124,10 @@ class RecollectionMigrationTests(unittest.TestCase):
             def close(self):
                 pass
         names = ("MySQLStore", "BrainBook", "MindStore", "CognitiveStore", "ExperienceLoop", "ProactiveFeedback",
-                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore", "AttentionStore", "RecollectionStore", "HabitsStore", "FollowthroughStore", "ProjectsStore", "SharedReadingStore")
+                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore", "AttentionStore", "RecollectionStore", "HabitsStore", "FollowthroughStore", "ProjectsStore", "SharedReadingStore", "AdviceStore", "ReferenceStore")
         with patch.multiple(migration, **{name: EmptyStore for name in names}), tempfile.TemporaryDirectory() as temp:
             migration.ensure_schema({"table_prefix": "test_"}, Path(temp))
-        self.assertEqual(len(calls), 18)
+        self.assertEqual(len(calls), 20)
         recollection = next(call for call in calls if call[0] and call[0][0].name == "recollection.sqlite3")
         self.assertEqual(recollection[1]["mysql_settings"], {"table_prefix": "test_"})
 
