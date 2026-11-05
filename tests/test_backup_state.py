@@ -104,6 +104,121 @@ def seed_followthrough(store):
             ("owner_id" if table == "followthrough_control" else "id"))] for table in backup.LEDGERS["followthrough.sqlite3"]}
 
 
+def seed_projects(store):
+    owner = "12345678"
+    def seed(letter):
+        return {"question_key": "q:"+letter*24, "interest_key": "i:"+letter*24,
+                "topic": "天文作品", "question": "这篇作品有哪些天文线索？",
+                "seed_refs": [{"id": "brain:fact:"+letter, "digest": "a"*64,
+                               "scope": "private:"+owner, "sensitivity": "personal"}],
+                "source_signature": "b"*64}
+    completed = store.create(owner, seed("a"), now=100)
+    claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=101)
+    evidence = {"id": "tool:observation:"+"c"*64, "digest": "d"*64,
+                "scope": "private:"+owner, "sensitivity": "personal"}
+    if not claim or not store.finish(owner, claim["id"], claim["lease_token"], claim["revision"],
+                                      action="gathered", evidence_refs=[evidence], now=102):
+        raise AssertionError("expected a real project gather stage")
+    claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=402)
+    result = {"outcome": "supported", "conclusion": "本次资料包含天文主题。",
+              "quotes": [{"source_id": evidence["id"], "quote": "作品包含天文主题"}]}
+    if not claim or not store.finish(owner, claim["id"], claim["lease_token"], claim["revision"],
+                                      action="reviewed", result=result, now=403):
+        raise AssertionError("expected a reviewed project result")
+    paused = store.create(owner, seed("b"), now=404)
+    if not store.command(owner, paused["id"], paused["revision"], "pause", "e"*64, "f"*64, now=405):
+        raise AssertionError("expected an owner-paused project")
+    changed = store.create(owner, seed("c"), now=406)
+    if not store.pause_invalid(owner, changed["id"], changed["revision"], now=407):
+        raise AssertionError("expected a source-invalidated project")
+    stopped = store.create(owner, seed("d"), now=408)
+    if not store.command(owner, stopped["id"], stopped["revision"], "stop", "0"*64, "1"*64, now=409):
+        raise AssertionError("expected an owner-stopped project")
+    return {table: [dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+
+            ("owner_id" if table.endswith("_control") else "id"))] for table in backup.LEDGERS["projects.sqlite3"]}
+
+
+def shared_reading_fixture(letter="a"):
+    owner = "12345678"
+    return {"id": "reading:"+letter*64, "owner_id": owner, "scope": "private:"+owner,
+            "provider": "pixiv", "resource_type": "novel", "resource_id": "123" if letter == "a" else "456",
+            "version": "1", "service_signature": "d"*64,
+            "source_refs": [{"id": "tool:observation:"+letter*64, "digest": "c"*64,
+                             "scope": "private:"+owner, "sensitivity": "personal"}]}
+
+
+def shared_reading_message(action, letter="a", units=0):
+    from MaiLivingWorld.shared_reading_store import command_text
+    return dict(attention_message(), message_id="shared-backup-"+letter+"-"+action+"-"+str(units),
+                processed_plain_text=command_text(action, "reading:"+letter*64, units=units))
+
+
+def seed_shared_reading(store):
+    owner, sid = "12345678", "owner-backup-stream"
+    for offset, letter in enumerate(("a", "b", "c")):
+        now, reading = 100+offset*10, shared_reading_fixture(letter)
+        if not store.command(shared_reading_message("start", letter), owner_id=owner, action="start", reading=reading, unit_count=3, now=now):
+            raise AssertionError("expected actual shared reading command")
+        store.command(shared_reading_message("position", letter, 1), owner_id=owner, action="position", reading=reading,
+                      unit_count=3, units=1, now=now+1)
+        row = store.session(owner, reading["id"])
+        row = store.prepare(owner, sid, reading["id"], row["revision"], 1, "e"*64, "我们提到了第一段的星空。", now=now+2)
+        if not row:
+            raise AssertionError("expected a bounded discussion draft")
+        if letter in {"a", "c"}:
+            if not store.record_delivery(owner, sid, "我们提到了第一段的星空。", ("f" if letter == "a" else "e")*64,
+                                         reading_id=reading["id"], expected_revision=row["revision"], now=now+3):
+                raise AssertionError("expected an actual discussion delivery")
+            action = "position" if letter == "a" else "clear"
+            store.command(shared_reading_message(action, letter, 0), owner_id=owner, action=action, reading=reading,
+                          unit_count=3, units=0, now=now+4)
+        else:
+            store.command(shared_reading_message("stop", letter), owner_id=owner, action="stop", reading=reading,
+                          unit_count=3, now=now+3)
+    return {table: [dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+
+            ("owner_id" if table.endswith("_control") else "id"))] for table in backup.LEDGERS["shared_reading.sqlite3"]}
+
+
+def assert_v20_restore(case, store, expected):
+    for table, rows in expected.items():
+        order = "owner_id" if table.endswith("_control") else "id"
+        case.assertEqual([dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order)], rows)
+        case.assertTrue(rows, table)
+    if "projects_items" in expected:
+        items = {item["seed"]["question_key"]: item for item in store.items("12345678")}
+        case.assertEqual(items["q:"+"a"*24]["status"], "completed")
+        case.assertEqual(items["q:"+"b"*24]["status"], "paused")
+        case.assertEqual(items["q:"+"c"*24]["reason"], "source_changed")
+        case.assertEqual(items["q:"+"d"*24]["status"], "stopped")
+        case.assertIsNone(store.claim("12345678", [row["id"] for row in items.values()],
+                                     day_start=0, daily_limit=6, interval_seconds=300, now=800))
+        case.assertEqual(store.state("12345678")["daily_actions"], 2)
+    else:
+        active = store.session("12345678", "reading:"+"a"*64)
+        case.assertEqual((active["status"], active["owner_units"], active["discussed_units"]), ("active", 0, 1))
+        case.assertEqual(active["binding"]["service_signature"], "d"*64)
+        case.assertFalse(store.command(shared_reading_message("position", "a", 1), owner_id="12345678", action="position",
+                                      reading=shared_reading_fixture(), unit_count=3, units=1, now=120))
+        case.assertEqual(store.session("12345678", active["reading_id"])["owner_units"], 0)
+        case.assertIsNone(store.prepare("12345678", "owner-backup-stream", active["reading_id"], active["revision"],
+                                       1, "e"*64, "我们提到了第一段的星空。", now=121))
+        stopped = store.session("12345678", "reading:"+"b"*64)
+        case.assertEqual(stopped["status"], "stopped")
+        case.assertIsNone(stopped["draft"])
+        case.assertFalse(store.record_delivery("12345678", "owner-backup-stream", "我们提到了第一段的星空。", "0"*64,
+                        reading_id=stopped["reading_id"], expected_revision=stopped["revision"], now=121))
+        cleared = store.session("12345678", "reading:"+"c"*64)
+        case.assertEqual((cleared["status"], cleared["owner_units"], cleared["discussed_units"]), ("stopped", 0, 0))
+        case.assertIsNone(cleared["draft"])
+        case.assertFalse(store.command(shared_reading_message("start", "c"), owner_id="12345678", action="start",
+                                      reading=shared_reading_fixture("c"), unit_count=3, now=130))
+        changed = dict(shared_reading_fixture(), service_signature="e"*64)
+        message = dict(shared_reading_message("position", "a", 1), message_id="shared-after-service-change")
+        with case.assertRaisesRegex(ValueError, "source_binding_changed"):
+            store.command(message, owner_id="12345678", action="position", reading=changed, unit_count=3, units=1, now=131)
+        case.assertEqual(store.session("12345678", active["reading_id"])["owner_units"], 0)
+
+
 def assert_v19_restore(case, store, expected):
     for table, rows in expected.items():
         order = "owner_id" if table.endswith("_control") else "id"
@@ -158,9 +273,9 @@ class SQLiteBackupTests(unittest.TestCase):
                 target.writestr(key, value)
         return altered
 
-    def test_inventory_sixteen_databases_66_tables_and_frozen_legacy_catalogs(self):
-        self.assertEqual(len(backup.LEDGERS), 16)
-        self.assertEqual(len(backup.TABLES), 66)
+    def test_inventory_eighteen_databases_72_tables_and_frozen_legacy_catalogs(self):
+        self.assertEqual(len(backup.LEDGERS), 18)
+        self.assertEqual(len(backup.TABLES), 72)
         self.assertEqual(len(backup.CATALOGS["v0.14"]), 10)
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.14"].values())), 44)
         self.assertEqual(len(backup.CATALOGS["v0.15"]), 11)
@@ -171,6 +286,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.17"].values())), 54)
         self.assertEqual(len(backup.CATALOGS["v0.18"]), 14)
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.18"].values())), 58)
+        self.assertEqual(len(backup.CATALOGS["v0.19"]), 16)
+        self.assertEqual(sum(map(len, backup.CATALOGS["v0.19"].values())), 66)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -183,13 +300,17 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.18"]["habits.sqlite3"] = ("habits_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.18"]["followthrough.sqlite3"] = ("followthrough_control",)
+        with self.assertRaises(TypeError):
+            backup.CATALOGS["v0.19"]["projects.sqlite3"] = ("projects_control",)
+        with self.assertRaises(TypeError):
+            backup.CATALOGS["v0.19"]["shared_reading.sqlite3"] = ("shared_reading_control",)
 
     def test_full_offline_restore_drill_preserves_every_table(self):
         self.seed(all_ledgers=True)
         self.archive_now()
-        self.assertEqual(backup.verify_archive(self.archive)["files"], 16)
+        self.assertEqual(backup.verify_archive(self.archive)["files"], 18)
         result = self.restore_now()
-        self.assertEqual(result["files"], 16)
+        self.assertEqual(result["files"], 18)
         for name, tables in backup.LEDGERS.items():
             original, restored = sqlite3.connect(self.source/name), sqlite3.connect(self.target/name)
             try:
@@ -347,12 +468,12 @@ class SQLiteBackupTests(unittest.TestCase):
         result = backup.verify_archive(archive)
         self.assertEqual(result["catalog"], "v0.14")
         self.assertEqual(result["files"], 10)
-        self.assertEqual(result["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         preview = backup.restore_sqlite(archive, self.target)
-        self.assertEqual(preview["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(preview["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertFalse(self.target.exists())
         result = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-        self.assertEqual(result["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertFalse((self.target/"bond.sqlite3").exists())
         self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V14_LEDGERS))
         with zipfile.ZipFile(archive) as package:
@@ -360,16 +481,16 @@ class SQLiteBackupTests(unittest.TestCase):
 
     def test_explicit_known_v14_catalog_is_supported(self):
         archive = self.legacy_archive(explicit=True)
-        self.assertEqual(backup.verify_archive(archive)["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(backup.verify_archive(archive)["missing"], ["bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
 
     def test_v15_eleven_ledger_archive_restores_without_inventing_continuity(self):
         archive = self.legacy_archive(explicit=True, catalog="v0.15")
         result = backup.verify_archive(archive)
         self.assertEqual(result["catalog"], "v0.15")
         self.assertEqual(result["files"], 11)
-        self.assertEqual(result["missing"], ["continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         result = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-        self.assertEqual(result["missing"], ["continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V15_LEDGERS))
 
     def test_v15_catalog_cannot_smuggle_continuity_or_hide_missing_file(self):
@@ -390,12 +511,12 @@ class SQLiteBackupTests(unittest.TestCase):
         result = backup.verify_archive(archive)
         self.assertEqual(result["catalog"], "v0.16")
         self.assertEqual(result["files"], 12)
-        self.assertEqual(result["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         preview = backup.restore_sqlite(archive, self.target)
-        self.assertEqual(preview["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(preview["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertFalse(self.target.exists())
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-        self.assertEqual(restored["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(restored["missing"], ["attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V16_LEDGERS))
         self.assertFalse((self.target/"attention.sqlite3").exists())
 
@@ -418,12 +539,12 @@ class SQLiteBackupTests(unittest.TestCase):
         result = backup.verify_archive(archive)
         self.assertEqual(result["catalog"], "v0.17")
         self.assertEqual(result["files"], 13)
-        self.assertEqual(result["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         preview = backup.restore_sqlite(archive, self.target)
-        self.assertEqual(preview["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(preview["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertFalse(self.target.exists())
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-        self.assertEqual(restored["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(restored["missing"], ["recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V17_LEDGERS))
         self.assertFalse((self.target/"recollection.sqlite3").exists())
 
@@ -446,7 +567,7 @@ class SQLiteBackupTests(unittest.TestCase):
         result = backup.verify_archive(archive)
         self.assertEqual(result["catalog"], "v0.18")
         self.assertEqual(result["files"], 14)
-        self.assertEqual(result["missing"], ["habits.sqlite3", "followthrough.sqlite3"])
+        self.assertEqual(result["missing"], ["habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"])
         preview = backup.restore_sqlite(archive, self.target)
         self.assertEqual(preview["missing"], result["missing"])
         self.assertFalse(self.target.exists())
@@ -465,6 +586,35 @@ class SQLiteBackupTests(unittest.TestCase):
                        lambda m: m["files"][0].update(path="sqlite/followthrough.sqlite3"),
                        lambda m: m["files"][0]["tables"].update(habits_preferences=0),
                        lambda m: m.update(catalog="v0.19")):
+            candidate = copy.deepcopy(manifest)
+            change(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(backup.BackupError):
+                backup._validate_manifest(candidate)
+
+    def test_v19_sixteen_ledger_archive_reports_new_progress_as_missing(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.19")
+        result = backup.verify_archive(archive)
+        self.assertEqual(result["catalog"], "v0.19")
+        self.assertEqual(result["files"], 16)
+        self.assertEqual(result["missing"], ["projects.sqlite3", "shared_reading.sqlite3"])
+        preview = backup.restore_sqlite(archive, self.target)
+        self.assertEqual(preview["missing"], result["missing"])
+        self.assertFalse(self.target.exists())
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual(restored["missing"], result["missing"])
+        self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V19_LEDGERS))
+        for name in result["missing"]:
+            self.assertFalse((self.target/name).exists())
+
+    def test_v19_catalog_cannot_hide_or_smuggle_project_and_shared_reading_state(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.19")
+        with zipfile.ZipFile(archive) as package:
+            manifest = json.loads(package.read("manifest.json"))
+        for change in (lambda m: m["files"].pop(),
+                       lambda m: m.update(missing=["projects.sqlite3"]),
+                       lambda m: m["files"][0].update(path="sqlite/shared_reading.sqlite3"),
+                       lambda m: m["files"][0]["tables"].update(projects_items=0),
+                       lambda m: m.update(catalog="v0.20")):
             candidate = copy.deepcopy(manifest)
             change(candidate)
             with self.subTest(candidate=candidate), self.assertRaises(backup.BackupError):
@@ -492,7 +642,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.19")
+        self.assertEqual(current["catalog"], "v0.20")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -509,7 +659,8 @@ class SQLiteBackupTests(unittest.TestCase):
             ("bond_store", "BondStore", "bond"), ("continuity_store", "ContinuityStore", "continuity"),
             ("attention_store", "AttentionStore", "attention"),
             ("recollection_store", "RecollectionStore", "recollection"),
-            ("habits_store", "HabitsStore", "habits"), ("followthrough_store", "FollowthroughStore", "followthrough"))
+            ("habits_store", "HabitsStore", "habits"), ("followthrough_store", "FollowthroughStore", "followthrough"),
+            ("projects_store", "ProjectsStore", "projects"), ("shared_reading_store", "SharedReadingStore", "shared_reading"))
         for module, name, filename in classes:
             store = getattr(importlib.import_module("MaiLivingWorld."+module), name)(self.source/(filename+".sqlite3"))
             try:
@@ -565,6 +716,10 @@ class SQLiteBackupTests(unittest.TestCase):
                     habits_rows = seed_habits(store)
                 elif module == "followthrough_store":
                     followthrough_rows = seed_followthrough(store)
+                elif module == "projects_store":
+                    projects_rows = seed_projects(store)
+                elif module == "shared_reading_store":
+                    shared_reading_rows = seed_shared_reading(store)
             finally:
                 store.close()
         self.archive_now()
@@ -578,11 +733,14 @@ class SQLiteBackupTests(unittest.TestCase):
         from MaiLivingWorld.recollection_store import RecollectionStore
         from MaiLivingWorld.habits_store import HabitsStore
         from MaiLivingWorld.followthrough_store import FollowthroughStore
+        from MaiLivingWorld.projects_store import ProjectsStore
+        from MaiLivingWorld.shared_reading_store import SharedReadingStore
         stores = [SelfState(self.target/"self_state.sqlite3"), GrowthStore(self.target/"growth.sqlite3"),
                   CompanionStore(self.target/"companion.sqlite3"), BondStore(self.target/"bond.sqlite3"),
                   ContinuityStore(self.target/"continuity.sqlite3"), AttentionStore(self.target/"attention.sqlite3"),
                   RecollectionStore(self.target/"recollection.sqlite3"), HabitsStore(self.target/"habits.sqlite3"),
-                  FollowthroughStore(self.target/"followthrough.sqlite3")]
+                  FollowthroughStore(self.target/"followthrough.sqlite3"), ProjectsStore(self.target/"projects.sqlite3"),
+                  SharedReadingStore(self.target/"shared_reading.sqlite3")]
         try:
             current = stores[0].state()
             self.assertEqual(current["agent_id"], identity["agent_id"])
@@ -608,6 +766,8 @@ class SQLiteBackupTests(unittest.TestCase):
             assert_recollection_restore(self, stores[6], recollection_rows)
             assert_v19_restore(self, stores[7], habits_rows)
             assert_v19_restore(self, stores[8], followthrough_rows)
+            assert_v20_restore(self, stores[9], projects_rows)
+            assert_v20_restore(self, stores[10], shared_reading_rows)
         finally:
             for store in stores:
                 store.close()
@@ -870,13 +1030,13 @@ class MySQLBackupTests(unittest.TestCase):
             with self.assertRaises(backup.BackupError):
                 backup._encode(value)
 
-    def test_v15_v16_v17_v18_mysql_catalogs_require_matching_schema_before_upgrade(self):
-        for catalog, expected_count in (("v0.15", 47), ("v0.16", 51), ("v0.17", 54), ("v0.18", 58)):
+    def test_v15_v16_v17_v18_v19_mysql_catalogs_require_matching_schema_before_upgrade(self):
+        for catalog, expected_count in (("v0.15", 47), ("v0.16", 51), ("v0.17", 54), ("v0.18", 58), ("v0.19", 66)):
             with self.subTest(catalog=catalog):
                 old_tables = {table: [] for group in backup.CATALOGS[catalog].values() for table in group}
                 old_tables.update(copy.deepcopy(self.data))
                 old_tables["bond_moments"] = [{"id": 19, "payload": "保留旧主人纪念与撤回状态"}]
-                if catalog in {"v0.16", "v0.17", "v0.18"}:
+                if catalog in {"v0.16", "v0.17", "v0.18", "v0.19"}:
                     old_tables["continuity_threads"] = [{"id": 20, "payload": "保留已解决话题及原话来源"}]
                 current = Path(self.temp.name)/(catalog+"-source.zip")
                 archive = Path(self.temp.name)/(catalog+"-schema.zip")
@@ -914,7 +1074,7 @@ class MySQLBackupTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1" and os.getenv("MLW_BACKUP_MYSQL_DATABASE", "").startswith("mlw_backup_test"),
                      "Only with an explicitly configured empty dedicated MySQL CI database")
 class BackupMySQLLiveTests(unittest.TestCase):
-    def test_real_66_table_archive_empty_restore_and_counter_high_water(self):
+    def test_real_72_table_archive_empty_restore_and_counter_high_water(self):
         import pymysql
         from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
         from MaiLivingWorld.self_state import SelfState
@@ -922,6 +1082,8 @@ class BackupMySQLLiveTests(unittest.TestCase):
         from MaiLivingWorld.recollection_store import RecollectionStore
         from MaiLivingWorld.habits_store import HabitsStore
         from MaiLivingWorld.followthrough_store import FollowthroughStore
+        from MaiLivingWorld.projects_store import ProjectsStore
+        from MaiLivingWorld.shared_reading_store import SharedReadingStore
         env = dict(os.environ, MLW_MYSQL_DATABASE=os.environ["MLW_BACKUP_MYSQL_DATABASE"], MLW_MYSQL_PREFIX="backup_")
         config = backup.mysql_config(env)
         settings = {key: value for key, value in config.items() if key != "prefix"}
@@ -961,13 +1123,21 @@ class BackupMySQLLiveTests(unittest.TestCase):
                             v19_before[name] = seed(store)
                         finally:
                             store.close()
+                    v20_before = {}
+                    for name, cls, seed in (("projects", ProjectsStore, seed_projects),
+                                            ("shared_reading", SharedReadingStore, seed_shared_reading)):
+                        store = cls(directory/("unused-"+name+".sqlite3"), mysql_settings=settings)
+                        try:
+                            v20_before[name] = seed(store)
+                        finally:
+                            store.close()
                     with connection.cursor() as cursor:
                         cursor.execute("ALTER TABLE backup_attempts AUTO_INCREMENT = 900")
                         cursor.execute("INSERT INTO backup_attempts(target,created_at,kind) VALUES ('private:test',100,'test')")
                         deleted_id = cursor.lastrowid
                         cursor.execute("DELETE FROM backup_attempts WHERE id=%s", (deleted_id,))
                     result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
-                    self.assertEqual(result["tables"], 66)
+                    self.assertEqual(result["tables"], 72)
                     self.assertTrue(backup.verify_archive(archive)["verified"])
                     with self.assertRaisesRegex(backup.BackupError, "target_not_empty"):
                         backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
@@ -977,7 +1147,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                             cursor.execute("DROP TABLE `backup_"+table+"`")
                     ensure_schema(settings, directory)
                     restored = backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-                    self.assertEqual(restored["tables"], 66)
+                    self.assertEqual(restored["tables"], 72)
                     state = SelfState(directory/"unused.sqlite3", mysql_settings=settings)
                     try:
                         self.assertEqual(state.state()["agent_id"], identity["agent_id"])
@@ -1002,6 +1172,12 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         store = cls(directory/("unused-"+name+".sqlite3"), mysql_settings=settings)
                         try:
                             assert_v19_restore(self, store, v19_before[name])
+                        finally:
+                            store.close()
+                    for name, cls in (("projects", ProjectsStore), ("shared_reading", SharedReadingStore)):
+                        store = cls(directory/("unused-"+name+".sqlite3"), mysql_settings=settings)
+                        try:
+                            assert_v20_restore(self, store, v20_before[name])
                         finally:
                             store.close()
                     with connection.cursor() as cursor:

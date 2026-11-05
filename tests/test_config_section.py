@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.19.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.20.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -34,8 +34,8 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(set(parsed), set(defaults))
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
-        self.assertEqual(len(defaults), 25)
-        self.assertEqual(total_fields, 175)
+        self.assertEqual(len(defaults), 27)
+        self.assertEqual(total_fields, 180)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -49,7 +49,7 @@ class ConfigSectionTests(unittest.TestCase):
         def section(name):
             ref = schema["properties"][name]["$ref"].rsplit("/", 1)[1]
             return schema["$defs"][ref]["properties"]
-        self.assertEqual(len(schema["properties"]), 25)
+        self.assertEqual(len(schema["properties"]), 27)
         recollection = section("recollection")
         self.assertEqual(set(recollection), {"enabled", "auto_correct", "interval_seconds",
                                             "max_daily_batches", "repeat_cooldown_hours"})
@@ -79,6 +79,24 @@ class ConfigSectionTests(unittest.TestCase):
                 self.assertEqual(set(fields), set(defaults))
                 self.assertEqual({key: field["default"] for key, field in fields.items()}, defaults)
                 self.assertTrue(all(field["description"] for field in fields.values()))
+
+    def test_project_and_shared_reading_defaults_and_bounds_are_explicit(self):
+        schema = plugin.Config.model_json_schema()
+        expected = {
+            "projects": {"enabled": False, "interval_seconds": 900, "max_daily_actions": 6, "max_active_projects": 2},
+            "shared_reading": {"enabled": False},
+        }
+        for name, defaults in expected.items():
+            with self.subTest(section=name):
+                self.assertEqual(getattr(plugin.Config(), name).model_dump(), defaults)
+                ref = schema["properties"][name]["$ref"].rsplit("/", 1)[1]
+                fields = schema["$defs"][ref]["properties"]
+                self.assertEqual(set(fields), set(defaults))
+                self.assertEqual({key: field["default"] for key, field in fields.items()}, defaults)
+                self.assertTrue(all(field["description"] for field in fields.values()))
+                if name == "projects":
+                    for field, limits in {"interval_seconds": (300, 86400), "max_daily_actions": (0, 24), "max_active_projects": (1, 3)}.items():
+                        self.assertEqual((fields[field]["minimum"], fields[field]["maximum"]), limits)
 
 
 if __name__ == "__main__":

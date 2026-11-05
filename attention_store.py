@@ -282,7 +282,7 @@ class AttentionStore:
             if not isinstance(value, dict) or set(value) != {"kind", "key", "version"}:
                 raise ValueError("invalid_candidate")
             kind, key, version = value["kind"], value["key"], value["version"]
-            if (not isinstance(kind, str) or kind not in {"reading", "research"}
+            if (not isinstance(kind, str) or kind not in {"reading", "research", "project"}
                     or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,191}", key)
                     or not isinstance(version, str) or not re.fullmatch(r"[0-9a-f]{64}", version)):
                 raise ValueError("invalid_candidate")

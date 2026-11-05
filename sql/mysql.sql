@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十六套数据共 66 表（含持续自我、成长、工具、陪伴、聊天连续性、注意安排、回忆修正、相处习惯与承诺回告）
+-- MaiLivingWorld MySQL 8.4 十八套数据共 72 表（含持续自我、成长、工具、陪伴、聊天连续性、相处习惯、任务回告、自主项目与共同阅读）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -705,3 +705,66 @@ CREATE TABLE IF NOT EXISTS `mlw_followthrough_sources` (
     source_signature VARCHAR(191) NOT NULL COMMENT '任务创建时MCP服务配置签名，服务变更使旧任务不可复用',
     created DOUBLE NOT NULL COMMENT '可信创建绑定确认时间，Unix秒'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='真实任务创建时的主人与MCP服务绑定，防止服务切换复用旧任务标识';
+
+CREATE TABLE IF NOT EXISTS `mlw_projects_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '项目所属可信主人，原主人状态不转移给新主人',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '项目控制状态的乐观锁版本',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '项目动作预算所属日期起点，Unix秒',
+    daily_actions BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的项目推进次数',
+    last_action DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留项目动作时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '项目调度的独占租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '项目调度租约失效时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态更新时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='有限自主项目的持久动作预算与调度租约，不增加外部操作权限';
+
+CREATE TABLE IF NOT EXISTS `mlw_projects_items` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '自主项目的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '项目所属可信主人',
+    status VARCHAR(191) NOT NULL COMMENT '项目当前执行状态，完成不等于问题已解决',
+    stage VARCHAR(191) NOT NULL COMMENT '有限研究流程所处的阶段',
+    revision BIGINT NOT NULL COMMENT '项目内容和状态版本',
+    payload LONGTEXT NOT NULL COMMENT '项目种子、证据引用、有限成果与租约JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次建立项目时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近项目状态变化时间，Unix秒',
+    KEY `idx_projects_items_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='根据有效兴趣和未解问题推进的有限自主项目，保留原始来源引用';
+
+CREATE TABLE IF NOT EXISTS `mlw_projects_audit` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '项目操作审计的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '项目操作所属可信主人',
+    item_id VARCHAR(191) NOT NULL COMMENT '关联的自主项目标识',
+    action VARCHAR(191) NOT NULL COMMENT '实际发生的项目阶段或主人控制操作',
+    body_digest VARCHAR(191) NOT NULL COMMENT '输入或阶段结果摘要，校验幂等与冲突',
+    payload LONGTEXT NOT NULL COMMENT '有界项目操作记录和版本引用JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒',
+    KEY `idx_projects_audit_item` (item_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='自主项目状态和可信主人控制的幂等审计';
+
+CREATE TABLE IF NOT EXISTS `mlw_shared_reading_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '共读控制所属可信主人',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '共同阅读控制状态版本',
+    updated DOUBLE NOT NULL DEFAULT 0 COMMENT '最近控制状态更新时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人共同阅读记录的事务互斥与状态版本';
+
+CREATE TABLE IF NOT EXISTS `mlw_shared_reading_sessions` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '共同阅读记录的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '共读进度所属可信主人',
+    reading_id VARCHAR(191) NOT NULL COMMENT '绑定既有阅读及来源版本的记录标识',
+    status VARCHAR(191) NOT NULL COMMENT '共同阅读当前有效或停止状态',
+    revision BIGINT NOT NULL COMMENT '共读边界与讨论状态的乐观锁版本',
+    payload LONGTEXT NOT NULL COMMENT '真实阅读引用、主人确认边界和成功送达讨论进度JSON',
+    created DOUBLE NOT NULL COMMENT '首次建立共同阅读时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近共读状态变化时间，Unix秒',
+    UNIQUE (owner_id,reading_id),
+    KEY `idx_shared_reading_sessions_owner` (owner_id,status,updated)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='区分她的阅读游标、主人确认边界与实际送达讨论的共读记录';
+
+CREATE TABLE IF NOT EXISTS `mlw_shared_reading_receipts` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信共读命令或成功送达回执的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际操作或回执所属可信主人',
+    session_id VARCHAR(191) NOT NULL COMMENT '关联共同阅读记录标识',
+    kind VARCHAR(191) NOT NULL COMMENT '可信操作或实际送达回执类型',
+    body_digest VARCHAR(191) NOT NULL COMMENT '命令或已发送正文摘要，仅供幂等与冲突核验',
+    created DOUBLE NOT NULL COMMENT '操作或成功回执确认时间，Unix秒',
+    KEY `idx_shared_reading_receipts_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='共同阅读边界和讨论送达的幂等记录，工具返回不算已讨论';

@@ -735,3 +735,61 @@ ALTER TABLE `mlw_followthrough_sources`
   MODIFY COLUMN `operation` VARCHAR(191) NOT NULL COMMENT '实际已执行的许可任务创建操作',
   MODIFY COLUMN `source_signature` VARCHAR(191) NOT NULL COMMENT '任务创建时MCP服务配置签名，服务变更使旧任务不可复用',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '可信创建绑定确认时间，Unix秒';
+
+ALTER TABLE `mlw_projects_control`
+  COMMENT = '有限自主项目的持久动作预算与调度租约，不增加外部操作权限',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '项目所属可信主人，原主人状态不转移给新主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '项目控制状态的乐观锁版本',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '项目动作预算所属日期起点，Unix秒',
+  MODIFY COLUMN `daily_actions` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的项目推进次数',
+  MODIFY COLUMN `last_action` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留项目动作时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '项目调度的独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '项目调度租约失效时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态更新时间，Unix秒';
+
+ALTER TABLE `mlw_projects_items`
+  COMMENT = '根据有效兴趣和未解问题推进的有限自主项目，保留原始来源引用',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '自主项目的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '项目所属可信主人',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '项目当前执行状态，完成不等于问题已解决',
+  MODIFY COLUMN `stage` VARCHAR(191) NOT NULL COMMENT '有限研究流程所处的阶段',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '项目内容和状态版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '项目种子、证据引用、有限成果与租约JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次建立项目时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近项目状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_projects_audit`
+  COMMENT = '自主项目状态和可信主人控制的幂等审计',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '项目操作审计的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '项目操作所属可信主人',
+  MODIFY COLUMN `item_id` VARCHAR(191) NOT NULL COMMENT '关联的自主项目标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际发生的项目阶段或主人控制操作',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '输入或阶段结果摘要，校验幂等与冲突',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界项目操作记录和版本引用JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒';
+
+ALTER TABLE `mlw_shared_reading_control`
+  COMMENT = '主人共同阅读记录的事务互斥与状态版本',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '共读控制所属可信主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '共同阅读控制状态版本',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近控制状态更新时间，Unix秒';
+
+ALTER TABLE `mlw_shared_reading_sessions`
+  COMMENT = '区分她的阅读游标、主人确认边界与实际送达讨论的共读记录',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '共同阅读记录的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '共读进度所属可信主人',
+  MODIFY COLUMN `reading_id` VARCHAR(191) NOT NULL COMMENT '绑定既有阅读及来源版本的记录标识',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '共同阅读当前有效或停止状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '共读边界与讨论状态的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '真实阅读引用、主人确认边界和成功送达讨论进度JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次建立共同阅读时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近共读状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_shared_reading_receipts`
+  COMMENT = '共同阅读边界和讨论送达的幂等记录，工具返回不算已讨论',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信共读命令或成功送达回执的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际操作或回执所属可信主人',
+  MODIFY COLUMN `session_id` VARCHAR(191) NOT NULL COMMENT '关联共同阅读记录标识',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '可信操作或实际送达回执类型',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '命令或已发送正文摘要，仅供幂等与冲突核验',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '操作或成功回执确认时间，Unix秒';

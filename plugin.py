@@ -48,6 +48,8 @@ from .attention_runtime import AttentionRuntime
 from .recollection_runtime import RecollectionRuntime
 from .habits_runtime import HabitsRuntime
 from .followthrough_runtime import FollowthroughRuntime
+from .projects_runtime import ProjectsRuntime
+from .shared_reading_runtime import SharedReadingRuntime, resource_key as shared_resource_key
 from .recall_query import expand_query, rank_records
 
 
@@ -56,7 +58,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.19.0",
+        default="0.20.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -333,6 +335,19 @@ class Followthrough(PluginConfigBase):
     max_daily_checks: int = Field(default=12, ge=0, le=12, description="每天最多状态检查次数；同时计入原MCP预算，主动回告仍遵守白名单、安静时间及联系限额")
 
 
+class Projects(PluginConfigBase):
+    __ui_label__ = "26 / 自主长期项目"
+    enabled: bool = Field(default=False, description="从有依据的自身兴趣和未解问题选题，有限查阅、整理与独立复核；需统一心智和成长active，不自动下载或发布")
+    interval_seconds: int = Field(default=900, ge=300, le=86400, description="项目阶段行动的最小间隔秒数，重启保留；同时遵守原阅读、工具和模型预算")
+    max_daily_actions: int = Field(default=6, ge=0, le=24, description="每天最多尝试推进项目阶段的次数，失败也计；主人正在交谈时优先回应")
+    max_active_projects: int = Field(default=2, ge=1, le=3, description="同时推进的项目上限；暂停/停止不自动复活")
+
+
+class SharedReading(PluginConfigBase):
+    __ui_label__ = "27 / 共同阅读与剧透边界"
+    enabled: bool = Field(default=False, description="记录主人明确确认的阅读位置和真实已发送讨论；分段或分页，不猜章节。保护已绑定作品的插件证据出口，内部阅读继续")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -358,6 +373,8 @@ class Config(PluginConfigBase):
     recollection: Recollection = Field(default_factory=Recollection)
     habits: Habits = Field(default_factory=Habits)
     followthrough: Followthrough = Field(default_factory=Followthrough)
+    projects: Projects = Field(default_factory=Projects)
+    shared_reading: SharedReading = Field(default_factory=SharedReading)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -417,6 +434,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._recollection: RecollectionRuntime | None = None
         self._habits: HabitsRuntime | None = None
         self._followthrough: FollowthroughRuntime | None = None
+        self._projects: ProjectsRuntime | None = None
+        self._shared_reading: SharedReadingRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -464,7 +483,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.19.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.20.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -490,6 +509,10 @@ class MaiLivingWorld(MaiBotPlugin):
             self._habits.reset()
         if self._followthrough:
             self._followthrough.reset()
+        if self._projects:
+            self._projects.reset()
+        if self._shared_reading:
+            self._shared_reading.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -679,6 +702,13 @@ class MaiLivingWorld(MaiBotPlugin):
         followthrough = self._ensure_followthrough()
         if followthrough:
             followthrough.capture(message)
+        projects = self._ensure_projects()
+        shared = self._ensure_shared_reading()
+        changed = bool(projects and projects.capture(message))
+        changed = bool(shared and shared.capture(message)) or changed
+        if changed and runtime:
+            runtime.reset()
+            runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
         return {"action": "continue"}
 
     @HookHandler(
@@ -826,6 +856,22 @@ class MaiLivingWorld(MaiBotPlugin):
                 self.ctx.logger.info("[MaiLivingWorld][FOLLOWTHROUGH] 回执未完成核验，保留未确认状态")
         return {"action": "continue"}
 
+    @HookHandler(
+        "send_service.after_send", name="living_world_shared_reading_receipt",
+        description="只根据已核验的主人私聊送达回执记录实际提及的阅读单元，不推断双方已理解",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def shared_reading_send_feedback(self, **kwargs):
+        runtime = self._ensure_shared_reading()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][SHARED-READING] 回执未完成核验，未推进讨论位置")
+        return {"action": "continue"}
+
     def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
@@ -872,14 +918,14 @@ class MaiLivingWorld(MaiBotPlugin):
         hint = owner_hint(bond.address() if bond else cfg.title, "private",
                           self._relation_for("private", context["query"] if context else "",
                               dialogue_managed=bool(attention and self.config.attention.dialogue_enabled and attention.trusted(kwargs))))
-        if self.config.mind.enabled and self._mind and not self._unified_active():
+        if self.config.mind.enabled and self._mind and not self._unified_active() and not self._shared_reading_protected():
             note = self._mind.private_hint(normalize_qq(cfg.qq), mode=self.config.mind.mode)
             if note:
                 hint += "\n\n" + note
         return hint
 
     def _brain_hint_for(self, kwargs: dict[str,Any]) -> str:
-        if self._unified_active():
+        if self._unified_active() or self._shared_reading_protected():
             # Unified expression is the sole memory-to-reply route in active mode.
             return ""
         if not (self.config.plugin.enabled and self.config.brain_memory.enabled
@@ -939,6 +985,7 @@ class MaiLivingWorld(MaiBotPlugin):
                     recollection = self._ensure_recollection()
                     def recall(query):
                         records = self._collect_unified(query)
+                        records = self._expression_records(records, runtime.context(kwargs))
                         return recollection.with_questions(records) if recollection and recollection.trusted(kwargs) else records
                     prompt = await runtime.reply_hint(
                         kwargs, self.config.unified_mind, recall=recall,
@@ -970,6 +1017,10 @@ class MaiLivingWorld(MaiBotPlugin):
                         extra = self._followthrough_hint(kwargs)
                         if extra:
                             prompt += "\n\n" + extra
+                        shared = self._ensure_shared_reading()
+                        extra = shared.hint(kwargs) if shared else ""
+                        if extra:
+                            prompt += "\n\n" + extra
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -991,6 +1042,10 @@ class MaiLivingWorld(MaiBotPlugin):
         prompt = self._owner_prompt_for(kwargs)
         if prompt:
             extra = self._followthrough_hint(kwargs)
+            if extra:
+                prompt += "\n\n" + extra
+            shared = self._ensure_shared_reading()
+            extra = shared.hint(kwargs) if shared else ""
             if extra:
                 prompt += "\n\n" + extra
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
@@ -1051,6 +1106,12 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._followthrough:
             self._followthrough.close()
             self._followthrough = None
+        if self._projects:
+            self._projects.close()
+            self._projects = None
+        if self._shared_reading:
+            self._shared_reading.close()
+            self._shared_reading = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -1174,7 +1235,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._unified = UnifiedRuntime(self._self_state, profile=self._growth_style_hint)
         elif previous != owner:
             self._unified.reset()
-        self._unified.latest_private_only = bool(self.config.followthrough.enabled or
+        self._unified.latest_private_only = bool(self.config.followthrough.enabled or self.config.shared_reading.enabled or
+            self.config.projects.enabled or
             (self.config.attention.enabled or self.config.recollection.enabled or self.config.habits.enabled) and self._unified_active())
         return self._unified
 
@@ -1257,6 +1319,10 @@ class MaiLivingWorld(MaiBotPlugin):
     def _collect_unified(self, query: str) -> list[dict[str, Any]]:
         roots = self._collect_roots(query)
         derived = self._derived_memories(query)
+        projects = self._ensure_projects()
+        if projects:
+            derived = rank_records(derived + projects.records(query), query, now=time.time(),
+                                   timezone=self.config.general.timezone)
         # Reserve room for both lived evidence and learned conclusions.
         if not derived:
             return roots
@@ -1327,6 +1393,96 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._habits is None:
             self._habits = HabitsRuntime(self)
         return self._habits
+
+    def _ensure_projects(self):
+        if not (self.config.projects.enabled and self._unified_active() and self._ensure_growth()
+                and self.config.growth.mode == "active"):
+            return None
+        if self._projects is None:
+            self._projects = ProjectsRuntime(self)
+        return self._projects
+
+    @Tool("living_world_projects", description="可信主人私聊只读查看她的长期项目、阶段与本次有限查阅成果；来源失效或受共读保护时只显示状态，不执行下载或代主人更改项目")
+    async def projects(self, **kwargs):
+        runtime = self._ensure_projects()
+        return runtime.inspect(kwargs) if runtime else {"success": False, "code": "projects_disabled"}
+
+    def _ensure_shared_reading(self):
+        if not (self.config.plugin.enabled and self.config.shared_reading.enabled
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq)):
+            return None
+        # Keep the saved boundary when a data provider or unified expression is disabled.
+        if self._self_state is None:
+            self._self_state = SelfState(Path(self.ctx.paths.data_dir) / "self_state.sqlite3",
+                                         **self._ledger_storage_options())
+        previous = self._self_state.state()["owner_id"]
+        owner = normalize_qq(self.config.owner.qq)
+        self._self_state.configure_owner(owner)
+        if previous != owner and self._unified:
+            self._unified.reset()
+        if self._shared_reading is None:
+            self._shared_reading = SharedReadingRuntime(self)
+        return self._shared_reading
+
+    def _shared_reading_protected(self):
+        runtime = self._ensure_shared_reading()
+        return bool(runtime and runtime.protected_works())
+
+    def _expression_records(self, records, context=None):
+        runtime = self._ensure_shared_reading()
+        if not runtime:
+            return records
+        # A group can contain the owner even when someone else is speaking.
+        owner = runtime.owner() if context and context.get("scope", "").startswith("group:") else context
+        return runtime.filter_records(records, owner)
+
+    @Tool("living_world_shared_reading", description="主人私聊查看共读双方进度，读取本人已确认位置内的原文/复核笔记，或准备讨论；工具取回不等于已聊过，不能代主人声明阅读位置", parameters={
+        "action": {"type": "string", "enum": ["list", "notes", "discuss"]},
+        "reading_id": {"type": "string", "default": ""}, "unit": {"type": "integer", "default": 0}})
+    async def shared_reading(self, action: str, reading_id: str = "", unit: int = 0, **kwargs):
+        runtime = self._ensure_shared_reading()
+        return await runtime.tool(action, reading_id, unit, kwargs) if runtime else {"success": False, "code": "shared_reading_disabled"}
+
+    def _shared_tool_blocked(self, provider, arguments):
+        runtime = self._ensure_shared_reading()
+        if not runtime or not isinstance(arguments, dict):
+            return False
+        if provider == "cap" and "jm_id" in arguments:
+            return runtime.protected_work("cap", "pdf", arguments["jm_id"])
+        if provider == "pixiv" and "pixiv_id" in arguments:
+            return any(runtime.protected_work("pixiv", kind, arguments["pixiv_id"]) for kind in ("novel", "illust"))
+        return False
+
+    @staticmethod
+    def _shared_boundary_result():
+        return {"success": False, "code": "shared_reading_boundary",
+                "instructions": "请通过 living_world_shared_reading 获取本人已确认位置内的内容。需要调整边界时，由主人本人发送共读指令。"}
+
+    def _shared_tool_result(self, provider, result):
+        runtime = self._ensure_shared_reading()
+        works = runtime.protected_works() if runtime else []
+        if not works or not isinstance(result, dict) or not result.get("success"):
+            return result
+        protected = {(row["provider"], row["resource_id"]) for row in works}
+        blocked = object()
+        def scrub(value, depth=0):
+            if depth > 20:
+                return blocked
+            if isinstance(value, dict):
+                ident = value.get("jm_id") if provider == "cap" else value.get("pixiv_id")
+                if ident is not None and (provider, shared_resource_key(ident)) in protected:
+                    return blocked
+                clean = {}
+                for key, child in value.items():
+                    safe = scrub(child, depth+1)
+                    if safe is not blocked:
+                        clean[key] = safe
+                return clean
+            if isinstance(value, list):
+                return [clean for child in value if (clean := scrub(child, depth+1)) is not blocked]
+            return value
+        data = scrub(result.get("data"))
+        return self._shared_boundary_result() if data is blocked else {**result, "data": data}
 
     async def _process_habits(self):
         try:
@@ -1478,7 +1634,25 @@ class MaiLivingWorld(MaiBotPlugin):
         runtime = self._ensure_companion() if self.config.reading.enabled else None
         if not runtime:
             return outward_result({"success": False, "code": "reading_disabled"})
+        source = None
+        if reading_id:
+            try:
+                source = runtime.store.reading(reading_id, owner_id=normalize_qq(self.config.owner.qq))
+            except ValueError:
+                pass
         result = await runtime.read(action, provider, resource_type, resource_id, reading_id, kwargs)
+        shared = self._ensure_shared_reading()
+        if shared and result.get("success"):
+            if action == "list":
+                result = {**result, "data": [{**row, "title": "共读作品"} if shared.protected_work(
+                    row.get("provider"), row.get("resource_type"), row.get("resource_id")) else row for row in result.get("data", [])]}
+            elif shared.protected_work(source["provider"] if source else provider,
+                    source["resource_type"] if source else resource_type, source["resource_id"] if source else resource_id):
+                data = result.get("data", {})
+                row = data.get("reading", data) if isinstance(data, dict) else {}
+                safe = {key: row[key] for key in ("id", "provider", "resource_type", "resource_id", "version", "status", "cursor", "total_units", "revision", "note_status") if key in row}
+                result = {"success": True, "data": safe,
+                    "instructions": "她的阅读进度已按工具结果保存，未改变主人读到哪里，也未记为已讨论。正文与笔记请通过 living_world_shared_reading 按已确认边界取回。"}
         output = outward_result(result)
         if result.get("success") and result.get("content_items"):
             output["content_items"] = result["content_items"]
@@ -1647,12 +1821,19 @@ class MaiLivingWorld(MaiBotPlugin):
     async def mcp_call(self, provider: str, tool: str, arguments: dict, **kwargs):
         if provider == "cap" and tool == "living_read_pdf_page":
             return {"success": False, "content": "请使用 living_world_reading 的 open/next 读取PDF并保存进度。"}
-        return outward_result(await self._invoke_mcp(provider, tool, arguments, kwargs))
+        if self._shared_tool_blocked(provider, arguments):
+            return outward_result(self._shared_boundary_result())
+        result = await self._invoke_mcp(provider, tool, arguments, kwargs)
+        if self._shared_tool_blocked(provider, arguments):
+            return outward_result(self._shared_boundary_result())
+        return outward_result(self._shared_tool_result(provider, result))
 
     @Tool("living_world_pixiv_image", description="读取 Pixiv 已缓存作品的一张图片交给模型观察；不自动向 QQ 发送，仅主人私聊且需启用媒体读取", parameters={
         "pixiv_id": {"type": "integer", "description": "作品编号"},
         "page_index": {"type": "integer", "description": "从0开始的图片页码", "default": 0}})
     async def pixiv_image(self, pixiv_id: int, page_index: int = 0, **kwargs):
+        if self._shared_tool_blocked("pixiv", {"pixiv_id": pixiv_id}):
+            return outward_result(self._shared_boundary_result())
         trusted = self._mcp_context(kwargs)
         owner = normalize_qq(self.config.owner.qq)
         if (not self.config.mcp.media_enabled or not trusted or trusted[0]["scope"] != "private:"+owner
@@ -1685,6 +1866,8 @@ class MaiLivingWorld(MaiBotPlugin):
                 page_index=page_index, max_bytes=self.config.mcp.max_media_bytes,
                 timeout_seconds=min(30, self.config.mcp.timeout_seconds))
             self._tool_store.complete_call(call["id"], "succeeded")
+            if self._shared_tool_blocked("pixiv", {"pixiv_id": pixiv_id}):
+                return outward_result(self._shared_boundary_result())
             return {"success": True, **image} if valid() else outward_result({"success": False, "code": "context_changed"})
         except MediaError as exc:
             self._tool_store.complete_call(call["id"], "failed")
@@ -1702,7 +1885,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 "pixiv_enabled": self.config.mcp_pixiv.enabled, "connected": list(self._mcp_clients),
                 "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
 
-    async def _research_tools(self, *, question_key=None, external_valid=None):
+    async def _research_tools(self, *, question_key=None, external_valid=None, with_evidence=False):
         cfg = self.config.mcp
         if not (cfg.enabled and cfg.research_enabled and cfg.remember_results and self.config.mcp_pixiv.enabled
                 and self._ensure_growth() and self.config.growth.mode == "active"):
@@ -1711,6 +1894,10 @@ class MaiLivingWorld(MaiBotPlugin):
         questions = {item["key"]: item for item in state["questions"] if item["status"] == "open"}
         if question_key is not None:
             questions = {key: value for key, value in questions.items() if key == question_key}
+        elif self.config.projects.enabled:
+            projects = self._ensure_projects()
+            claimed = projects.active_question_keys() if projects else set()
+            questions = {key: value for key, value in questions.items() if key not in claimed}
         if external_valid is not None and not external_valid():
             return False
         store = self._ensure_tool_store()
@@ -1729,7 +1916,7 @@ class MaiLivingWorld(MaiBotPlugin):
                     and self.config.growth.mode == "active" and self.config.unified_mind.enabled
                     and any(item == questions[claim["question_key"]]
                             for item in self._growth_snapshot()["questions"]))
-        success = False
+        success, evidence = False, []
         try:
             client = self._mcp_client("pixiv")
             options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,
@@ -1746,6 +1933,17 @@ class MaiLivingWorld(MaiBotPlugin):
                         detail = await self._mcp_bridge.execute("pixiv", "get_library_work",
                             {"pixiv_id": ident, "kind": kind, "file_limit": 1}, **options)
                         success = bool(detail.get("success"))
+                        if success and with_evidence and valid():
+                            from .mcp_policy import observation
+                            from .tool_store import _digest as observation_digest
+                            item = observation("pixiv", "get_library_work", {"pixiv_id": ident, "kind": kind}, detail["data"])
+                            if item:
+                                import unicodedata
+                                key = "tool:observation:"+observation_digest("pixiv", item["resource_key"])
+                                origin = "tool:pixiv:"+observation_digest(item["origin_key"])
+                                evidence = [row for row in store.resolve([key])
+                                            if row["text"] == unicodedata.normalize("NFKC", item["text"]).strip()
+                                            and row["origin_key"] == origin]
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1753,7 +1951,7 @@ class MaiLivingWorld(MaiBotPlugin):
         finally:
             success = success and valid()
             store.finish_research(claim["question_key"], success, token=claim["token"])
-        return success
+        return {"success": bool(success), "records": evidence if success else []} if with_evidence else success
 
     @API("living_world_growth_status", description="管理员查看成长状态和恢复队列的计数，不返回私人正文", public=False)
     async def growth_status(self) -> dict[str, Any]:
@@ -2030,9 +2228,15 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.exception("[MaiLivingWorld][COGNITION] 公开认知失败，其他功能继续")
+                    projects = self._ensure_projects()
+                    if projects:
+                        try:
+                            projects.prepare()
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld][PROJECTS] 选题暂未完成，保留现有进度")
                     if self.config.growth.enabled:
                         try:
-                            if not self._ensure_attention():
+                            if not self._ensure_attention() and not projects:
                                 await self._research_tools()
                             await self._grow()
                         except asyncio.CancelledError:
@@ -2053,23 +2257,7 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.warning("[MaiLivingWorld][FOLLOWTHROUGH] 未确认任务结果，保留跟进")
-                    attention = self._ensure_attention()
-                    if attention:
-                        try:
-                            await attention.tick()
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            self.ctx.logger.warning("[MaiLivingWorld][ATTENTION] 本轮行动未完成，保留进度")
-                    if not attention and self.config.reading.enabled and self.config.reading.auto_continue:
-                        try:
-                            companion = self._ensure_companion()
-                            if companion:
-                                await companion.auto_read()
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            self.ctx.logger.warning("[MaiLivingWorld][READING] 本轮阅读未完成，进度保留")
+                    await self._advance_background()
                     if not self.config.general.enabled:
                         continue
                     if now-self._last_chat_check >= self.config.audience.check_interval_minutes*60:
@@ -2080,6 +2268,48 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception:
             # 宿主会看到完整异常，不会自动重启后无上限循环。
             self.ctx.logger.exception("[MaiLivingWorld] 调度器异常退出，请修复错误后重载插件")
+
+    async def _advance_background(self):
+        """Give a project attempt one slot; never read its source a second time."""
+        try:
+            attention = self._ensure_attention()
+            if attention:
+                await attention.tick()
+                return
+            projects = self._ensure_projects()
+            signature = None
+            if projects:
+                signature = projects.signature()
+                before = projects.store.state(projects.owner())["last_action"]
+                result = await projects.tick()
+                if (result is not None or projects.engaged() or projects.signature() != signature
+                        or projects.store.state(projects.owner())["last_action"] != before):
+                    return
+                # Ordinary questions share the research quota. They may use an
+                # idle slot, but must never consume it before the project tries.
+                researched = await self._research_tools(external_valid=lambda:
+                    projects.signature() == signature and not projects.engaged())
+                if researched is not None or projects.engaged() or projects.signature() != signature:
+                    return
+            if not (self.config.reading.enabled and self.config.reading.auto_continue):
+                return
+            companion = self._ensure_companion()
+            if not companion:
+                return
+            if not projects:
+                await companion.auto_read()
+                return
+            occupied = projects.active_reading_ids()
+            rows = companion.store.readings(owner_id=projects.owner(), status="active", resource_type="novel",
+                                            order="oldest", limit=100)
+            row = next((item for item in rows if item["id"] not in occupied), None)
+            if row:
+                await companion.auto_read(reading_id=row["id"], external_valid=lambda:
+                    projects.signature() == signature and not projects.engaged())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld] 本轮后台行动未完成，保留进度")
 
     def _ensure_cognition(self) -> CognitiveStore | None:
         if not self.config.plugin.enabled or not self.config.cognition.enabled:
@@ -2394,7 +2624,7 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             config = {name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection", "habits", "followthrough")}
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection", "habits", "followthrough", "projects", "shared_reading")}
             bond = self._ensure_bond()
             config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
             continuity = self._ensure_continuity()
@@ -2405,6 +2635,9 @@ class MaiLivingWorld(MaiBotPlugin):
             if recollection:
                 state = recollection.store.state(recollection.owner())
                 config["recollection_version"] = (state["revision"], state["updated"])
+            shared = self._ensure_shared_reading()
+            if shared:
+                config["shared_reading_signature"] = shared.signature()
             return tool_digest(config)
         signature = proactive_signature()
         assert self._store is not None
@@ -2524,13 +2757,13 @@ class MaiLivingWorld(MaiBotPlugin):
             recollection = self._ensure_recollection()
             if recollection:
                 intent += "\n\n" + recollection.repeat_style()
-            if self.config.mind.enabled and not unified_active:
+            if self.config.mind.enabled and not unified_active and not self._shared_reading_protected():
                 mind = self._ensure_mind()
                 if mind:
                     hint = mind.private_hint(ident, mode=self.config.mind.mode)
                     if hint:
                         intent += "\n\n" + hint
-        if (not unified_active and kind == "private" and self._brain and self.config.brain_memory.enabled
+        if (not unified_active and not self._shared_reading_protected() and kind == "private" and self._brain and self.config.brain_memory.enabled
                 and self.config.brain_memory.mode == "active"):
             hint=self._brain.hint("private:"+ident)
             if hint:
@@ -2561,6 +2794,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 if pending_report:
                     return []
                 records = self._collect_unified(query)
+                records = self._expression_records(records, {"scope": kind+":"+ident, "speaker_id": ident if kind == "private" else ""})
                 return recollection.with_questions(records) if recollection else records
             def memory_version():
                 return _memory_version(sorted(recall(query), key=lambda item: item["id"]))

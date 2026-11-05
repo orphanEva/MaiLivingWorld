@@ -47,7 +47,7 @@ class AttentionRuntime:
         b = self.bot
         return digest([self._generation, self.owner(), b.config.attention.model_dump(),
                        b.config.unified_mind.model_dump(), b.config.plugin.enabled,
-                       b.config.reading.model_dump(), b.config.growth.model_dump(),
+                       b.config.reading.model_dump(), b.config.growth.model_dump(), b.config.projects.model_dump(),
                        b._mcp_signature("pixiv")])
 
     def capture(self, message):
@@ -177,11 +177,16 @@ class AttentionRuntime:
         rows = []
         if not self.enabled():
             return rows
+        projects = b._ensure_projects()
+        occupied_readings = projects.active_reading_ids() if projects else set()
+        occupied_questions = projects.active_question_keys() if projects else set()
+        if projects:
+            rows.extend(projects.candidates())
         if (b.config.reading.enabled and b.config.reading.auto_continue and b.config.mcp.enabled
                 and b.config.mcp_pixiv.enabled):
             companion = b._ensure_companion()
             for row in companion.store.readings(owner_id=owner, status="active", resource_type="novel", limit=100):
-                if (row["provider"] == "pixiv" and row["cursor"] < row["total_units"]
+                if (row["id"] not in occupied_readings and row["provider"] == "pixiv" and row["cursor"] < row["total_units"]
                         and companion._current_refs(row) == row["source_refs"]):
                     rows.append({"kind": "reading", "key": row["id"], "version": digest([
                         row["version"], row["status"], row["source_refs"]])})
@@ -190,7 +195,7 @@ class AttentionRuntime:
                 and b.config.growth.enabled and b.config.growth.mode == "active"):
             state = b._growth_snapshot()
             interests = set().union(*(_terms(x.get("topic", "")) for x in state.get("interests", [])))
-            questions = [q for q in state.get("questions", []) if q["status"] == "open"]
+            questions = [q for q in state.get("questions", []) if q["status"] == "open" and q["key"] not in occupied_questions]
             questions.sort(key=lambda q: (-len(set(_terms(q.get("topic", ""))) & interests), q["key"]))
             rows += [{"kind": "research", "key": q["key"], "version": digest(q)} for q in questions[:100]]
             if state.get("traits", {}).get("curiosity", .5) >= .55:
@@ -223,6 +228,11 @@ class AttentionRuntime:
                     outcome = "interrupted"
                 elif focus["kind"] == "reading":
                     result = await b._ensure_companion().auto_read(reading_id=focus["key"], external_valid=valid)
+                    if isinstance(result, dict) and result.get("success"):
+                        outcome = "progress"
+                elif focus["kind"] == "project":
+                    projects = b._ensure_projects()
+                    result = await projects.tick(project_id=focus["key"], external_valid=valid) if projects else None
                     if isinstance(result, dict) and result.get("success"):
                         outcome = "progress"
                 else:

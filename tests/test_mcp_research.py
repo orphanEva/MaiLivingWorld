@@ -101,3 +101,30 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config.growth.mode = "observe"
         await self.bot._research_tools()
         self.assertEqual(self.bot._mcp_clients["pixiv"].calls, [])
+
+    async def test_project_receives_only_actual_canonical_metadata_observation(self):
+        result = await self.bot._research_tools(with_evidence=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["records"]), 1)
+        record = result["records"][0]
+        self.assertIn("倾听与交流", record["text"])
+        self.assertEqual(record["evidence_status"], "tool_observation")
+        resolved = self.bot._resolve_roots([record["id"]])[record["id"]]
+        self.assertEqual({key: resolved[key] for key in record}, record)
+        self.assertNotIn("全文", record["text"])
+
+    async def test_empty_library_does_not_manufacture_project_evidence(self):
+        async def empty(name, arguments):
+            return {"items": []}
+        self.bot._mcp_clients["pixiv"].call_tool = empty
+        result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result, {"success": True, "records": []})
+
+    async def test_project_interruption_during_search_does_not_fetch_detail(self):
+        valid = [True]
+        client = self.bot._mcp_clients["pixiv"]
+        client.callback = lambda: valid.__setitem__(0, False)
+        result = await self.bot._research_tools(with_evidence=True, external_valid=lambda: valid[0])
+        self.assertEqual(result, {"success": False, "records": []})
+        self.assertEqual([name for name, _ in client.calls], ["search_library"])
+        self.assertEqual(len(self.bot._tool_store.observations()), 1)

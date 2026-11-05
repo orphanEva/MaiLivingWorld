@@ -43,6 +43,8 @@ from MaiLivingWorld.attention_store import AttentionStore
 from MaiLivingWorld.recollection_store import RecollectionStore
 from MaiLivingWorld.habits_store import HabitsStore
 from MaiLivingWorld.followthrough_store import FollowthroughStore
+from MaiLivingWorld.projects_store import ProjectsStore
+from MaiLivingWorld.shared_reading_store import SharedReadingStore
 
 
 LEDGERS = {
@@ -62,9 +64,11 @@ LEDGERS = {
     "recollection.sqlite3": tuple(t for t in TABLES if t.startswith("recollection_")),
     "habits.sqlite3": tuple(t for t in TABLES if t.startswith("habits_")),
     "followthrough.sqlite3": tuple(t for t in TABLES if t.startswith("followthrough_")),
+    "projects.sqlite3": tuple(t for t in TABLES if t.startswith("projects_")),
+    "shared_reading.sqlite3": tuple(t for t in TABLES if t.startswith("shared_reading_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
-OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"})
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -113,7 +117,8 @@ def ensure_schema(config: dict, workdir: Path) -> None:
                      ("growth",GrowthStore),("tool_memory",ToolStore),("companion",CompanionStore),("bond",BondStore),
                      ("continuity",ContinuityStore),("attention",AttentionStore),
                      ("recollection",RecollectionStore),("habits",HabitsStore),
-                     ("followthrough",FollowthroughStore)):
+                     ("followthrough",FollowthroughStore),("projects",ProjectsStore),
+                     ("shared_reading",SharedReadingStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 

@@ -31,6 +31,8 @@ TABLES = (
     "recollection_control", "recollection_inputs", "recollection_revisions", "recollection_deliveries",
     "habits_control", "habits_inputs", "habits_preferences", "habits_audit",
     "followthrough_control", "followthrough_items", "followthrough_receipts", "followthrough_sources",
+    "projects_control", "projects_items", "projects_audit",
+    "shared_reading_control", "shared_reading_sessions", "shared_reading_receipts",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",
