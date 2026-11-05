@@ -47,6 +47,7 @@ from MaiLivingWorld.projects_store import ProjectsStore
 from MaiLivingWorld.shared_reading_store import SharedReadingStore
 from MaiLivingWorld.advice_store import AdviceStore
 from MaiLivingWorld.reference_store import ReferenceStore
+from MaiLivingWorld.repair_store import RepairStore
 
 
 LEDGERS = {
@@ -70,9 +71,10 @@ LEDGERS = {
     "shared_reading.sqlite3": tuple(t for t in TABLES if t.startswith("shared_reading_")),
     "advice.sqlite3": tuple(t for t in TABLES if t.startswith("advice_")),
     "reference.sqlite3": tuple(t for t in TABLES if t.startswith("reference_")),
+    "repair.sqlite3": tuple(t for t in TABLES if t.startswith("repair_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
-OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3", "advice.sqlite3", "reference.sqlite3"})
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3", "projects.sqlite3", "shared_reading.sqlite3", "advice.sqlite3", "reference.sqlite3", "repair.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -122,7 +124,8 @@ def ensure_schema(config: dict, workdir: Path) -> None:
                      ("continuity",ContinuityStore),("attention",AttentionStore),
                      ("recollection",RecollectionStore),("habits",HabitsStore),
                      ("followthrough",FollowthroughStore),("projects",ProjectsStore),
-                     ("shared_reading",SharedReadingStore),("advice",AdviceStore),("reference",ReferenceStore)):
+                     ("shared_reading",SharedReadingStore),("advice",AdviceStore),("reference",ReferenceStore),
+                     ("repair",RepairStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 

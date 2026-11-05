@@ -1,5 +1,5 @@
--- MaiLivingWorld 已建表补充中文注释专用脚本（含持续自我身份）
--- 旧库升级请先执行 mysql.sql 创建缺失的身份、成长、工具、陪伴与相处约定表，再运行本脚本。
+-- MaiLivingWorld v0.24 已建表补充中文注释专用脚本（82表，含自身表达修复）
+-- 旧库升级请先执行 mysql.sql 创建所有缺失表（含repair四表），再运行本脚本。
 -- 先备份数据库并在低峰期执行。此脚本不删除、插入或更新业务行，
 -- 但 ALTER TABLE MODIFY COLUMN 可能获取元数据锁并重建部分表，请勿运行在高流量服务上。
 -- 仅适用于由 sql/mysql.sql 创建、字段结构一致的 MySQL 8.4 数据库；
@@ -856,3 +856,51 @@ ALTER TABLE `mlw_reference_receipts`
   MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '可信输入或真实送达的回执类型',
   MODIFY COLUMN `text_digest` VARCHAR(191) NOT NULL COMMENT '输入或已发送文本摘要，仅用于幂等检查',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '回执入账时间，Unix秒';
+
+ALTER TABLE `mlw_repair_control`
+  COMMENT = '自身表达修复的持久额度与租约，撤回水位阻止旧解释复活',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '修复控制或内容的乐观锁版本',
+  MODIFY COLUMN `epoch` BIGINT NOT NULL DEFAULT 0 COMMENT '主人撤回或遗忘后的水位，旧待处理解释不可继续提交',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '复核批次额度所属日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的修复复核次数，失败不退还',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留复核批次时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前纠正复核的独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '当前复核租约失效时间，Unix秒',
+  MODIFY COLUMN `lease_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前租约绑定的纠正输入标识',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_repair_items`
+  COMMENT = '实际送达原话与主人明确纠正的有限修复，只代表主人报告而非客观真相',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '绑定主人、实际送达消息和原话的稳定修复标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '有效、已撤回或已忘记状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '修复控制或内容的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '逐字原话和纠正、来源指纹及主人报告性质JSON，遗忘后清正文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_repair_inputs`
+  COMMENT = '有期限的主人纠正队列，提交或失效后清除临时正文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '主人纠正输入的稳定指纹',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文摘要，识别重复消息与同标识编辑冲突',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '纠正输入待处理、处理、失效或完成状态',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '纠正输入已尝试的复核次数',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前纠正复核的独占租约令牌',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '允许下次重试的时间，Unix秒',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '临时正文窗口失效时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有期限的纠正原文、真实送达引用与撤回水位JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_repair_receipts`
+  COMMENT = '有限真实出站窗口和主人控制指纹，过期与遗忘清正文仍保留防重放依据',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '真实送达或主人命令的稳定防重放标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '真实送达或主人修复控制的回执种类',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文摘要，识别重复消息与同标识编辑冲突',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '临时正文窗口失效时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '最近有限出站正文或主人控制引用JSON，过期与遗忘后清正文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒';

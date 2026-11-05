@@ -1,5 +1,7 @@
 # Docker MCP 网关
 
+v0.24 增加默认关闭的 `[repair]` 自身表达修复，继续使用原插件及两个网关，不增加服务或端口。需保留插件状态持久卷；SQLite新增 `repair.sqlite3`，MySQL新增 `repair_control/items/inputs/receipts` 四表，合计二十一库/82表。配置30节193字段、92文件发布包。核验实际发送和主人纠正后，经两阶段复核保存有限的表达修复，沿用共享模型预算；不用MCP查询代替主人证据。开启和宿主验收见 [长期伴侣说明](COMPANION.md)、[连续对话验收](EVALUATION.md)、[状态备份](BACKUP.md)。
+
 v0.23 的活动感知与性格取舍继续使用原插件及两个网关，无新增服务、端口或数据库表。配置29节189字段、89文件发布包；`attention.activity_awareness` 与 `growth.personality_tensions` 默认关闭，两项本身零额外模型调用。沿用二十SQLite库/78张MySQL表及原持久卷即可保留注意力负荷、活动事件与成长性格；高负荷只暂缓新后台探索，主人当前消息仍照常处理。启用与真实宿主验收见 [长期伴侣说明](COMPANION.md)、[连续对话验收](EVALUATION.md) 和 [备份说明](BACKUP.md)。
 
 v0.22 的观点复核与当前喜讯回应继续使用原插件和这两个网关，无新增服务、端口或数据库表。配置29节187字段、88文件发布包；`growth.review_beliefs` 默认关闭，启用后复用成长最多两次模型调用及共享预算。沿用二十SQLite库/78张MySQL表，保留原持久卷即可延续已提交观点与分歧。喜讯回应只影响当前主人私聊语气，不保存长期情绪。升级、启用与实际验收见 [长期伴侣说明](COMPANION.md)、[连续对话验收](EVALUATION.md) 和 [备份说明](BACKUP.md)。

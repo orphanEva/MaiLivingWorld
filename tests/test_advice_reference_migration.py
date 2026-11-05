@@ -33,8 +33,8 @@ def seed_v20(directory):
 
 class AdviceReferenceMigrationTests(unittest.TestCase):
     def test_current_schema_migration_and_archive_inventories_agree(self):
-        self.assertEqual(len(backup.LEDGERS), 20)
-        self.assertEqual(len(backup.TABLES), 78)
+        self.assertEqual(len(backup.LEDGERS), 21)
+        self.assertEqual(len(backup.TABLES), 82)
         self.assertEqual(set(migration.LEDGERS), set(backup.LEDGERS))
         self.assertEqual(set(migration.ALL_TABLES), set(backup.TABLES))
         self.assertEqual(set(TABLES) | {"stories", "attempts", "story_attempts"}, set(backup.TABLES))
@@ -90,7 +90,7 @@ class AdviceReferenceMigrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, re.escape(filename)+".*"+tables[1]):
                     migration.snapshot(directory)
 
-    def test_schema_initializer_uses_all_twenty_official_store_constructors(self):
+    def test_schema_initializer_uses_all_twenty_one_official_store_constructors(self):
         calls = []
         class EmptyStore:
             def __init__(self, *args, **kwargs):
@@ -100,10 +100,10 @@ class AdviceReferenceMigrationTests(unittest.TestCase):
         names = ("MySQLStore", "BrainBook", "MindStore", "CognitiveStore", "ExperienceLoop", "ProactiveFeedback",
                  "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore",
                  "AttentionStore", "RecollectionStore", "HabitsStore", "FollowthroughStore", "ProjectsStore", "SharedReadingStore",
-                 "AdviceStore", "ReferenceStore")
+                 "AdviceStore", "ReferenceStore", "RepairStore")
         with patch.multiple(migration, **{name: EmptyStore for name in names}), tempfile.TemporaryDirectory() as temp:
             migration.ensure_schema({"table_prefix": "test_"}, Path(temp))
-        self.assertEqual(len(calls), 20)
+        self.assertEqual(len(calls), 21)
         for filename in NEW_LEDGERS:
             call = next(call for call in calls if call[0] and call[0][0].name == filename)
             self.assertEqual(call[1]["mysql_settings"], {"table_prefix": "test_"})

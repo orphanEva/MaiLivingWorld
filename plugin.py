@@ -60,7 +60,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.23.0",
+        default="0.24.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -367,6 +367,14 @@ class Reference(PluginConfigBase):
     ttl_hours: int = Field(default=24, ge=1, le=72, description="已确认话题焦点的最长有效小时数；新话题、遗忘、来源变化和时效到期均停止沿用")
 
 
+class Repair(PluginConfigBase):
+    __ui_label__ = "30 / 自身表达修复"
+    enabled: bool = Field(default=False, description="核验主人私聊实际发送原话与具体纠正，保留可撤回的表达修复；需统一心智active，不把主人自述当外部已证实事实")
+    auto_review: bool = Field(default=True, description="唯一定位自己说过的片段后，经逐字依据和独立复核保存修复；含糊指责不猜测")
+    interval_seconds: int = Field(default=300, ge=30, le=86400, description="表达修复批次最小间隔秒数；真实发送原文只保留有限24小时窗口")
+    max_daily_batches: int = Field(default=4, ge=0, le=24, description="每日最多修复复核批次，仍受共享模型预算和前台预留限制")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -396,6 +404,7 @@ class Config(PluginConfigBase):
     shared_reading: SharedReading = Field(default_factory=SharedReading)
     advice: Advice = Field(default_factory=Advice)
     reference: Reference = Field(default_factory=Reference)
+    repair: Repair = Field(default_factory=Repair)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -459,6 +468,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._shared_reading: SharedReadingRuntime | None = None
         self._advice: AdviceRuntime | None = None
         self._reference: ReferenceRuntime | None = None
+        self._repair = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -506,7 +516,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.23.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.24.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -540,6 +550,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._advice.reset()
         if self._reference:
             self._reference.reset()
+        if self._repair:
+            self._repair.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -747,6 +759,17 @@ class MaiLivingWorld(MaiBotPlugin):
         reference = self._ensure_reference()
         if reference:
             changed = reference.capture(message) or changed
+        repair = self._ensure_repair()
+        if repair:
+            try:
+                repair_changed, queued = repair.capture(message)
+                changed = repair_changed or changed
+                if queued:
+                    job = asyncio.create_task(self._process_repair())
+                    self._memory_jobs.add(job)
+                    job.add_done_callback(self._memory_jobs.discard)
+            except (ValueError, TypeError):
+                self.ctx.logger.info("[MaiLivingWorld][REPAIR] 本轮表达纠正未通过核验，保留原状态")
         if changed and runtime:
             runtime.reset()
             runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
@@ -945,6 +968,22 @@ class MaiLivingWorld(MaiBotPlugin):
                 self.ctx.logger.info("[MaiLivingWorld][REFERENCE] 回执未完成核验，未更新话题")
         return {"action": "continue"}
 
+    @HookHandler(
+        "send_service.after_send", name="living_world_repair_receipt",
+        description="核验真实主人私聊发送原文，供有限窗口内具体表达纠正使用",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def repair_send_feedback(self, **kwargs):
+        runtime = self._ensure_repair()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][REPAIR] 发送回执未通过核验，未记录原文")
+        return {"action": "continue"}
+
     def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
@@ -1123,6 +1162,10 @@ class MaiLivingWorld(MaiBotPlugin):
                                     prompt += "\n\n" + extra
                                 if prompt:
                                     reference.stage(kwargs, recalled)
+                        repair = self._ensure_repair()
+                        extra = repair.hint(kwargs) if repair else ""
+                        if extra:
+                            prompt += "\n\n" + extra
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1152,6 +1195,10 @@ class MaiLivingWorld(MaiBotPlugin):
                 prompt += "\n\n" + extra
             advice = self._ensure_advice()
             extra = advice.hint(kwargs) if advice else ""
+            if extra:
+                prompt += "\n\n" + extra
+            repair = self._ensure_repair()
+            extra = repair.hint(kwargs) if repair else ""
             if extra:
                 prompt += "\n\n" + extra
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
@@ -1224,6 +1271,9 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._reference:
             self._reference.close()
             self._reference = None
+        if self._repair:
+            self._repair.close()
+            self._repair = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -1348,7 +1398,7 @@ class MaiLivingWorld(MaiBotPlugin):
         elif previous != owner:
             self._unified.reset()
         self._unified.latest_private_only = bool(self.config.followthrough.enabled or self.config.shared_reading.enabled or
-            self.config.projects.enabled or self.config.advice.enabled or self.config.reference.enabled or
+            self.config.projects.enabled or self.config.advice.enabled or self.config.reference.enabled or self.config.repair.enabled or
             (self.config.attention.enabled or self.config.recollection.enabled or self.config.habits.enabled) and self._unified_active())
         return self._unified
 
@@ -1619,6 +1669,31 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._reference is None:
             self._reference = ReferenceRuntime(self)
         return self._reference
+
+    def _ensure_repair(self):
+        if not (self.config.plugin.enabled and self.config.repair.enabled and self._unified_active()
+                and self._ensure_unified()):
+            return None
+        if self._repair is None:
+            from .repair_runtime import RepairRuntime
+            self._repair = RepairRuntime(self)
+        return self._repair
+
+    async def _process_repair(self):
+        try:
+            runtime = self._ensure_repair()
+            if runtime:
+                await runtime.process()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld][REPAIR] 本轮表达修复未完成，保留原状态")
+
+    @Tool("living_world_repair", description="可信主人私聊只读查看表达修复和状态；纠正是本人自述，不是外部事实已证实，也不代表已经道歉或被原谅", parameters={
+        "action": {"type": "string", "enum": ["list", "status"], "default": "list"}})
+    async def repair(self, action: str = "list", **kwargs):
+        runtime = self._ensure_repair()
+        return await runtime.tool(action=action, kwargs=kwargs) if runtime else {"success": False, "code": "repair_disabled"}
 
     async def _process_advice(self):
         try:
@@ -2413,6 +2488,8 @@ class MaiLivingWorld(MaiBotPlugin):
                         await self._process_habits()
                     if self.config.advice.enabled:
                         await self._process_advice()
+                    if self.config.repair.enabled:
+                        await self._process_repair()
                     followthrough = self._ensure_followthrough()
                     if followthrough:
                         try:

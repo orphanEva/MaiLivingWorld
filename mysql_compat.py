@@ -35,6 +35,7 @@ TABLES = (
     "shared_reading_control", "shared_reading_sessions", "shared_reading_receipts",
     "advice_control", "advice_items", "advice_inputs", "advice_receipts",
     "reference_control", "reference_receipts",
+    "repair_control", "repair_items", "repair_inputs", "repair_receipts",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

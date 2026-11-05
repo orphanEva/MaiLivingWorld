@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十八套数据共 72 表（含持续自我、成长、工具、陪伴、聊天连续性、相处习惯、任务回告、自主项目与共同阅读）
+-- MaiLivingWorld v0.24 MySQL 8.4 二十一套数据共 82 表（含持续自我、成长、工具、陪伴、连续性、习惯、任务回告、项目、共读、建议、话题承接与表达修复）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -835,3 +835,54 @@ CREATE TABLE IF NOT EXISTS `mlw_reference_receipts` (
     created DOUBLE NOT NULL COMMENT '回执入账时间，Unix秒',
     KEY `idx_reference_receipts_owner` (owner_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='话题承接的防重放回执，清除后不因旧事件恢复';
+
+CREATE TABLE IF NOT EXISTS `mlw_repair_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '经核验的唯一主人标识，不转移给新主人',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '修复控制或内容的乐观锁版本',
+    epoch BIGINT NOT NULL DEFAULT 0 COMMENT '主人撤回或遗忘后的水位，旧待处理解释不可继续提交',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '复核批次额度所属日期起点，Unix秒',
+    cycle_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的修复复核次数，失败不退还',
+    last_cycle DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留复核批次时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前纠正复核的独占租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '当前复核租约失效时间，Unix秒',
+    lease_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前租约绑定的纠正输入标识',
+    created DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='自身表达修复的持久额度与租约，撤回水位阻止旧解释复活';
+
+CREATE TABLE IF NOT EXISTS `mlw_repair_items` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '绑定主人、实际送达消息和原话的稳定修复标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+    status VARCHAR(191) NOT NULL COMMENT '有效、已撤回或已忘记状态',
+    revision BIGINT NOT NULL COMMENT '修复控制或内容的乐观锁版本',
+    payload LONGTEXT NOT NULL COMMENT '逐字原话和纠正、来源指纹及主人报告性质JSON，遗忘后清正文',
+    created DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒',
+    KEY `idx_repair_items_owner` (owner_id,status,updated)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='实际送达原话与主人明确纠正的有限修复，只代表主人报告而非客观真相';
+
+CREATE TABLE IF NOT EXISTS `mlw_repair_inputs` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '主人纠正输入的稳定指纹',
+    owner_id VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文摘要，识别重复消息与同标识编辑冲突',
+    status VARCHAR(191) NOT NULL COMMENT '纠正输入待处理、处理、失效或完成状态',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '纠正输入已尝试的复核次数',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前纠正复核的独占租约令牌',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '允许下次重试的时间，Unix秒',
+    expires DOUBLE NOT NULL COMMENT '临时正文窗口失效时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '有期限的纠正原文、真实送达引用与撤回水位JSON',
+    created DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近内容或处理状态变化时间，Unix秒',
+    KEY `idx_repair_inputs_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='有期限的主人纠正队列，提交或失效后清除临时正文';
+
+CREATE TABLE IF NOT EXISTS `mlw_repair_receipts` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '真实送达或主人命令的稳定防重放标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '经核验的唯一主人标识，不转移给新主人',
+    kind VARCHAR(191) NOT NULL COMMENT '真实送达或主人修复控制的回执种类',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文摘要，识别重复消息与同标识编辑冲突',
+    expires DOUBLE NOT NULL COMMENT '临时正文窗口失效时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '最近有限出站正文或主人控制引用JSON，过期与遗忘后清正文',
+    created DOUBLE NOT NULL COMMENT '记录首次确认时间，Unix秒',
+    KEY `idx_repair_receipts_owner` (owner_id,kind,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='有限真实出站窗口和主人控制指纹，过期与遗忘清正文仍保留防重放依据';
