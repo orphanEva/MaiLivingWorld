@@ -490,7 +490,29 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         cursor.execute("INSERT INTO backup_attempts(target,created_at,kind) VALUES ('private:test',100,'test')")
                         deleted_id = cursor.lastrowid
                         cursor.execute("DELETE FROM backup_attempts WHERE id=%s", (deleted_id,))
-                    result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
+                    original_check = backup._check_increment
+                    def diagnose_counter(schema, value):
+                        try:
+                            return original_check(schema, value)
+                        except backup.BackupError:
+                            print("BACKUP_COUNTER_DIAGNOSTIC", json.dumps({"counter": value, "columns": schema}, ensure_ascii=False))
+                            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                                cursor.execute("SET SESSION information_schema_stats_expiry = 0")
+                                cursor.execute("SHOW TABLE STATUS")
+                                states = cursor.fetchall()
+                                for item in states:
+                                    cursor.execute("SHOW FULL COLUMNS FROM `"+item["Name"]+"`")
+                                    fields = cursor.fetchall()
+                                    if [row["Field"] for row in fields] == [row["Field"] for row in schema]:
+                                        cursor.execute("SHOW CREATE TABLE `"+item["Name"]+"`")
+                                        print("BACKUP_TABLE_DIAGNOSTIC", json.dumps({"table": item["Name"],
+                                            "counter": item["Auto_increment"], "ddl": cursor.fetchone()}, ensure_ascii=False))
+                            raise
+                    try:
+                        backup._check_increment = diagnose_counter
+                        result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
+                    finally:
+                        backup._check_increment = original_check
                     self.assertEqual(result["tables"], 44)
                     self.assertTrue(backup.verify_archive(archive)["verified"])
                     with self.assertRaisesRegex(backup.BackupError, "target_not_empty"):
