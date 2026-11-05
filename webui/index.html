@@ -6,7 +6,10 @@
 <header><div><div class="eyebrow">MAI LIVING WORLD</div><h1>成长手记</h1><p id="identity" class="muted">正在读取持续档案</p></div><button id="refresh" type="button">刷新状态</button></header>
 <div id="error" role="alert" class="error" hidden></div>
 <div id="content" hidden><div class="cards"><div class="card"><strong id="revision">—</strong><span>成长修订</span></div><div class="card"><strong id="questions">—</strong><span>仍在探索的问题</span></div><div class="card"><strong id="reading">—</strong><span>阅读记录</span></div><div class="card"><strong id="plans">—</strong><span>共同计划</span></div></div>
-<div class="columns"><div class="stack"><section><h2>我在逐渐形成的想法</h2><div class="toolbar"><input id="search" type="search" aria-label="筛选成长、计划和阅读" placeholder="搜索主题、计划或阅读"></div><nav class="tabs" aria-label="成长分类"><button type="button" class="active" data-tab="interests">兴趣</button><button type="button" data-tab="beliefs">观点</button><button type="button" data-tab="knowledge">知识候选</button><button type="button" data-tab="questions">未解问题</button></nav><div id="growth-list"></div><p class="notice">这些是有来源的偏好与推断，不代表已经证实的事实；来源失效后暂停展示内容。</p></section><section><h2>与主人一起的计划</h2><div id="plan-list"></div></section><section><h2>阅读进度</h2><div id="reading-list"></div></section></div>
+<div class="columns"><div class="stack">
+<section><h2>我们的相处方式</h2><div id="bond-profile"></div><p class="notice">称呼与边界来自主人明确的约定，可在私聊中用 /相处 指令查看和修改。</p></section>
+<section><h2>留下的回忆与纪念日</h2><div id="bond-moments"></div><p class="notice">展示主人明确记下的事项。草稿、未完成的计划和发送尝试不会自动成为共同回忆。</p></section>
+<section><h2>我在逐渐形成的想法</h2><div class="toolbar"><input id="search" type="search" aria-label="筛选成长、回忆、计划和阅读" placeholder="搜索主题、回忆、计划或阅读"></div><nav class="tabs" aria-label="成长分类"><button type="button" class="active" data-tab="interests">兴趣</button><button type="button" data-tab="beliefs">观点</button><button type="button" data-tab="knowledge">知识候选</button><button type="button" data-tab="questions">未解问题</button></nav><div id="growth-list"></div><p class="notice">这些是有来源的偏好与推断，不代表已经证实的事实；来源失效后暂停展示内容。</p></section><section><h2>与主人一起的计划</h2><div id="plan-list"></div></section><section><h2>阅读进度</h2><div id="reading-list"></div></section></div>
 <aside class="stack"><section><h2>长期性格 · 短期状态</h2><div id="traits"></div><div id="mood"></div><p class="notice">性格缓慢变化；情绪与精力会随时间恢复。数值用于观察变化，不是心理诊断。</p></section><section><h2>今天的使用额度</h2><div id="budgets"></div><p class="notice">额度不足时等待恢复，不会通过重启重置。</p></section><section><h2>来源健康度</h2><div class="counts"><div><strong id="valid">0</strong><span>可展示</span></div><div><strong id="invalid">0</strong><span>来源已失效</span></div><div><strong id="protected">0</strong><span>隐私保护</span></div></div><p class="notice">按成长条目统计。第三方私人原文、密钥及来源身份不会返回到此页面。</p></section></aside></div></div>
 <footer id="footer">只读面板 · 通过宿主管理员认证访问</footer>
 </main><script id="snapshot" type="application/json">null</script><script>
@@ -26,7 +29,41 @@ const stamp=x=>{const d=new Date(x);
 return x&&!Number.isNaN(d.valueOf())?d.toLocaleString():""};
 const empty=(el,text)=>el.append(node("div",text,"empty"));
 const tag=(el,text,warn=false)=>el.append(node("span",text,"tag"+(warn?" warn":"")));
-const matches=x=>[x.topic,x.text,x.title,x.next_step].filter(Boolean).join(" ").toLowerCase().includes($("search").value.toLowerCase().trim());
+const matches=x=>[x.topic,x.text,x.title,x.next_step,x.summary,x.occurred_on].filter(Boolean).join(" ").toLowerCase().includes($("search").value.toLowerCase().trim());
+
+function renderBond(){
+  const bond=state.bond||{}, profile=$("bond-profile"), moments=$("bond-moments");
+  profile.replaceChildren();
+  moments.replaceChildren();
+  if(!bond.enabled){
+    empty(profile,"相处约定尚未启用或主人尚未绑定。");
+    empty(moments,"启用后可在主人私聊中用 /相处 记下值得留下的事。");
+    return;
+  }
+  if(bond.preferred_address) profile.append(node("p","喜欢的称呼："+bond.preferred_address));
+  if(rows(bond.blocked_addresses).length) profile.append(node("p","不使用的称呼："+bond.blocked_addresses.join("、")));
+  const affection={default:"沿用原有表达",allow:"可以亲昵地表达",avoid:"避免亲昵表达"};
+  profile.append(node("p","相处偏好："+(affection[bond.affection]||affection.default)));
+  for(const boundary of rows(bond.boundaries)){
+    const row=node("div",undefined,"row");
+    row.append(node("p",boundary.text));
+    tag(row,"约定的边界");
+    profile.append(row);
+  }
+  if(!bond.preferred_address&&!rows(bond.blocked_addresses).length&&!rows(bond.boundaries).length&&bond.affection==="default"){
+    empty(profile,"还没有额外约定。可以在主人私聊中用 /相处 告诉她你喜欢怎样相处。");
+  }
+  const items=rows(bond.moments).filter(matches);
+  for(const item of items){
+    const row=node("article",undefined,"row");
+    row.append(node("p",item.summary));
+    tag(row,item.kind==="anniversary"?"纪念日":"主人记下的回忆");
+    if(item.occurred_on) tag(row,item.occurred_on);
+    if(item.updated_at) row.append(node("p","记录更新于 "+stamp(item.updated_at),"muted"));
+    moments.append(row);
+  }
+  if(!items.length) empty(moments,$("search").value?"没有符合搜索条件的记录。":"还没有留下记录。可在主人私聊中用 /相处 记下回忆或纪念日。");
+}
 
 function meter(el,label,value,detail){const block=node("div",undefined,"meter"),line=node("div",undefined,"meter-label");
 line.append(node("span",label),node("span",detail));
@@ -35,7 +72,8 @@ fill.style.width=Math.max(0,Math.min(100,value*100))+"%";
 track.append(fill);
 block.append(line,track);
 el.append(block)}
-function lists(){const gl=$("growth-list");
+function lists(){renderBond();
+const gl=$("growth-list");
 gl.replaceChildren();
 const selected=rows(state.growth?.[tab]).filter(x=>!$("search").value||matches(x));
 for(const x of selected){const row=node("article",undefined,"row");

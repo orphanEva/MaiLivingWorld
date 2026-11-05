@@ -40,6 +40,7 @@ jobs:
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_growth_mysql_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_tool_mysql_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_companion_mysql_live.py' -v
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_bond_mysql_live.py' -v
       - name: Create isolated backup restore database
         run: |
           python - <<'PY'

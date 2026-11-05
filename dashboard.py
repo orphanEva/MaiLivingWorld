@@ -65,8 +65,42 @@ def _status(value):
     return value if isinstance(value, str) and value in STATUSES else "unknown"
 
 
+def _calendar_date(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return ""
+    try:
+        return datetime.fromisoformat(value).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _bond_view(value):
+    """Whitelist an already owner-filtered projection, including offline exports."""
+    value = _dict(value)
+    result = {"enabled": False, "preferred_address": "", "blocked_addresses": [],
+              "affection": "default", "boundaries": [], "moments": []}
+    if value.get("enabled") is not True:
+        return result
+    result["enabled"] = True
+    result["preferred_address"] = _text(value.get("preferred_address"), 24)
+    result["affection"] = value.get("affection") if value.get("affection") in ("default", "allow", "avoid") else "default"
+    addresses = value.get("blocked_addresses")
+    if isinstance(addresses, list):
+        result["blocked_addresses"] = [text for item in addresses[:32] if (text := _text(item, 24))]
+    result["boundaries"] = [{"text": text} for item in _rows(value.get("boundaries"), 32)
+                            if (text := _text(item.get("text"), 120))]
+    for item in _rows(value.get("moments"), 200):
+        summary, kind = _text(item.get("summary"), 400), item.get("kind")
+        occurred_on = _calendar_date(item.get("occurred_on"))
+        if not summary or kind not in ("memory", "anniversary") or (kind == "anniversary" and not occurred_on):
+            continue
+        result["moments"].append({"summary": summary, "kind": kind, "occurred_on": occurred_on,
+                                  "updated_at": _date(item.get("updated_at"))})
+    return result
+
+
 def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fingerprint,
-                    budgets=None, companion=None, authorized=False, now=None) -> dict:
+                    budgets=None, companion=None, bond=None, authorized=False, now=None) -> dict:
     """Caller must authenticate the Host WebUI administrator or the private owner.
 
     ``authorized`` is a server decision, never a user/model argument. Invalid or
@@ -147,6 +181,16 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
                            unit="字符" if item.get("resource_type") == "novel" else "页 / 图",
                            provider=item.get("provider") if item.get("provider") in ("cap", "pixiv") else "local")
             result[key].append(row)
+    profile = _dict(_dict(bond).get("profile"))
+    result["bond"] = _bond_view(None)
+    if owner and profile.get("owner_id") == owner:
+        moments = [{"summary": item.get("summary"), "kind": item.get("kind"), "occurred_on": item.get("occurred_on"),
+                    "updated_at": item.get("updated")}
+                   for item in _rows(_dict(bond).get("moments"), 200)
+                   if item.get("owner_id") == owner and item.get("scope") == "private:"+owner and item.get("status") == "active"]
+        result["bond"] = _bond_view({"enabled": True, "preferred_address": profile.get("preferred_address"),
+            "blocked_addresses": profile.get("blocked_addresses"), "affection": profile.get("affection"),
+            "boundaries": profile.get("boundaries"), "moments": moments})
     return result
 
 
@@ -189,6 +233,7 @@ def _export(snapshot):
                            unit="字符" if item.get("unit") == "字符" else "页 / 图",
                            provider=item.get("provider") if item.get("provider") in ("cap", "pixiv") else "local")
             result[key].append(row)
+    result["bond"] = _bond_view(snapshot.get("bond"))
     return result
 
 

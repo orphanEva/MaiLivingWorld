@@ -90,6 +90,81 @@ class DashboardTests(unittest.TestCase):
         for secret in ("private_payload", "private_original", self.owner, "87654321", "888888"):
             self.assertNotIn(secret, text)
 
+    def bond(self):
+        return {"profile": {"owner_id": self.owner, "preferred_address": "小伙伴", "blocked_addresses": ["老板"],
+                "affection": "allow", "boundaries": [{"id": "boundary-private-key", "text": "忙的时候晚点聊"}], "score": 999},
+                "moments": [{"id": "bond-private-key", "owner_id": self.owner, "scope": "private:"+self.owner,
+                    "kind": "anniversary", "status": "active", "summary": "开始一起读书", "occurred_on": "2024-02-29",
+                    "updated": 100, "source_refs": [{"text": "private-source-original"}]}]}
+
+    def test_bond_projection_has_no_identifiers_scores_or_raw_sources(self):
+        result = self.build(bond=self.bond())["bond"]
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["preferred_address"], "小伙伴")
+        self.assertEqual(result["boundaries"], [{"text": "忙的时候晚点聊"}])
+        self.assertEqual(result["moments"][0]["occurred_on"], "2024-02-29")
+        text = json.dumps(result, ensure_ascii=False)
+        for secret in (self.owner, "boundary-private-key", "bond-private-key", "private-source-original", "999", "score"):
+            self.assertNotIn(secret, text)
+
+    def test_bond_requires_current_owner_profile_and_exact_private_moments(self):
+        values = self.bond()
+        own = values["moments"][0]
+        values["moments"] += [dict(own, summary="foreign owner", owner_id="87654321"),
+            dict(own, summary="group moment", scope="group:888888"), dict(own, summary="retired moment", status="retired")]
+        result = self.build(bond=values)["bond"]
+        self.assertEqual(len(result["moments"]), 1)
+        values["profile"]["owner_id"] = "87654321"
+        result = self.build(bond=values)["bond"]
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["moments"], [])
+        self.assertNotIn("小伙伴", json.dumps(result, ensure_ascii=False))
+
+    def test_bond_absent_and_readonly_default_profile_are_distinct(self):
+        self.assertFalse(self.build()["bond"]["enabled"])
+        result = self.build(bond={"profile": {"owner_id": self.owner}, "moments": []})["bond"]
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["affection"], "default")
+        self.assertEqual(result["preferred_address"], "")
+        self.assertFalse(self.build(identity={}, bond=self.bond())["bond"]["enabled"])
+
+    def test_bond_sensitive_text_invalid_dates_and_unknown_types_are_filtered(self):
+        values = self.bond()
+        values["profile"].update(preferred_address="12345678", blocked_addresses=["老板", "密码 secret"],
+                                boundaries=[{"text": "API_KEY private"}, {"text": "睡前少发消息"}])
+        own = values["moments"][0]
+        values["moments"] += [dict(own, summary="密码 secret"), dict(own, occurred_on="2023-02-29"),
+                             dict(own, kind="unknown"), dict(own, occurred_on="2024-02-29T00:00:00Z")]
+        result = self.build(bond=values)["bond"]
+        self.assertEqual(result["preferred_address"], "")
+        self.assertEqual(result["blocked_addresses"], ["老板"])
+        self.assertEqual(result["boundaries"], [{"text": "睡前少发消息"}])
+        self.assertEqual(len(result["moments"]), 1)
+
+    def test_bond_export_revalidates_fields_and_never_embeds_disabled_private_text(self):
+        result = self.build(bond=self.bond())
+        result["bond"]["owner_id"] = self.owner
+        result["bond"]["moments"][0]["raw"] = "hidden-original"
+        result["bond"]["moments"][0]["summary"] = "</script><script>alert('bond')</script>"
+        html = dashboard.render_dashboard(result)
+        self.assertNotIn(self.owner, html)
+        self.assertNotIn("hidden-original", html)
+        self.assertNotIn("</script><script>alert('bond')", html)
+        self.assertIn("\\u003c/script\\u003e", html)
+        result["bond"]["enabled"] = False
+        self.assertNotIn("小伙伴", dashboard.render_dashboard(result))
+
+    def test_bond_is_bounded_and_ui_uses_concrete_agreements_and_memories(self):
+        values = self.bond()
+        values["moments"] *= 1000
+        result = self.build(bond=values)
+        self.assertEqual(len(result["bond"]["moments"]), 200)
+        self.assertLess(len(json.dumps(result).encode()), 512*1024)
+        html = dashboard.render_dashboard(result)
+        for label in ("我们的相处方式", "留下的回忆与纪念日", "主人记下的回忆", "/相处"):
+            self.assertIn(label, html)
+        self.assertNotIn("好感分", html)
+
     def test_malformed_and_large_inputs_are_bounded(self):
         self.growth["questions"] = [self.item]*10000
         self.growth["traits"]["curiosity"] = float("nan")

@@ -1,5 +1,5 @@
 -- MaiLivingWorld 已建表补充中文注释专用脚本（含持续自我身份）
--- 旧库升级请先执行 mysql.sql 创建缺失的身份、成长、工具与陪伴表，再运行本脚本。
+-- 旧库升级请先执行 mysql.sql 创建缺失的身份、成长、工具、陪伴与相处约定表，再运行本脚本。
 -- 先备份数据库并在低峰期执行。此脚本不删除、插入或更新业务行，
 -- 但 ALTER TABLE MODIFY COLUMN 可能获取元数据锁并重建部分表，请勿运行在高流量服务上。
 -- 仅适用于由 sql/mysql.sql 创建、字段结构一致的 MySQL 8.4 数据库；
@@ -479,4 +479,35 @@ ALTER TABLE `mlw_companion_audit`
   MODIFY COLUMN `message_digest` VARCHAR(191) NOT NULL COMMENT '可信消息ID与场合的SHA256摘要',
   MODIFY COLUMN `summary_hash` VARCHAR(191) NOT NULL COMMENT '可信原消息摘要的SHA256，不保存原文',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '命令签名及操作前后状态的JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒';
+
+ALTER TABLE `mlw_bond_profiles`
+  COMMENT = '可信主人明确设置的相处约定与节奏，不生成亲密度分数',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '相处约定所属的可信主人标识，不随主人配置变更迁移',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '主人约定修改的乐观锁版本，不表示好感或关系等级',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '主人明确设置的称呼亲昵表达偏好与相处边界JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次明确设置约定的时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近约定变更时间，Unix秒';
+
+ALTER TABLE `mlw_bond_moments`
+  COMMENT = '主人通过明确命令留下的纪念日和共同回忆，模型提议不等于已发生',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信主人命令生成的稳定纪念日或回忆ID',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '该条回忆或纪念日原主人标识，禁止自动迁移给新主人',
+  MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '首次记录场合，供来源追溯和表达判断',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '明确记录的纪念日或共同回忆类型',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '当前记录状态，不由模型生成内容自行认定为真实经历',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '主人命令修改记录的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '主人确认的标题内容日期和来源摘要JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次明确记下该事项的时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近内容或状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_bond_audit`
+  COMMENT = '相处约定与纪念事项的幂等和修改审计，保留原主人归属',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信主人场合消息与命令生成的幂等审计ID',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际命令所属可信主人标识',
+  MODIFY COLUMN `entity_id` VARCHAR(191) NOT NULL COMMENT '关联相处约定或纪念事项的标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际执行的约定修改记录或撤回操作',
+  MODIFY COLUMN `message_digest` VARCHAR(191) NOT NULL COMMENT '可信消息与场合的SHA256摘要',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原命令正文的SHA256摘要，不保存命令原文',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '命令签名及修改前后结构化状态JSON',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒';

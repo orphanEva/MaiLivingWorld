@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.13.0 · 全字段中文注释配置模板
+# MaiLivingWorld v0.15.0 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.14.0"
+config_version = "0.15.0"
 
 # ====================================================================
 # 10 / 统一心智与唯一主人（沿用 brain_memory 的输入名单）
@@ -193,7 +193,7 @@ recognize_in_private = true
 add_to_private_targets = false
 # 主人专属关系风格；关闭后仍识别主人，但不添加亲疏表达指引
 relationship_enabled = true
-# banter=损友亲近 / gentle=温柔偏心 / tsundere=嘴硬心软 / custom=自定义。
+# banter=损友亲近 / gentle=温柔偏心 / tsundere=嘴硬心软、partner=长期伴侣 / custom=自定义。
 relationship_mode = "banter"
 # 主人的私聊自定义风格；非空时覆盖对应预设，最多使用前1600字。
 private_template = ""
@@ -396,3 +396,12 @@ args = ["-m", "app.mcp"]
 cwd = ""
 # stdio 专用：传给子进程的环境变量名；不自动读取 .env。
 env_names = ["PIXIV_MCP_BACKEND_URL", "PIXIV_MCP_API_KEY"]
+
+# ====================================================================
+# 20 / 长期伴侣与相处约定
+# ====================================================================
+[bond]
+# 记住可信主人亲自确认的称呼、亲昵边界、回忆与纪念日；需统一心智active。
+enabled = false
+# 根据真实当地时段调整语气，不推断起居，不增加主动联系或模型调用。
+daily_rhythm = true

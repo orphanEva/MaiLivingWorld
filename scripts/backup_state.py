@@ -21,10 +21,12 @@ import re
 import sqlite3
 import stat
 import tempfile
+from types import MappingProxyType
 import zipfile
 
-FORMAT = "mailivingworld.state-backup.v1"
-LEDGERS = {
+LEGACY_FORMAT = "mailivingworld.state-backup.v1"
+FORMAT = "mailivingworld.state-backup.v2"
+V14_LEDGERS = MappingProxyType({
     "living_world.sqlite3": ("stories", "attempts", "story_attempts"),
     "brain_book.sqlite3": ("brain_runs", "brain_events", "brain_event_evidence", "brain_facts", "brain_fact_evidence", "brain_goals", "brain_goal_events", "brain_decisions", "brain_cycles", "brain_fact_revisions"),
     "mind.sqlite3": ("mind_runs", "mind_notes", "mind_evidence", "mind_reviews", "mind_snapshots"),
@@ -35,7 +37,13 @@ LEDGERS = {
     "growth.sqlite3": ("growth_state", "growth_jobs", "growth_history", "growth_consumed"),
     "tool_memory.sqlite3": ("tool_observations", "tool_calls", "tool_tasks", "tool_research"),
     "companion.sqlite3": ("companion_control", "companion_readings", "companion_units", "companion_plans", "companion_audit"),
-}
+})
+V15_LEDGERS = MappingProxyType({**V14_LEDGERS,
+    "bond.sqlite3": ("bond_profiles", "bond_moments", "bond_audit"),
+})
+CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS})
+CURRENT_CATALOG = "v0.15"
+LEDGERS = CATALOGS[CURRENT_CATALOG]
 TABLES = tuple(table for tables in LEDGERS.values() for table in tables)
 MAX_MANIFEST = 1024 * 1024
 MAX_FILE = 2 * 1024**3
@@ -119,8 +127,10 @@ def _hash(path):
 
 
 def _manifest(backend, files, missing=()):
-    return {"format": FORMAT, "backend": backend, "created_at": datetime.now(timezone.utc).isoformat(),
-            "consistency": "writers_stopped", "files": files, "missing": list(missing)}
+    manifest = {"format": FORMAT, "catalog": CURRENT_CATALOG, "backend": backend,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "consistency": "writers_stopped", "files": files, "missing": list(missing)}
+    return _validate_manifest(manifest)
 
 
 def _publish(archive, directory, manifest):
@@ -218,17 +228,43 @@ def backup_sqlite(source, archive, *, apply=False, writers_stopped=False):
     return result
 
 
+def _catalog_name(manifest):
+    # The old format predates explicit catalogs and always meant these ten
+    # ledgers. Never reinterpret its omissions against an evolving current list.
+    if manifest.get("format") == LEGACY_FORMAT:
+        return "v0.14"
+    name = manifest.get("catalog")
+    if manifest.get("format") != FORMAT or not isinstance(name, str) or name not in CATALOGS:
+        _fail("unsupported_backup_catalog")
+    return name
+
+
+def _current_missing(manifest):
+    missing = list(manifest["missing"])
+    if manifest["backend"] == "sqlite":
+        catalog = CATALOGS[_catalog_name(manifest)]
+        missing.extend(name for name in LEDGERS if name not in catalog)
+    return missing
+
+
 def _validate_manifest(manifest):
-    if not isinstance(manifest, dict) or set(manifest) != {"format", "backend", "created_at", "consistency", "files", "missing"}:
+    if not isinstance(manifest, dict):
         _fail("invalid_manifest")
-    if manifest["format"] != FORMAT or manifest["backend"] not in ("sqlite", "mysql") or manifest["consistency"] != "writers_stopped":
+    fields = {"format", "backend", "created_at", "consistency", "files", "missing"}
+    if manifest.get("format") == FORMAT:
+        fields.add("catalog")
+    if set(manifest) != fields:
+        _fail("invalid_manifest")
+    if manifest["format"] not in (LEGACY_FORMAT, FORMAT) or manifest["backend"] not in ("sqlite", "mysql") or manifest["consistency"] != "writers_stopped":
         _fail("unsupported_backup_format")
+    catalog = CATALOGS[_catalog_name(manifest)]
+    catalog_tables = tuple(table for group in catalog.values() for table in group)
     if not isinstance(manifest["created_at"], str) or len(manifest["created_at"]) > 64:
         _fail("invalid_manifest")
     files, missing = manifest["files"], manifest["missing"]
-    if not isinstance(files, list) or not 1 <= len(files) <= len(TABLES) or not isinstance(missing, list):
+    if not isinstance(files, list) or not 1 <= len(files) <= len(catalog_tables) or not isinstance(missing, list):
         _fail("invalid_manifest")
-    allowed = {"sqlite/"+name for name in LEDGERS} if manifest["backend"] == "sqlite" else {"mysql/"+name+".jsonl" for name in TABLES}
+    allowed = {"sqlite/"+name for name in catalog} if manifest["backend"] == "sqlite" else {"mysql/"+name+".jsonl" for name in catalog_tables}
     seen = set()
     total = 0
     for item in files:
@@ -243,7 +279,7 @@ def _validate_manifest(manifest):
             if set(item) != {"path", "size", "sha256", "tables"} or not isinstance(tables, dict):
                 _fail("invalid_sqlite_metadata")
             for table, count in tables.items():
-                if table not in LEDGERS[Path(item["path"]).name] or type(count) is not int or count < 0:
+                if table not in catalog[Path(item["path"]).name] or type(count) is not int or count < 0:
                     _fail("invalid_sqlite_metadata")
         else:
             if set(item) != {"path", "size", "sha256", "schema", "rows", "definition", "auto_increment"} or type(item.get("rows")) is not int or item["rows"] < 0:
@@ -257,9 +293,9 @@ def _validate_manifest(manifest):
     if total > MAX_TOTAL:
         _fail("backup_too_large")
     if manifest["backend"] == "sqlite":
-        if any(not isinstance(name, str) or name not in LEDGERS for name in missing) or len(set(missing)) != len(missing):
+        if any(not isinstance(name, str) or name not in catalog for name in missing) or len(set(missing)) != len(missing):
             _fail("invalid_missing_ledgers")
-        if {Path(name).name for name in seen} & set(missing) or {Path(name).name for name in seen} | set(missing) != set(LEDGERS):
+        if {Path(name).name for name in seen} & set(missing) or {Path(name).name for name in seen} | set(missing) != set(catalog):
             _fail("incomplete_ledger_inventory")
     elif missing:
         _fail("invalid_missing_tables")
@@ -318,7 +354,8 @@ def _verified(archive):
 
 def verify_archive(archive):
     with _verified(archive) as (manifest, _):
-        return {"backend": manifest["backend"], "verified": True, "files": len(manifest["files"]), "missing": manifest["missing"]}
+        return {"backend": manifest["backend"], "catalog": _catalog_name(manifest), "verified": True,
+                "files": len(manifest["files"]), "missing": _current_missing(manifest)}
 
 
 def restore_sqlite(archive, target, *, apply=False, writers_stopped=False, confirm=None):
@@ -327,7 +364,8 @@ def restore_sqlite(archive, target, *, apply=False, writers_stopped=False, confi
     with _verified(archive) as (manifest, directory):
         if manifest["backend"] != "sqlite":
             _fail("backend_mismatch")
-        result = {"backend": "sqlite", "dry_run": not apply, "files": len(manifest["files"]), "missing": manifest["missing"]}
+        result = {"backend": "sqlite", "catalog": _catalog_name(manifest), "dry_run": not apply,
+                  "files": len(manifest["files"]), "missing": _current_missing(manifest)}
         if not apply:
             return result
         with tempfile.TemporaryDirectory(prefix="mlw-restore-", dir=target.parent) as temp:
@@ -615,6 +653,8 @@ def restore_mysql(archive, config, *, apply=False, writers_stopped=False, confir
             increments = {}
             expected = {Path(item["path"]).stem: item for item in manifest["files"]}
             if set(tables) != set(expected):
+                if _catalog_name(manifest) != CURRENT_CATALOG:
+                    _fail("mysql_catalog_requires_matching_schema_then_upgrade")
                 _fail("mysql_schema_inventory_mismatch")
             # Empty-table next-key locks prevent concurrent INSERTs under InnoDB RR.
             # Writers must still be stopped (including DDL) throughout restoration.

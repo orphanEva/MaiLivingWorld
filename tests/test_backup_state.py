@@ -60,16 +60,20 @@ class SQLiteBackupTests(unittest.TestCase):
                 target.writestr(key, value)
         return altered
 
-    def test_inventory_ten_databases_44_tables(self):
-        self.assertEqual(len(backup.LEDGERS), 10)
-        self.assertEqual(len(backup.TABLES), 44)
+    def test_inventory_eleven_databases_47_tables_and_frozen_legacy_catalog(self):
+        self.assertEqual(len(backup.LEDGERS), 11)
+        self.assertEqual(len(backup.TABLES), 47)
+        self.assertEqual(len(backup.CATALOGS["v0.14"]), 10)
+        self.assertEqual(sum(map(len, backup.CATALOGS["v0.14"].values())), 44)
+        with self.assertRaises(TypeError):
+            backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
 
     def test_full_offline_restore_drill_preserves_every_table(self):
         self.seed(all_ledgers=True)
         self.archive_now()
-        self.assertEqual(backup.verify_archive(self.archive)["files"], 10)
+        self.assertEqual(backup.verify_archive(self.archive)["files"], 11)
         result = self.restore_now()
-        self.assertEqual(result["files"], 10)
+        self.assertEqual(result["files"], 11)
         for name, tables in backup.LEDGERS.items():
             original, restored = sqlite3.connect(self.source/name), sqlite3.connect(self.target/name)
             try:
@@ -205,12 +209,78 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIn("companion.sqlite3", result["missing"])
         self.assertEqual(backup.verify_archive(self.archive)["missing"], result["missing"])
 
+    def legacy_archive(self, *, explicit=False):
+        self.seed(all_ledgers=True)
+        self.archive_now()
+        def mutation(members):
+            manifest = json.loads(members["manifest.json"])
+            manifest["files"] = [item for item in manifest["files"] if item["path"] != "sqlite/bond.sqlite3"]
+            members.pop("sqlite/bond.sqlite3")
+            if explicit:
+                manifest["catalog"] = "v0.14"
+            else:
+                manifest["format"] = backup.LEGACY_FORMAT
+                manifest.pop("catalog")
+            members["manifest.json"] = json.dumps(manifest).encode()
+        return self.tamper(mutation)
+
+    def test_legacy_v14_ten_ledger_archive_restores_and_reports_unprovided_bond(self):
+        archive = self.legacy_archive()
+        result = backup.verify_archive(archive)
+        self.assertEqual(result["catalog"], "v0.14")
+        self.assertEqual(result["files"], 10)
+        self.assertEqual(result["missing"], ["bond.sqlite3"])
+        preview = backup.restore_sqlite(archive, self.target)
+        self.assertEqual(preview["missing"], ["bond.sqlite3"])
+        self.assertFalse(self.target.exists())
+        result = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual(result["missing"], ["bond.sqlite3"])
+        self.assertFalse((self.target/"bond.sqlite3").exists())
+        self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V14_LEDGERS))
+        with zipfile.ZipFile(archive) as package:
+            self.assertEqual(json.loads(package.read("manifest.json"))["missing"], [])
+
+    def test_explicit_known_v14_catalog_is_supported(self):
+        archive = self.legacy_archive(explicit=True)
+        self.assertEqual(backup.verify_archive(archive)["missing"], ["bond.sqlite3"])
+
+    def test_catalog_version_cannot_hide_missing_files_or_smuggle_new_ledger(self):
+        archive = self.legacy_archive()
+        with zipfile.ZipFile(archive) as package:
+            legacy = json.loads(package.read("manifest.json"))
+        for change in (
+            lambda m: m["files"].pop(),
+            lambda m: m.update(missing=["bond.sqlite3"]),
+            lambda m: m["files"][0].update(path="sqlite/bond.sqlite3"),
+            lambda m: m.update(catalog="v0.15"),
+            lambda m: m["files"][0]["tables"].update(bond_profiles=0),
+        ):
+            candidate = copy.deepcopy(legacy)
+            change(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(backup.BackupError):
+                backup._validate_manifest(candidate)
+
+    def test_new_archive_requires_explicit_known_catalog_and_complete_inventory(self):
+        self.seed()
+        self.archive_now()
+        with zipfile.ZipFile(self.archive) as package:
+            current = json.loads(package.read("manifest.json"))
+        self.assertEqual(current["format"], backup.FORMAT)
+        self.assertEqual(current["catalog"], "v0.15")
+        for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
+                       lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
+            candidate = copy.deepcopy(current)
+            change(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(backup.BackupError):
+                backup._validate_manifest(candidate)
+
     def test_real_store_schema_identity_budget_growth_and_plan_survive_restore(self):
         classes = (("store", "Store", "living_world"), ("brain_core", "BrainBook", "brain_book"),
             ("mind", "MindStore", "mind"), ("cognition", "CognitiveStore", "cognition"),
             ("experience_loop", "ExperienceLoop", "experience_loop"), ("proactive_feedback", "ProactiveFeedback", "proactive_feedback"),
             ("self_state", "SelfState", "self_state"), ("growth_store", "GrowthStore", "growth"),
-            ("tool_store", "ToolStore", "tool_memory"), ("companion_store", "CompanionStore", "companion"))
+            ("tool_store", "ToolStore", "tool_memory"), ("companion_store", "CompanionStore", "companion"),
+            ("bond_store", "BondStore", "bond"))
         for module, name, filename in classes:
             store = getattr(importlib.import_module("MaiLivingWorld."+module), name)(self.source/(filename+".sqlite3"))
             try:
@@ -224,6 +294,17 @@ class SQLiteBackupTests(unittest.TestCase):
                         next_step="第一章", message_id="trusted-real-schema-test", summary_hash="a"*64, now=100)
                     plan = store.command_plan(plan["id"], owner_id="12345678", action="accept", expected_revision=plan["revision"],
                         message_id="trusted-accept", summary_hash="b"*64, now=101)
+                elif module == "bond_store":
+                    message = {"platform": "qq", "session_id": "owner-test-stream", "message_id": "bond-backup-test",
+                        "message_info": {"user_info": {"user_id": "12345678"}, "group_info": None},
+                        "processed_plain_text": "记下这次一起读书的约定"}
+                    moment = store.confirm_moment(message, owner_id="12345678", summary="一起读书的约定", now=101)
+                    store.command(dict(message, message_id="bond-ban", processed_plain_text="不要叫我老板"),
+                        owner_id="12345678", action="ban_address", value="老板", now=102)
+                    old = store.confirm_moment(dict(message, message_id="bond-old", processed_plain_text="记下旧回忆"),
+                        owner_id="12345678", summary="旧回忆", now=103)
+                    retired = store.retire_moment(dict(message, message_id="bond-retire", processed_plain_text="撤回旧回忆"),
+                        owner_id="12345678", moment_id=old["id"], expected_revision=old["revision"], now=104)
             finally:
                 store.close()
         self.archive_now()
@@ -231,7 +312,9 @@ class SQLiteBackupTests(unittest.TestCase):
         from MaiLivingWorld.self_state import SelfState
         from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.companion_store import CompanionStore
-        stores = [SelfState(self.target/"self_state.sqlite3"), GrowthStore(self.target/"growth.sqlite3"), CompanionStore(self.target/"companion.sqlite3")]
+        from MaiLivingWorld.bond_store import BondStore
+        stores = [SelfState(self.target/"self_state.sqlite3"), GrowthStore(self.target/"growth.sqlite3"),
+                  CompanionStore(self.target/"companion.sqlite3"), BondStore(self.target/"bond.sqlite3")]
         try:
             current = stores[0].state()
             self.assertEqual(current["agent_id"], identity["agent_id"])
@@ -239,6 +322,10 @@ class SQLiteBackupTests(unittest.TestCase):
             self.assertEqual(current["thought_count"], 1)
             self.assertEqual(stores[1].state(now=100), growth)
             self.assertEqual(stores[2].plan(plan["id"], owner_id="12345678"), plan)
+            self.assertEqual(stores[3].moments("12345678"), [moment])
+            self.assertEqual(stores[3].moments("12345678", status="retired"), [retired])
+            self.assertEqual(stores[3].profile("12345678")["blocked_addresses"], ["老板"])
+            self.assertEqual(len(stores[3].audit("12345678")), 4)
         finally:
             for store in stores:
                 store.close()
@@ -466,6 +553,33 @@ class MySQLBackupTests(unittest.TestCase):
             with self.subTest(rows=rows), self.assertRaises(backup.BackupError):
                 self.restore(FakeMySQL(rows))
 
+    def test_legacy_mysql_44_tables_require_matching_schema_before_upgrade(self):
+        old_tables = {table: [] for group in backup.V14_LEDGERS.values() for table in group}
+        old_tables.update(copy.deepcopy(self.data))
+        source = FakeMySQL(old_tables)
+        current = Path(self.temp.name)/"old-schema.zip"
+        legacy = Path(self.temp.name)/"legacy-v14.zip"
+        backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: source)
+        with zipfile.ZipFile(current) as origin, zipfile.ZipFile(legacy, "w") as destination:
+            for info in origin.infolist():
+                data = origin.read(info)
+                if info.filename == "manifest.json":
+                    manifest = json.loads(data)
+                    manifest["format"] = backup.LEGACY_FORMAT
+                    manifest.pop("catalog")
+                    data = json.dumps(manifest).encode()
+                destination.writestr(info, data)
+        self.assertEqual(backup.verify_archive(legacy)["files"], 44)
+        new_target = FakeMySQL({table: [] for table in backup.TABLES})
+        with self.assertRaisesRegex(backup.BackupError, "^mysql_catalog_requires_matching_schema_then_upgrade$"):
+            backup.restore_mysql(legacy, self.config, apply=True, writers_stopped=True,
+                confirm=backup.CONFIRM, connect=lambda _: new_target)
+        self.assertFalse(any(sql.startswith(("INSERT", "ALTER")) for sql, _ in new_target.operations))
+        old_target = FakeMySQL({table: [] for table in old_tables})
+        backup.restore_mysql(legacy, self.config, apply=True, writers_stopped=True,
+            confirm=backup.CONFIRM, connect=lambda _: old_target)
+        self.assertEqual(old_target.rows, old_tables)
+
     def test_mysql_value_codec_is_exact_and_rejects_nonfinite(self):
         values = [None, True, 7, "中文", 1.25, b"\x00\xff", Decimal("1.2300"), datetime(2026, 1, 2, 3, 4), date(2026, 1, 2), time(3, 4), timedelta(days=-1, microseconds=17)]
         for value in values:
@@ -486,7 +600,7 @@ class MySQLBackupTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1" and os.getenv("MLW_BACKUP_MYSQL_DATABASE", "").startswith("mlw_backup_test"),
                      "Only with an explicitly configured empty dedicated MySQL CI database")
 class BackupMySQLLiveTests(unittest.TestCase):
-    def test_real_44_table_archive_empty_restore_and_counter_high_water(self):
+    def test_real_47_table_archive_empty_restore_and_counter_high_water(self):
         import pymysql
         from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
         from MaiLivingWorld.self_state import SelfState
@@ -517,7 +631,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         deleted_id = cursor.lastrowid
                         cursor.execute("DELETE FROM backup_attempts WHERE id=%s", (deleted_id,))
                     result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
-                    self.assertEqual(result["tables"], 44)
+                    self.assertEqual(result["tables"], 47)
                     self.assertTrue(backup.verify_archive(archive)["verified"])
                     with self.assertRaisesRegex(backup.BackupError, "target_not_empty"):
                         backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
@@ -527,7 +641,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                             cursor.execute("DROP TABLE `backup_"+table+"`")
                     ensure_schema(settings, directory)
                     restored = backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
-                    self.assertEqual(restored["tables"], 44)
+                    self.assertEqual(restored["tables"], 47)
                     state = SelfState(directory/"unused.sqlite3", mysql_settings=settings)
                     try:
                         self.assertEqual(state.state()["agent_id"], identity["agent_id"])

@@ -42,6 +42,7 @@ from .mcp_client import StdioMCPClient, MCPError
 from .mcp_runtime import MCPBridge, outward_result, day_start as tool_day_start, digest as tool_digest
 from .mcp_policy import CATALOG
 from .companion_runtime import CompanionRuntime
+from .bond_runtime import BondRuntime
 
 
 class PluginSection(PluginConfigBase):
@@ -49,7 +50,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.14.0",
+        default="0.15.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -93,7 +94,7 @@ class Owner(PluginConfigBase):
     recognize_in_private: bool = Field(default=True, description="在与主人 QQ 的私聊中识别其身份")
     add_to_private_targets: bool = Field(default=False, description="可选：将主人加入主动私聊白名单；默认不自动联系主人")
     relationship_enabled: bool = Field(default=True, description="主人专属关系风格；关闭后仍识别主人，但不添加亲疏表达指引")
-    relationship_mode: Literal["banter", "gentle", "tsundere", "custom"] = Field(default="banter", description="风格预设：banter=损友亲近、gentle=温柔偏心、tsundere=嘴硬心软、custom=完全自定义")
+    relationship_mode: Literal["banter", "gentle", "tsundere", "partner", "custom"] = Field(default="banter", description="风格预设：banter=损友亲近、gentle=温柔偏心、tsundere=嘴硬心软、partner=长期伴侣、custom=完全自定义")
     private_template: str = Field(default="", description="私聊专属风格模板；留空使用所选预设。建议写相处方式而不是固定台词")
     group_template: str = Field(default="", description="群聊专属风格模板；留空使用所选预设。请勿填入私聊秘密")
 
@@ -277,6 +278,12 @@ class Storage(PluginConfigBase):
     sql_debug: bool = Field(default=False, description="打印 MyBatis 风格 SQL 模板、脱敏参数类型和耗时；默认关闭")
 
 
+class Bond(PluginConfigBase):
+    __ui_label__ = "20 / 长期伴侣与相处约定"
+    enabled: bool = Field(default=False, description="记住主人亲自确认的称呼、亲昵边界、回忆和纪念日；需统一心智active；不因沉默降低关系")
+    daily_rhythm: bool = Field(default=True, description="按真实当地时间调整日常语气；不推断用户起居，不增加主动消息")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -296,6 +303,7 @@ class Config(PluginConfigBase):
     mcp_pixiv: MCPPixiv = Field(default_factory=MCPPixiv)
     reading: Reading = Field(default_factory=Reading)
     shared_plans: SharedPlans = Field(default_factory=SharedPlans)
+    bond: Bond = Field(default_factory=Bond)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -348,6 +356,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._mcp_generation = 0
         self._mcp_calls: set[asyncio.Task] = set()
         self._companion: CompanionRuntime | None = None
+        self._bond: BondRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -395,7 +404,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.14.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.15.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -539,6 +548,16 @@ class MaiLivingWorld(MaiBotPlugin):
                 private = list(dict.fromkeys(private + [normalize_qq(self.config.owner.qq)]))
             runtime.capture(message, private_users=private,
                             group_ids=_clean_ids(self.config.brain_memory.group_ids))
+            bond = self._ensure_bond()
+            if bond:
+                try:
+                    if bond.capture(message):
+                        # A new boundary/retracted memory invalidates in-flight reflection.
+                        runtime.reset()
+                        runtime.capture(message, private_users=private,
+                                        group_ids=_clean_ids(self.config.brain_memory.group_ids))
+                except (ValueError, TypeError):
+                    self.ctx.logger.info("[MaiLivingWorld][BOND] 相处指令无效或版本已变化，保留原状态")
             if self.config.shared_plans.enabled:
                 await self._ensure_companion().capture_plan_command(message)
         return {"action": "continue"}
@@ -658,11 +677,15 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _relation_for(self, kind: str) -> str:
         cfg = self.config.owner
-        if not self.config.plugin.enabled or not cfg.enabled or not cfg.relationship_enabled or not normalize_qq(cfg.qq):
+        if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
             return ""
-        return relationship_note(
+        hint = relationship_note(
             cfg.relationship_mode, kind, cfg.private_template, cfg.group_template
-        )
+        ) if cfg.relationship_enabled else ""
+        bond = self._ensure_bond() if kind == "private" else None
+        if bond:
+            hint += "\n\n" + bond.style()
+        return hint
 
     def _owner_prompt_for(self, kwargs: dict[str, Any]) -> str:
         cfg = self.config.owner
@@ -680,7 +703,8 @@ class MaiLivingWorld(MaiBotPlugin):
             if group_hit is not None:
                 when, verified, configured_qq = group_hit
                 if verified and configured_qq == normalize_qq(cfg.qq) and time.monotonic() - when <= 90:
-                    return owner_hint(cfg.title, "group", self._relation_for("group"))
+                    # Do not disclose or contradict private address preferences in a group.
+                    return owner_hint(None if self._ensure_bond() else cfg.title, "group", self._relation_for("group"))
                 return ""
         # 群聊没有匹配的目标消息 ID 时，不能回退到“最近一个群发言者”。
         hit = self._owner_events.get(sid)
@@ -688,7 +712,8 @@ class MaiLivingWorld(MaiBotPlugin):
             return ""
         if hit[3] != normalize_qq(cfg.qq) or time.monotonic() - hit[0] > 90:
             return ""
-        hint = owner_hint(cfg.title, "private", self._relation_for("private"))
+        bond = self._ensure_bond()
+        hint = owner_hint(bond.address() if bond else cfg.title, "private", self._relation_for("private"))
         if self.config.mind.enabled and self._mind and not self._unified_active():
             note = self._mind.private_hint(normalize_qq(cfg.qq), mode=self.config.mind.mode)
             if note:
@@ -813,6 +838,9 @@ class MaiLivingWorld(MaiBotPlugin):
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
         await self._close_mcp()
+        if self._bond:
+            self._bond.close()
+            self._bond = None
         if self._companion:
             self._companion.close()
             self._companion = None
@@ -944,11 +972,21 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _collect_roots(self, query: str = "") -> list[dict[str, Any]]:
         cfg = self.config.unified_mind
-        return collect_memories(**self._memory_sources(), owner_id=normalize_qq(self.config.owner.qq),
-                                query=query, limit=cfg.recall_limit, scan_limit=cfg.candidate_limit)
+        roots = collect_memories(**self._memory_sources(), owner_id=normalize_qq(self.config.owner.qq),
+                                 query=query, limit=cfg.recall_limit, scan_limit=cfg.candidate_limit)
+        bond = self._ensure_bond()
+        moments = bond.recall(query, limit=min(4, cfg.recall_limit)) if bond else []
+        return (moments + roots)[:cfg.recall_limit]
 
     def _resolve_roots(self, ids) -> dict[str, dict]:
-        return resolve_memories(ids, **self._memory_sources())
+        if not isinstance(ids, (list, tuple)) or len(ids) > 128 or any(not isinstance(i, str) for i in ids):
+            raise ValueError("invalid memory ids")
+        bond_ids = [i for i in ids if i.startswith("bond:moment:")]
+        roots = resolve_memories([i for i in ids if i not in bond_ids], **self._memory_sources())
+        bond = self._ensure_bond()
+        if bond and bond_ids:
+            roots.update(bond.resolve(bond_ids))
+        return roots
 
     def _growth_snapshot(self) -> dict:
         state = self._growth.state()
@@ -1002,6 +1040,9 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _growth_candidates(self) -> list[dict]:
         recent = self._collect_roots()
+        bond = self._ensure_bond()
+        if bond:
+            recent = list({item["id"]: item for item in bond.learning_candidates() + recent}.values())[:12]
         state = self._growth_snapshot()
         questions = [item for item in state["questions"] if item.get("status") == "open"]
         if not questions:
@@ -1031,6 +1072,21 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._mcp_bridge is None:
             self._mcp_bridge = MCPBridge(self._tool_store)
         return self._tool_store
+
+    def _ensure_bond(self):
+        if not (self.config.bond.enabled and self._unified_active() and self._ensure_unified()):
+            return None
+        if self._bond is None:
+            self._bond = BondRuntime(self)
+        return self._bond
+
+    @Tool("living_world_relationship", description="仅在可信主人私聊读取相处偏好、边界及主人亲自留下的回忆/纪念日。不能代主人写入或改变身份，不能把自述当作已核实的共同经历", parameters={
+        "query": {"type": "string", "default": ""}, "offset": {"type": "integer", "default": 0},
+        "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 20}})
+    async def relationship(self, query: str = "", offset: int = 0, limit: int = 20, **kwargs):
+        bond = self._ensure_bond()
+        return outward_result(bond.inspect(kwargs, query=query, offset=offset, limit=limit) if bond else
+                              {"success": False, "code": "bond_disabled"})
 
     def _ensure_companion(self):
         if not self._ensure_unified():
@@ -1082,6 +1138,7 @@ class MaiLivingWorld(MaiBotPlugin):
         today = tool_day_start(self.config.general.timezone)
         runtime = self._ensure_companion()
         reading_budget = runtime.store.status()["reading_budget"]
+        bond = self._ensure_bond()
         return build_dashboard(identity=identity, growth=growth, resolved_sources=resolved,
             fingerprint=source_fingerprint, authorized=True, budgets={
                 "model": {"used": identity["thought_count"] if identity["budget_day"] == today else 0,
@@ -1093,7 +1150,9 @@ class MaiLivingWorld(MaiBotPlugin):
                 "reading": {"used": reading_budget["daily_count"] if reading_budget["budget_day"] == today else 0,
                             "limit": self.config.reading.max_daily_units}},
             companion={"plans": runtime.store.plans(owner_id=identity["owner_id"]),
-                       "reading": runtime.store.readings(owner_id=identity["owner_id"])})
+                       "reading": runtime.store.readings(owner_id=identity["owner_id"])},
+            bond={"profile": bond.store.profile(identity["owner_id"]),
+                  "moments": bond.store.moments(identity["owner_id"], limit=200)} if bond else None)
 
     async def _close_mcp(self):
         self._mcp_generation += 1
@@ -1912,8 +1971,11 @@ class MaiLivingWorld(MaiBotPlugin):
         cfg=self.config.audience
         unified_active = self._unified_active()
         def proactive_signature():
-            return tool_digest({name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans")})
+            config = {name: getattr(self.config, name).model_dump() for name in
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond")}
+            bond = self._ensure_bond()
+            config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
+            return tool_digest(config)
         signature = proactive_signature()
         assert self._store is not None
         target=f"qq:{kind}:{ident}"

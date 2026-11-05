@@ -37,6 +37,7 @@ from MaiLivingWorld.self_state import SelfState
 from MaiLivingWorld.growth_store import GrowthStore
 from MaiLivingWorld.tool_store import ToolStore
 from MaiLivingWorld.companion_store import CompanionStore
+from MaiLivingWorld.bond_store import BondStore
 
 
 LEDGERS = {
@@ -50,9 +51,10 @@ LEDGERS = {
     "growth.sqlite3": tuple(t for t in TABLES if t.startswith("growth_")),
     "tool_memory.sqlite3": tuple(t for t in TABLES if t.startswith("tool_")),
     "companion.sqlite3": tuple(t for t in TABLES if t.startswith("companion_")),
+    "bond.sqlite3": tuple(t for t in TABLES if t.startswith("bond_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
-OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3"})
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -98,7 +100,7 @@ def ensure_schema(config: dict, workdir: Path) -> None:
     for name,cls in (("brain_book",BrainBook),("mind",MindStore),
                      ("cognition",CognitiveStore),("experience_loop",ExperienceLoop),
                      ("proactive_feedback",ProactiveFeedback),("self_state",SelfState),
-                     ("growth",GrowthStore),("tool_memory",ToolStore),("companion",CompanionStore)):
+                     ("growth",GrowthStore),("tool_memory",ToolStore),("companion",CompanionStore),("bond",BondStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 

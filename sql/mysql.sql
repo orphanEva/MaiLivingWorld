@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十套数据共 44 表（含持续自我、成长、工具与陪伴记忆）
+-- MaiLivingWorld MySQL 8.4 十一套数据共 47 表（含持续自我、成长、工具、陪伴与相处约定）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -434,3 +434,36 @@ CREATE TABLE IF NOT EXISTS `mlw_companion_audit` (
     created DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒',
     KEY `idx_companion_audit_entity` (entity_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人计划命令的幂等和变更审计，不保存原始消息正文';
+
+CREATE TABLE IF NOT EXISTS `mlw_bond_profiles` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '相处约定所属的可信主人标识，不随主人配置变更迁移',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '主人约定修改的乐观锁版本，不表示好感或关系等级',
+    payload LONGTEXT NOT NULL COMMENT '主人明确设置的称呼亲昵表达偏好与相处边界JSON',
+    created DOUBLE NOT NULL COMMENT '首次明确设置约定的时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近约定变更时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='可信主人明确设置的相处约定与节奏，不生成亲密度分数';
+
+CREATE TABLE IF NOT EXISTS `mlw_bond_moments` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信主人命令生成的稳定纪念日或回忆ID',
+    owner_id VARCHAR(191) NOT NULL COMMENT '该条回忆或纪念日原主人标识，禁止自动迁移给新主人',
+    scope VARCHAR(191) NOT NULL COMMENT '首次记录场合，供来源追溯和表达判断',
+    kind VARCHAR(191) NOT NULL COMMENT '明确记录的纪念日或共同回忆类型',
+    status VARCHAR(191) NOT NULL COMMENT '当前记录状态，不由模型生成内容自行认定为真实经历',
+    revision BIGINT NOT NULL COMMENT '主人命令修改记录的乐观锁版本',
+    payload LONGTEXT NOT NULL COMMENT '主人确认的标题内容日期和来源摘要JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次明确记下该事项的时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近内容或状态变化时间，Unix秒',
+    KEY `idx_bond_moments_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人通过明确命令留下的纪念日和共同回忆，模型提议不等于已发生';
+
+CREATE TABLE IF NOT EXISTS `mlw_bond_audit` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信主人场合消息与命令生成的幂等审计ID',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际命令所属可信主人标识',
+    entity_id VARCHAR(191) NOT NULL COMMENT '关联相处约定或纪念事项的标识',
+    action VARCHAR(191) NOT NULL COMMENT '实际执行的约定修改记录或撤回操作',
+    message_digest VARCHAR(191) NOT NULL COMMENT '可信消息与场合的SHA256摘要',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原命令正文的SHA256摘要，不保存命令原文',
+    payload LONGTEXT NOT NULL COMMENT '命令签名及修改前后结构化状态JSON',
+    created DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒',
+    KEY `idx_bond_audit_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='相处约定与纪念事项的幂等和修改审计，保留原主人归属';
