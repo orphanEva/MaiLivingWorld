@@ -253,6 +253,7 @@ def _validate_manifest(manifest):
                 _fail("invalid_mysql_metadata")
             if item["auto_increment"] is not None and (type(item["auto_increment"]) is not int or not 1 <= item["auto_increment"] <= 2**64-1):
                 _fail("invalid_mysql_metadata")
+            _check_increment(item["schema"], item["auto_increment"])
     if total > MAX_TOTAL:
         _fail("backup_too_large")
     if manifest["backend"] == "sqlite":
@@ -467,6 +468,11 @@ def _connect(config):
 
 
 def _inventory(cursor, prefix):
+    # MySQL 8 caches SHOW TABLE STATUS statistics (including Auto_increment).
+    # A newly opened table or ALTER AUTO_INCREMENT can otherwise produce stale
+    # NULL/old counters. Read the engine on every inventory, without ANALYZE or
+    # any persistent source mutation; deleted-row high-water marks must survive.
+    cursor.execute("SET SESSION information_schema_stats_expiry = 0")
     cursor.execute("SHOW TRIGGERS")
     if cursor.fetchone() is not None:
         _fail("mysql_triggers_not_supported")
@@ -490,6 +496,14 @@ def _inventory(cursor, prefix):
 def _schema(cursor, name):
     cursor.execute("SHOW FULL COLUMNS FROM "+_ident(name))
     return _validate_schema([{key: row.get(key) if row.get(key) is None else str(row[key]) for key in SCHEMA_KEYS} for row in cursor.fetchall()])
+
+
+def _check_increment(schema, value):
+    auto_columns = [item for item in schema if "auto_increment" in (item["Extra"] or "").lower().split()]
+    # NULL means no AUTO_INCREMENT column, never an implicit starting value.
+    # Fail closed if the engine cannot supply a real counter for such a column.
+    if len(auto_columns) > 1 or bool(auto_columns) != (value is not None):
+        _fail("mysql_auto_increment_mismatch")
 
 
 def _definition(cursor, name, prefix):
@@ -548,6 +562,7 @@ def backup_mysql(config, archive, *, apply=False, writers_stopped=False, connect
                 if table not in tables:
                     continue
                 schema = _schema(cursor, tables[table])
+                _check_increment(schema, increments[table])
                 definition = _definition(cursor, tables[table], config["prefix"])
                 _select(cursor, tables[table], schema)
                 path = directory/"mysql"/(table+".jsonl")
@@ -593,6 +608,7 @@ def restore_mysql(archive, config, *, apply=False, writers_stopped=False, confir
                 item = expected[table]
                 if _schema(cursor, tables[table]) != item["schema"]:
                     _fail("mysql_schema_mismatch")
+                _check_increment(item["schema"], increments[table])
                 if _definition(cursor, tables[table], config["prefix"]) != item["definition"]:
                     _fail("mysql_definition_mismatch")
                 if (item["auto_increment"] is None) != (increments[table] is None):

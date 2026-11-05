@@ -255,6 +255,8 @@ class FakeMySQL:
         self.rows = copy.deepcopy(rows if rows is not None else {"self_identity": [], "companion_plans": []})
         self.schemas = {table: schema() for table in self.rows}
         self.increments = {table: 900 for table in self.rows}
+        self.cached_increments = dict(self.increments)
+        self.stats_expiry = 86400
         self.operations, self.result = [], []
         self.closed = self.committed = False
         self.before = copy.deepcopy(self.rows)
@@ -269,8 +271,11 @@ class FakeMySQL:
         self.result = []
         if sql.startswith("START TRANSACTION"):
             self.before = copy.deepcopy(self.rows)
+        elif sql == "SET SESSION information_schema_stats_expiry = 0":
+            self.stats_expiry = 0
         elif sql == "SHOW TABLE STATUS":
-            self.result = [{"Name": self.prefix+table, "Engine": "InnoDB", "Auto_increment": self.increments[table]} for table in self.rows]
+            counters = self.increments if self.stats_expiry == 0 else self.cached_increments
+            self.result = [{"Name": self.prefix+table, "Engine": "InnoDB", "Auto_increment": counters[table]} for table in self.rows]
         elif sql.startswith("SHOW FULL COLUMNS"):
             table = re.findall(r"`([^`]+)`", sql)[0][len(self.prefix):]
             self.result = copy.deepcopy(self.schemas[table])
@@ -355,6 +360,56 @@ class MySQLBackupTests(unittest.TestCase):
         self.assertEqual(target.rows, before)
         self.assertFalse(any(sql.startswith(("INSERT", "ALTER")) for sql, _ in target.operations))
 
+    def test_stale_null_or_low_counter_cache_never_changes_archive_or_restore(self):
+        for stale in (None, 1):
+            with self.subTest(stale=stale):
+                archive = Path(self.temp.name)/("stale-"+str(stale)+".zip")
+                source = FakeMySQL(self.data)
+                source.cached_increments = {key: stale for key in source.rows}
+                backup.backup_mysql(self.config, archive, apply=True, writers_stopped=True, connect=lambda _: source)
+                with zipfile.ZipFile(archive) as package:
+                    manifest = json.loads(package.read("manifest.json"))
+                self.assertEqual({item["auto_increment"] for item in manifest["files"]}, {900})
+                statements = [sql for sql, _ in source.operations]
+                self.assertLess(statements.index("SET SESSION information_schema_stats_expiry = 0"), statements.index("SHOW TABLE STATUS"))
+                # The same nonempty source must be refused for its rows, without
+                # reporting a fake schema change caused by cached NULL -> 1.
+                with self.assertRaisesRegex(backup.BackupError, "^target_not_empty$"):
+                    backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+                        confirm=backup.CONFIRM, connect=lambda _: source)
+                target = FakeMySQL()
+                target.increments = {key: 1 for key in target.rows}
+                target.cached_increments = {key: None for key in target.rows}
+                backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+                    confirm=backup.CONFIRM, connect=lambda _: target)
+                self.assertEqual(target.rows, self.data)
+                self.assertEqual(set(target.increments.values()), {900})
+
+    def test_missing_live_counter_is_rejected_not_coerced_to_one(self):
+        source = FakeMySQL(self.data)
+        source.increments["self_identity"] = None
+        archive = Path(self.temp.name)/"unreliable.zip"
+        with self.assertRaisesRegex(backup.BackupError, "^mysql_auto_increment_mismatch$"):
+            backup.backup_mysql(self.config, archive, apply=True, writers_stopped=True, connect=lambda _: source)
+        self.assertFalse(archive.exists())
+
+    def test_non_auto_increment_tables_keep_null_counter(self):
+        source = FakeMySQL(self.data)
+        for name in source.rows:
+            source.increments[name] = None
+            source.schemas[name][0]["Extra"] = ""
+        archive = Path(self.temp.name)/"no-increments.zip"
+        backup.backup_mysql(self.config, archive, apply=True, writers_stopped=True, connect=lambda _: source)
+        self.assertTrue(backup.verify_archive(archive)["verified"])
+        target = FakeMySQL()
+        for name in target.rows:
+            target.increments[name] = None
+            target.schemas[name][0]["Extra"] = ""
+        backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+            confirm=backup.CONFIRM, connect=lambda _: target)
+        self.assertEqual(target.rows, self.data)
+        self.assertFalse(any(sql.startswith("ALTER TABLE") for sql, _ in target.operations))
+
     def test_schema_and_indexes_must_match(self):
         for changed in ("column", "index"):
             target = FakeMySQL()
@@ -432,6 +487,9 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         state.close()
                     with connection.cursor() as cursor:
                         cursor.execute("ALTER TABLE backup_attempts AUTO_INCREMENT = 900")
+                        cursor.execute("INSERT INTO backup_attempts(target,created_at,kind) VALUES ('private:test',100,'test')")
+                        deleted_id = cursor.lastrowid
+                        cursor.execute("DELETE FROM backup_attempts WHERE id=%s", (deleted_id,))
                     result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
                     self.assertEqual(result["tables"], 44)
                     self.assertTrue(backup.verify_archive(archive)["verified"])
@@ -452,7 +510,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         state.close()
                     with connection.cursor() as cursor:
                         cursor.execute("INSERT INTO backup_attempts(target,created_at,kind) VALUES ('private:test',101,'test')")
-                        self.assertGreaterEqual(cursor.lastrowid, 900)
+                        self.assertGreater(cursor.lastrowid, deleted_id)
                 finally:
                     if created:
                         with connection.cursor() as cursor:
