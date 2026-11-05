@@ -594,3 +594,54 @@ ALTER TABLE `mlw_attention_events`
   MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际已发生的控制变更或批次结果',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界结构化活动结果JSON，不保存隐藏推理或聊天正文',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '事件提交时间，Unix秒';
+
+ALTER TABLE `mlw_recollection_control`
+  COMMENT = '主人回忆修正的持久租约与提取预算，不覆盖原始事实',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '回忆修正控制状态的乐观锁版本',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '提取预算所属日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的回忆修正提取批次',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留提取批次的时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次的独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '提取租约失效时间，Unix秒',
+  MODIFY COLUMN `lease_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次的输入标识',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次控制状态建立时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒';
+
+ALTER TABLE `mlw_recollection_inputs`
+  COMMENT = '主人原话与发送回执相关的有界回忆修正输入队列',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信场合消息与输入类型的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '输入所属可信主人标识',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '原话反馈或其他可信输入的类型',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重复和变更核验',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '输入等待运行完成过期或撤回状态',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前处理租约令牌',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许处理时间，Unix秒',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '未处理输入的到期时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界输入及可信引用JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_recollection_revisions`
+  COMMENT = '带可信输入和原来源版本的回忆修正建议，不改写原始证据',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '回忆修正记录的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '修正记录原主人标识，不转移给新主人',
+  MODIFY COLUMN `target_id` VARCHAR(191) NOT NULL COMMENT '被补充或修正的原始来源标识',
+  MODIFY COLUMN `target_digest` VARCHAR(191) NOT NULL COMMENT '原始来源版本摘要，失配后不继续应用',
+  MODIFY COLUMN `input_id` VARCHAR(191) NOT NULL COMMENT '本次修正的可信输入标识',
+  MODIFY COLUMN `relation` VARCHAR(191) NOT NULL COMMENT '补充澄清纠正或反馈关系类型',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '修正记录当前审核及有效状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '记录变更版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界修正内容与证据引用JSON，不作为自证事实',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次记录修正的时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近修正内容或状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_recollection_deliveries`
+  COMMENT = '真实发送成功回执与来源引用，尝试和生成不等于已经说过',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '真实发送回执的稳定幂等标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '成功回执对应的可信主人标识',
+  MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '经核验的实际发送场合',
+  MODIFY COLUMN `text_digest` VARCHAR(191) NOT NULL COMMENT '已发送文本SHA256摘要',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界回执信息与使用来源引用JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '确认成功发送的时间，Unix秒';

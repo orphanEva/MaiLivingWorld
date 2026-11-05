@@ -45,6 +45,8 @@ from .companion_runtime import CompanionRuntime
 from .bond_runtime import BondRuntime
 from .continuity_runtime import ContinuityRuntime
 from .attention_runtime import AttentionRuntime
+from .recollection_runtime import RecollectionRuntime
+from .recall_query import expand_query, rank_records
 
 
 class PluginSection(PluginConfigBase):
@@ -52,7 +54,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.17.0",
+        default="0.18.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -198,6 +200,7 @@ class UnifiedMind(PluginConfigBase):
     candidate_limit: int = Field(default=200, ge=12, le=1000, description="统一检索最多取回的候选行数，不等于数据库物理扫描行数")
     min_interval_seconds: int = Field(default=30, ge=0, le=3600, description="新的内部联想最短间隔；同轮通用知识复核独立计费但不受此间隔限制")
     max_daily_model_calls: int = Field(default=60, ge=0, le=1000, description="每日统一联想、表达复核、成长提案和成长复核共用模型调用上限；失败计数，重启不重置")
+    reserved_reply_calls: int = Field(default=12, ge=0, le=1000, description="共享总额度中为前台内部理解与表达判断预留的调用数；后台仅可使用总额减预留部分，不另增加额度；不控制宿主最终回复模型")
     model_timeout_seconds: int = Field(default=8, ge=2, le=30, description="单次内部模型请求超时秒数；每轮最多联想和复核两次，超时不传递私人原文")
 
 
@@ -304,6 +307,15 @@ class Attention(PluginConfigBase):
     max_daily_actions: int = Field(default=12, ge=0, le=100, description="统一后台行动每天最多尝试次数，仍遵守原工具和阅读预算")
 
 
+class Recollection(PluginConfigBase):
+    __ui_label__ = "23 / 长期更正与少重复追问"
+    enabled: bool = Field(default=False, description="原话更正、相关词检索与主人私聊追问回执；需统一心智active，不修改原始账本")
+    auto_correct: bool = Field(default=True, description="仅可信主人私聊明确纠正自身记录时，经两阶段模型核对保存更正；不按昵称或聊天自称修改主人")
+    interval_seconds: int = Field(default=300, ge=30, le=86400, description="后台更正批次最短间隔秒数，重启保留；每批至多两次模型调用")
+    max_daily_batches: int = Field(default=6, ge=0, le=30, description="每天最多更正批次数，失败也计数；另外遵守共享模型总额与前台预留")
+    repeat_cooldown_hours: int = Field(default=24, ge=1, le=720, description="真实发送过的同一版本近况问题，在此期间提示减少重复追问；新证据会使旧回执失效")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -326,6 +338,7 @@ class Config(PluginConfigBase):
     bond: Bond = Field(default_factory=Bond)
     continuity: Continuity = Field(default_factory=Continuity)
     attention: Attention = Field(default_factory=Attention)
+    recollection: Recollection = Field(default_factory=Recollection)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -381,6 +394,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._bond: BondRuntime | None = None
         self._continuity: ContinuityRuntime | None = None
         self._attention: AttentionRuntime | None = None
+        self._recollection: RecollectionRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -448,6 +462,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._continuity.reset()
         if self._attention:
             self._attention.reset()
+        if self._recollection:
+            self._recollection.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -608,6 +624,19 @@ class MaiLivingWorld(MaiBotPlugin):
                     job.add_done_callback(self._memory_jobs.discard)
             except (ValueError, TypeError):
                 self.ctx.logger.info("[MaiLivingWorld][CONTINUITY] 指令或近况输入未通过校验，保留原状态")
+        recollection = self._ensure_recollection()
+        if recollection:
+            try:
+                changed, queued = recollection.capture(message)
+                if changed and runtime:
+                    runtime.reset()
+                    runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
+                if queued:
+                    job = asyncio.create_task(self._process_recollection())
+                    self._memory_jobs.add(job)
+                    job.add_done_callback(self._memory_jobs.discard)
+            except (ValueError, TypeError):
+                self.ctx.logger.info("[MaiLivingWorld][RECOLLECTION] 更正输入未通过核验，保留原记录")
         return {"action": "continue"}
 
     @HookHandler(
@@ -723,6 +752,22 @@ class MaiLivingWorld(MaiBotPlugin):
         self._pending_proactive.pop(sid, None)
         return {"action": "continue"}
 
+    @HookHandler(
+        "send_service.after_send", name="living_world_question_receipt",
+        description="只依据成功发送给主人的问题回执记录话题指纹，不保存出站正文",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def question_send_feedback(self, **kwargs):
+        runtime = self._ensure_recollection()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][RECOLLECTION] 回执未完成核验，未记录为已问")
+        return {"action": "continue"}
+
     def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
@@ -833,8 +878,12 @@ class MaiLivingWorld(MaiBotPlugin):
                     before = runtime.context(kwargs)
                     if attention:
                         await attention.prepare_dialogue(kwargs)
+                    recollection = self._ensure_recollection()
+                    def recall(query):
+                        records = self._collect_unified(query)
+                        return recollection.with_questions(records) if recollection and recollection.trusted(kwargs) else records
                     prompt = await runtime.reply_hint(
-                        kwargs, self.config.unified_mind, recall=self._collect_unified,
+                        kwargs, self.config.unified_mind, recall=recall,
                         generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                         timezone=self.config.general.timezone,
                     )
@@ -843,6 +892,9 @@ class MaiLivingWorld(MaiBotPlugin):
                             prompt = ""
                         else:
                             prompt += "\n\n" + attention.hint(kwargs)
+                    recollection = self._ensure_recollection()
+                    if recollection and runtime.context(kwargs) == before:
+                        prompt += "\n\n" + recollection.repeat_hint(kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -911,6 +963,9 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._attention:
             self._attention.close()
             self._attention = None
+        if self._recollection:
+            self._recollection.close()
+            self._recollection = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -1034,7 +1089,7 @@ class MaiLivingWorld(MaiBotPlugin):
             self._unified = UnifiedRuntime(self._self_state, profile=self._growth_style_hint)
         elif previous != owner:
             self._unified.reset()
-        self._unified.latest_private_only = bool(self.config.attention.enabled and self._unified_active())
+        self._unified.latest_private_only = bool((self.config.attention.enabled or self.config.recollection.enabled) and self._unified_active())
         return self._unified
 
     def _memory_sources(self) -> dict[str, Any]:
@@ -1044,17 +1099,32 @@ class MaiLivingWorld(MaiBotPlugin):
         return dict(brain=brain, mind=mind, cognition=cognition, stories=self._store,
                     tools=self._ensure_tool_store())
 
-    def _collect_roots(self, query: str = "") -> list[dict[str, Any]]:
+    def _collect_roots_raw(self, query: str = "", *, limit=None) -> list[dict[str, Any]]:
         cfg = self.config.unified_mind
+        limit = cfg.recall_limit if limit is None else min(48, max(1, limit))
+        if self.config.recollection.enabled and self._unified_active():
+            query = expand_query(query)
         roots = collect_memories(**self._memory_sources(), owner_id=normalize_qq(self.config.owner.qq),
-                                 query=query, limit=cfg.recall_limit, scan_limit=cfg.candidate_limit)
+                                 query=query, limit=limit, scan_limit=cfg.candidate_limit)
         bond = self._ensure_bond()
-        moments = bond.recall(query, limit=min(4, cfg.recall_limit)) if bond else []
+        moments = bond.recall(query, limit=min(4, limit)) if bond else []
         continuity = self._ensure_continuity()
         threads = continuity.recall(query) if continuity else []
-        return (threads + moments + roots)[:cfg.recall_limit]
+        return (threads + moments + roots)[:limit]
 
-    def _resolve_roots(self, ids) -> dict[str, dict]:
+    def _collect_roots(self, query: str = "") -> list[dict[str, Any]]:
+        recollection = self._ensure_recollection()
+        if not recollection:
+            return self._collect_roots_raw(query)
+        records = self._collect_roots_raw(query, limit=min(48, self.config.unified_mind.recall_limit*2))
+        # New wording can retrieve a correction even when the original used other words.
+        ids = list(dict.fromkeys(row["target_id"] for row in recollection.active()))
+        unique = {row["id"]: row for row in records}
+        unique.update(self._resolve_roots_raw(ids))
+        records = recollection.overlay(list(unique.values()))
+        return rank_records(records, query, now=time.time(), timezone=self.config.general.timezone)[:self.config.unified_mind.recall_limit]
+
+    def _resolve_roots_raw(self, ids) -> dict[str, dict]:
         if not isinstance(ids, (list, tuple)) or len(ids) > 128 or any(not isinstance(i, str) for i in ids):
             raise ValueError("invalid memory ids")
         bond_ids = [i for i in ids if i.startswith("bond:moment:")]
@@ -1067,6 +1137,11 @@ class MaiLivingWorld(MaiBotPlugin):
         if continuity and thread_ids:
             roots.update(continuity.resolve(thread_ids))
         return roots
+
+    def _resolve_roots(self, ids) -> dict[str, dict]:
+        roots = self._resolve_roots_raw(ids)
+        recollection = self._ensure_recollection()
+        return {row["id"]: row for row in recollection.overlay(list(roots.values()))} if recollection else roots
 
     def _growth_snapshot(self) -> dict:
         state = self._growth.state()
@@ -1126,6 +1201,9 @@ class MaiLivingWorld(MaiBotPlugin):
         continuity = self._ensure_continuity()
         if continuity:
             recent = list({item["id"]: item for item in continuity.learning_candidates() + recent}.values())[:12]
+        recollection = self._ensure_recollection()
+        if recollection:
+            recent = recollection.overlay(recent)
         state = self._growth_snapshot()
         questions = [item for item in state["questions"] if item.get("status") == "open"]
         if not questions:
@@ -1155,6 +1233,30 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._mcp_bridge is None:
             self._mcp_bridge = MCPBridge(self._tool_store)
         return self._tool_store
+
+    def _ensure_recollection(self):
+        if not (self.config.recollection.enabled and self._unified_active() and self._ensure_unified()
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq)):
+            return None
+        if self._recollection is None:
+            self._recollection = RecollectionRuntime(self)
+        return self._recollection
+
+    async def _process_recollection(self):
+        try:
+            runtime = self._ensure_recollection()
+            if runtime:
+                await runtime.process()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld][RECOLLECTION] 本批更正暂未完成，下轮重试")
+
+    @Tool("living_world_recollection", description="仅可信主人私聊查看当前更正及原话依据；只读，不替主人撤回或修改身份",
+          parameters={"offset": {"type": "integer", "default": 0}})
+    async def recollection(self, offset: int = 0, **kwargs):
+        runtime = self._ensure_recollection()
+        return outward_result(runtime.inspect(kwargs, offset=offset) if runtime else {"success": False, "code": "recollection_disabled"})
 
     def _ensure_attention(self):
         if not (self.config.attention.enabled and self._unified_active() and self._ensure_unified()
@@ -1775,6 +1877,8 @@ class MaiLivingWorld(MaiBotPlugin):
                             self.ctx.logger.warning("[MaiLivingWorld][GROWTH] 成长任务暂未完成，下轮重试")
                     if self.config.continuity.enabled:
                         await self._process_continuity()
+                    if self.config.recollection.enabled:
+                        await self._process_recollection()
                     attention = self._ensure_attention()
                     if attention:
                         try:
@@ -2116,13 +2220,17 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             config = {name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention")}
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection")}
             bond = self._ensure_bond()
             config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
             continuity = self._ensure_continuity()
             config["continuity_revision"] = continuity.store.state(continuity.owner())["revision"] if continuity else 0
             attention = self._ensure_attention()
             config["attention_revision"] = attention.store.state(attention.owner())["revision"] if attention else 0
+            recollection = self._ensure_recollection()
+            if recollection:
+                state = recollection.store.state(recollection.owner())
+                config["recollection_version"] = (state["revision"], state["updated"])
             return tool_digest(config)
         signature = proactive_signature()
         assert self._store is not None
@@ -2234,6 +2342,9 @@ class MaiLivingWorld(MaiBotPlugin):
             style = self._relation_for("private")
             if style:
                 intent += "\n\n" + style
+            recollection = self._ensure_recollection()
+            if recollection:
+                intent += "\n\n" + recollection.repeat_style()
             if self.config.mind.enabled and not unified_active:
                 mind = self._ensure_mind()
                 if mind:
@@ -2264,12 +2375,16 @@ class MaiLivingWorld(MaiBotPlugin):
                         and runtime._generation == generation and self._self_state.state()["owner_id"] == owner
                         and (not pending_plan or companion.store.plan(pending_plan["id"], owner_id=ident) == pending_plan))
             query = story["title"] if story else topic
+            recollection = self._ensure_recollection() if is_owner_private else None
+            def recall(query):
+                records = self._collect_unified(query)
+                return recollection.with_questions(records) if recollection else records
             def memory_version():
-                return _memory_version(sorted(self._collect_unified(query), key=lambda item: item["id"]))
+                return _memory_version(sorted(recall(query), key=lambda item: item["id"]))
             original_memories = memory_version()
             hint = await runtime.proactive_hint({"scope": kind+":"+ident, "speaker_id": ident if kind == "private" else "",
                 "sid": sid, "query": story["title"] if story else topic}, self.config.unified_mind,
-                recall=self._collect_unified, generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
+                recall=recall, generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                 timezone=self.config.general.timezone, valid=valid)
             if not valid() or memory_version() != original_memories:
                 return

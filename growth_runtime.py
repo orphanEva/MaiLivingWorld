@@ -76,7 +76,8 @@ class GrowthRuntime:
                 day = datetime.fromtimestamp(stamp, ZoneInfo(timezone)).replace(
                     hour=0, minute=0, second=0, microsecond=0).timestamp()
                 if not self.identity.reserve_thought(now=stamp, day_start=day,
-                        min_interval_seconds=interval, daily_limit=budget.max_daily_model_calls):
+                        min_interval_seconds=interval, daily_limit=budget.max_daily_model_calls,
+                        reserve_for_reply=getattr(budget, "reserved_reply_calls", 0), purpose="background"):
                     raise _Budget()
                 result = await asyncio.wait_for(generate(prompt, task_name=task_name,
                     temperature=0.1, max_tokens=1800), timeout=budget.model_timeout_seconds)

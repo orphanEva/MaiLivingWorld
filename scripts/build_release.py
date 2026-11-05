@@ -41,6 +41,8 @@ required = (
     "bond_store.py", "bond_runtime.py", "companion_style.py", "deploy/COMPANION.md",
     "attention_store.py", "attention_runtime.py", "dialogue_policy.py",
     "continuity_store.py", "continuity_runtime.py", "continuity_model.py",
+    "recollection_store.py", "recollection_model.py", "recollection_runtime.py", "recall_query.py",
+    "scripts/evaluate_companion.py", "evaluations/companion_scenarios.json", "deploy/EVALUATION.md",
     "scripts/backup_state.py", "scripts/migrate_all_sqlite_to_mysql.py", "scripts/migrate_sqlite_to_mysql.py",
     "sql/mysql.sql", "sql/mysql_comments_existing.sql", "deploy/BACKUP.md",
     "scripts/mcp_gateway.py", "deploy/README.md", "deploy/compose.mcp.yml", "deploy/Dockerfile.mcp-gateway", "deploy/mcp.example.env", "deploy/cap-option.example.yml",

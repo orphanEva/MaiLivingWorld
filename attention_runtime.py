@@ -118,7 +118,8 @@ class AttentionRuntime:
             def reserve():
                 b = self.bot
                 return b._self_state.reserve_thought(now=time.time(), day_start=day_start(b.config.general.timezone),
-                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls)
+                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls,
+                    reserve_for_reply=getattr(b.config.unified_mind, "reserved_reply_calls", 0), purpose="foreground")
 
             mode = state["conversation"]["mode"] if state["conversation"]["active"] else "normal"
             result = await understand_dialogue(text, previous_mode=mode, generate=self.bot.ctx.llm.generate,

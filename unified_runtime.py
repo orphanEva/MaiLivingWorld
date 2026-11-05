@@ -29,7 +29,7 @@ def _memory_version(items):
     return hashlib.sha256(json.dumps(
         [{key: memory.get(key) for key in (
             "id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
-            "timestamp", "source", "kind", "sources", "revision")}
+            "timestamp", "source", "kind", "sources", "revision", "recently_asked")}
          for memory in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -178,7 +178,9 @@ class UnifiedRuntime:
                 day = local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
                 if not self.state.reserve_thought(now=stamp, day_start=day,
                                                  min_interval_seconds=interval,
-                                                 daily_limit=config.max_daily_model_calls):
+                                                 daily_limit=config.max_daily_model_calls,
+                                                 reserve_for_reply=getattr(config, "reserved_reply_calls", 0),
+                                                 purpose="foreground"):
                     self.last_status = "budget_or_cooldown"
                     return None
                 return await asyncio.wait_for(
@@ -321,7 +323,8 @@ class UnifiedRuntime:
                     local = datetime.fromtimestamp(stamp, ZoneInfo(timezone))
                     day = local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
                     if not self.state.reserve_thought(now=stamp, day_start=day,
-                            min_interval_seconds=interval, daily_limit=config.max_daily_model_calls):
+                            min_interval_seconds=interval, daily_limit=config.max_daily_model_calls,
+                            reserve_for_reply=getattr(config, "reserved_reply_calls", 0), purpose="background"):
                         self.last_status = "budget_or_cooldown"
                         return None
                     result = await asyncio.wait_for(generate(prompt, task_name=task_name,

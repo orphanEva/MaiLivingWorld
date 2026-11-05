@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十三套数据共 54 表（含持续自我、成长、工具、陪伴、聊天连续性与注意安排）
+-- MaiLivingWorld MySQL 8.4 十四套数据共 58 表（含持续自我、成长、工具、陪伴、聊天连续性、注意安排与回忆修正）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -555,3 +555,58 @@ CREATE TABLE IF NOT EXISTS `mlw_attention_events` (
     created DOUBLE NOT NULL COMMENT '事件提交时间，Unix秒',
     KEY `idx_attention_events_owner` (owner_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='注意安排与活动结果审计，不存正文且不冒称已经关心';
+
+CREATE TABLE IF NOT EXISTS `mlw_recollection_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '回忆修正控制状态的乐观锁版本',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '提取预算所属日期起点，Unix秒',
+    cycle_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的回忆修正提取批次',
+    last_cycle DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留提取批次的时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次的独占租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '提取租约失效时间，Unix秒',
+    lease_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次的输入标识',
+    created DOUBLE NOT NULL COMMENT '首次控制状态建立时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人回忆修正的持久租约与提取预算，不覆盖原始事实';
+
+CREATE TABLE IF NOT EXISTS `mlw_recollection_inputs` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信场合消息与输入类型的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '输入所属可信主人标识',
+    kind VARCHAR(191) NOT NULL COMMENT '原话反馈或其他可信输入的类型',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重复和变更核验',
+    status VARCHAR(191) NOT NULL COMMENT '输入等待运行完成过期或撤回状态',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前处理租约令牌',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许处理时间，Unix秒',
+    expires DOUBLE NOT NULL COMMENT '未处理输入的到期时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '有界输入及可信引用JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒',
+    KEY `idx_recollection_inputs_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人原话与发送回执相关的有界回忆修正输入队列';
+
+CREATE TABLE IF NOT EXISTS `mlw_recollection_revisions` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '回忆修正记录的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '修正记录原主人标识，不转移给新主人',
+    target_id VARCHAR(191) NOT NULL COMMENT '被补充或修正的原始来源标识',
+    target_digest VARCHAR(191) NOT NULL COMMENT '原始来源版本摘要，失配后不继续应用',
+    input_id VARCHAR(191) NOT NULL COMMENT '本次修正的可信输入标识',
+    relation VARCHAR(191) NOT NULL COMMENT '补充澄清纠正或反馈关系类型',
+    status VARCHAR(191) NOT NULL COMMENT '修正记录当前审核及有效状态',
+    revision BIGINT NOT NULL COMMENT '记录变更版本',
+    payload LONGTEXT NOT NULL COMMENT '有界修正内容与证据引用JSON，不作为自证事实',
+    created DOUBLE NOT NULL COMMENT '首次记录修正的时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近修正内容或状态变化时间，Unix秒',
+    KEY `idx_recollection_revisions_owner` (owner_id,status,created),
+    KEY `idx_recollection_revisions_target` (owner_id,target_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='带可信输入和原来源版本的回忆修正建议，不改写原始证据';
+
+CREATE TABLE IF NOT EXISTS `mlw_recollection_deliveries` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '真实发送回执的稳定幂等标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '成功回执对应的可信主人标识',
+    scope VARCHAR(191) NOT NULL COMMENT '经核验的实际发送场合',
+    text_digest VARCHAR(191) NOT NULL COMMENT '已发送文本SHA256摘要',
+    payload LONGTEXT NOT NULL COMMENT '有界回执信息与使用来源引用JSON',
+    created DOUBLE NOT NULL COMMENT '确认成功发送的时间，Unix秒',
+    KEY `idx_recollection_deliveries_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='真实发送成功回执与来源引用，尝试和生成不等于已经说过';

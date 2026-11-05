@@ -28,6 +28,7 @@ TABLES = (
     "bond_profiles", "bond_moments", "bond_audit",
     "continuity_control", "continuity_inputs", "continuity_threads", "continuity_audit",
     "attention_control", "attention_receipts", "attention_events",
+    "recollection_control", "recollection_inputs", "recollection_revisions", "recollection_deliveries",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

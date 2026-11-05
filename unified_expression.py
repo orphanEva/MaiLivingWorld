@@ -16,6 +16,7 @@ from .policy import extract_text
 
 MAX_MEMORIES = 12
 MAX_SOURCE_CHARS = 600
+MAX_CORRECTED_SOURCE_CHARS = 1800
 MAX_GENERAL_CHARS = 180
 MAX_RESPONSE_CHARS = 6500
 BEHAVIORS = {
@@ -33,7 +34,7 @@ _SECRET = re.compile(
 )
 _IDENTIFIER = re.compile(
     r"(?i)\d{5,}|[\w.+-]+@[\w.-]+\.[a-z]{2,}|"
-    r"(?:https?://|www\.)|\b(?:private|group):|\bQQ\s*[:：号]|"
+    r"(?:https?://|www\.)|\b(?:private|group):|recollection:|\bQQ\s*[:：号]|"
     r"手机号|住址|邮箱|电话号码|身份证"
 )
 _INSTRUCTION = re.compile(
@@ -76,6 +77,19 @@ def _audience_valid(scope: Any, speaker_id: Any, *, proactive: bool = False) -> 
     return not scope.startswith("private:") or scope == "private:" + speaker_id
 
 
+def _correction_id(record: dict) -> str:
+    """Only collector-built original-owner corrections get the larger text bound.
+
+    This metadata is not disclosure permission; all ordinary audience and secret
+    checks still apply. A source's model-generated text cannot grant this marker.
+    """
+    marker, subject, source = record.get("correction_id"), record.get("subject_id"), record.get("source")
+    return marker if (isinstance(marker, str) and re.fullmatch(r"recollection:revision:[0-9a-f]{64}", marker)
+        and isinstance(source, str) and source in {"brain_fact", "mind", "bond", "continuity"}
+        and isinstance(subject, str) and re.fullmatch(r"[0-9]{5,20}", subject)
+        and record.get("scope") == "private:"+subject and record.get("evidence_status") == "owner_reported") else ""
+
+
 def _records(memories: Any) -> dict[str, dict[str, Any]]:
     """Take a bounded copy; reject duplicate source IDs instead of guessing precedence."""
     if not isinstance(memories, list):
@@ -86,7 +100,8 @@ def _records(memories: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         ident = _clean_text(item.get("id"), 240)
-        text = _clean_text(item.get("text"), MAX_SOURCE_CHARS)
+        correction_id = _correction_id(item)
+        text = _clean_text(item.get("text"), MAX_CORRECTED_SOURCE_CHARS if correction_id else MAX_SOURCE_CHARS)
         sensitivity = item.get("sensitivity", "unknown")
         if not ident or not text or not isinstance(sensitivity, str) or sensitivity not in SENSITIVITIES:
             continue
@@ -102,6 +117,10 @@ def _records(memories: Any) -> dict[str, dict[str, Any]]:
             "sensitivity": sensitivity,
             "evidence_status": str(item.get("evidence_status", "unknown"))[:60],
         }
+        if item.get("recently_asked") is True:
+            records[ident]["recently_asked"] = True
+        if correction_id:
+            records[ident]["correction_id"] = correction_id
     for ident in duplicates:
         records.pop(ident, None)
     return records
@@ -154,6 +173,8 @@ def build_deliberation_prompt(memories: list[dict], *, query: str,
         "必须由原来源支持，将交给独立复核后才使用；保密内容不能通过概括绕过。"
         "internal 表示记住并理解但不说出；omit 表示与当前交谈无关。"
         "主人可被更熟悉地对待，但主人地位不把未经核实的信息变为事实。"
+        "recently_asked=true表示这条同版本近况近期确实问过，仅供理解背景；"
+        "没有新进展且本轮未主动谈及时，不主动重复追问。该标记不扩大表达权限。"
         "只有枚举 behavior 可以承载未说出的经历对表达方式的影响，不提供自由文本理由。\n"
         "UNTRUSTED_INPUT_JSON\n" + json.dumps(data, ensure_ascii=False)
     )
@@ -226,7 +247,7 @@ def _approved_self_view(record: dict[str, Any]) -> tuple[str, str]:
 def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
                      speaker_id: str, is_owner: bool, proactive: bool = False) -> dict[str, Any] | None:
     """Produce only permitted text and review candidates; never retain withheld originals."""
-    del is_owner  # A special relationship is not an override of disclosure decisions.
+    # Owner status only permits a private follow-up marker, never broader disclosure.
     if not _audience_valid(audience_scope, speaker_id, proactive=proactive):
         return None
     data = _json_object(result)
@@ -262,6 +283,12 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
                                      "kind": record["kind"],
                                      "certainty": record["evidence_status"], "mode": "say",
                                      "perspective": perspective})
+            if record.get("correction_id"):
+                plan["memories"][-1]["correction_id"] = record["correction_id"]
+            if (is_owner is True and record.get("recently_asked") is True
+                    and audience_scope == "private:"+speaker_id
+                    and record["scope"] == audience_scope and record["subject_id"] == speaker_id):
+                plan["memories"][-1]["recently_asked"] = True
             plan["stats"]["direct"] += 1
         elif mode == "generalize" and not _hard_block(record):
             text = _general_text(decision.get("text"), records)
@@ -340,13 +367,19 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
     for item in plan.get("memories", [])[:MAX_MEMORIES]:
         if not isinstance(item, dict):
             continue
-        text = _clean_text(item.get("text"), MAX_SOURCE_CHARS)
+        # Only a permitted direct record can inherit this marker from the parser.
+        marker = item.get("correction_id")
+        corrected = (item.get("mode") == "say" and item.get("certainty") == "owner_reported"
+                     and isinstance(marker, str) and re.fullmatch(r"recollection:revision:[0-9a-f]{64}", marker))
+        text = _clean_text(item.get("text"), MAX_CORRECTED_SOURCE_CHARS if corrected else MAX_SOURCE_CHARS)
         if text:
             perspective = item.get("perspective", "source_memory")
             if not isinstance(perspective, str) or perspective not in PERSPECTIVES:
                 perspective = "source_memory"
             visible.append({"content": text, "status": str(item.get("certainty", "unknown"))[:60],
                             "perspective": perspective})
+            if item.get("recently_asked") is True and item.get("mode") == "say":
+                visible[-1]["usage"] = "这条近况近期已问过，本轮未主动谈及则不再次追问。"
     # Do not expose memory IDs, sources, withheld counts, reviewer rationale or pending text.
     return (
         "[MaiLivingWorld:unified-expression]\n"

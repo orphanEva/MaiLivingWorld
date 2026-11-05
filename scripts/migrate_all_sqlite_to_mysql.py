@@ -40,6 +40,7 @@ from MaiLivingWorld.companion_store import CompanionStore
 from MaiLivingWorld.bond_store import BondStore
 from MaiLivingWorld.continuity_store import ContinuityStore
 from MaiLivingWorld.attention_store import AttentionStore
+from MaiLivingWorld.recollection_store import RecollectionStore
 
 
 LEDGERS = {
@@ -56,9 +57,10 @@ LEDGERS = {
     "bond.sqlite3": tuple(t for t in TABLES if t.startswith("bond_")),
     "continuity.sqlite3": tuple(t for t in TABLES if t.startswith("continuity_")),
     "attention.sqlite3": tuple(t for t in TABLES if t.startswith("attention_")),
+    "recollection.sqlite3": tuple(t for t in TABLES if t.startswith("recollection_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
-OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3"})
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -105,7 +107,8 @@ def ensure_schema(config: dict, workdir: Path) -> None:
                      ("cognition",CognitiveStore),("experience_loop",ExperienceLoop),
                      ("proactive_feedback",ProactiveFeedback),("self_state",SelfState),
                      ("growth",GrowthStore),("tool_memory",ToolStore),("companion",CompanionStore),("bond",BondStore),
-                     ("continuity",ContinuityStore),("attention",AttentionStore)):
+                     ("continuity",ContinuityStore),("attention",AttentionStore),
+                     ("recollection",RecollectionStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 

@@ -189,7 +189,8 @@ class ContinuityRuntime:
                 def reserve():
                     nonlocal exhausted
                     allowed = b._self_state.reserve_thought(now=time.time(), day_start=day_start(b.config.general.timezone),
-                        min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls)
+                        min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls,
+                        reserve_for_reply=getattr(b.config.unified_mind, "reserved_reply_calls", 0), purpose="background")
                     exhausted = not allowed
                     return allowed
                 terms = _terms(" ".join(row["text"] for row in claim["inputs"]))

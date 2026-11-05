@@ -263,7 +263,7 @@ class CompanionRuntime:
                 return {"success": True, "data": self.store.notes(row["id"], owner_id=owner,
                     current_refs=self._current_refs(row), limit=30)}
             if action == "review":
-                return await self.review_pending(row, valid)
+                return await self.review_pending(row, valid, internal=internal)
         if action not in {"open", "next", "resume"}:
             return {"success": False, "code": "invalid_reading_action"}
         index = 0 if row is None or action == "resume" else row["cursor"]
@@ -303,7 +303,9 @@ class CompanionRuntime:
             # Fetching images only proves page delivery; text review never pretends to see pixels.
             def reserve():
                 return b._self_state.reserve_thought(now=time.time(), day_start=day_start(b.config.general.timezone),
-                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls)
+                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls,
+                    reserve_for_reply=getattr(b.config.unified_mind, "reserved_reply_calls", 0),
+                    purpose="background" if internal else "foreground")
             note = await understand_text(page["excerpt"], generate=b.ctx.llm.generate, reserve=reserve,
                 valid=valid, task_name=b.config.brain.model_task, timeout=b.config.unified_mind.model_timeout_seconds)
             if not valid():
@@ -353,7 +355,7 @@ class CompanionRuntime:
                     pass  # Completed, paused or superseded leases are already released.
             b._mcp_calls.discard(task)
 
-    async def review_pending(self, row, valid):
+    async def review_pending(self, row, valid, *, internal=False):
         b = self.bot
         owner = row["owner_id"]
         checked = self.store.check_reading(row["id"], owner_id=owner, version=row["version"],
@@ -377,7 +379,9 @@ class CompanionRuntime:
                         and self._current_refs(row) == row["source_refs"])
             note = await understand_text(pending["excerpt"], generate=b.ctx.llm.generate,
                 reserve=lambda: b._self_state.reserve_thought(now=time.time(), day_start=day_start(b.config.general.timezone),
-                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls),
+                    min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls,
+                    reserve_for_reply=getattr(b.config.unified_mind, "reserved_reply_calls", 0),
+                    purpose="background" if internal else "foreground"),
                 valid=current, task_name=b.config.brain.model_task, timeout=b.config.unified_mind.model_timeout_seconds)
             if not note or not current():
                 return {"success": False, "code": "note_pending_review_or_budget"}

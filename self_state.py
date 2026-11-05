@@ -120,14 +120,24 @@ class SelfState:
             return [dict(row) for row in rows]
 
     def reserve_thought(self, *, now: float, day_start: float,
-                        min_interval_seconds: int, daily_limit: int) -> bool:
-        """调用模型前原子预留次数；失败也计数，重启与主人配置变更均不重置。"""
+                        min_interval_seconds: int, daily_limit: int,
+                        reserve_for_reply: int = 0, purpose: str = "foreground") -> bool:
+        """原子预留插件内部模型次数，失败也计数，重启与易主均不重置。
+
+        后台与前台共用总计数；后台只可使用扣除回复预留量后的额度，
+        前台可使用完整额度。这不是 Host 最终回复模型的调用限制。
+        """
+        if (type(reserve_for_reply) is not int or reserve_for_reply < 0
+                or not isinstance(purpose, str) or purpose not in {"foreground", "background"}):
+            raise ValueError("无效的回复预留预算或调用用途")
         now, day_start = float(now), float(day_start)
         if (not math.isfinite(now) or not math.isfinite(day_start)
                 or day_start < 0 or now < day_start
                 or min_interval_seconds < 0 or daily_limit < 0):
             raise ValueError("无效的思考预算或时间")
-        if daily_limit == 0:
+        effective_limit = (max(0, int(daily_limit)-reserve_for_reply)
+                           if purpose == "background" else int(daily_limit))
+        if effective_limit == 0:
             return False
         self.state()
         with self.con:
@@ -138,6 +148,6 @@ class SelfState:
                 "AND budget_day<=? AND (thought_count=0 OR last_thought<=?) "
                 "AND (budget_day<? OR thought_count<?)",
                 (day_start, day_start, now, day_start, now-min_interval_seconds,
-                 day_start, int(daily_limit)),
+                 day_start, effective_limit),
             )
             return changed.rowcount == 1

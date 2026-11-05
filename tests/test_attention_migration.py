@@ -53,8 +53,8 @@ class AttentionMigrationTests(unittest.TestCase):
         self.assertEqual(migration.LEDGERS["attention.sqlite3"], ATTENTION_TABLES)
         self.assertEqual(set(migration.ALL_TABLES), set(backup.TABLES))
         self.assertEqual(set(TABLES) | {"stories", "attempts", "story_attempts"}, set(backup.TABLES))
-        self.assertEqual(len(backup.TABLES), 54)
-        self.assertEqual(len(backup.LEDGERS), 13)
+        self.assertEqual(len(backup.TABLES), 58)
+        self.assertEqual(len(backup.LEDGERS), 14)
         self.assertIn("attention.sqlite3", migration.OPTIONAL_LEDGERS)
         self.assertNotIn("attention.sqlite3", backup.V16_LEDGERS)
 
@@ -112,12 +112,12 @@ class AttentionMigrationTests(unittest.TestCase):
             def close(self):
                 pass
         names = ("MySQLStore", "BrainBook", "MindStore", "CognitiveStore", "ExperienceLoop", "ProactiveFeedback",
-                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore", "AttentionStore")
+                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore", "AttentionStore", "RecollectionStore")
         with patch.multiple(migration, **{name: EmptyStore for name in names}), tempfile.TemporaryDirectory() as temp:
             migration.ensure_schema({"table_prefix": "test_"}, Path(temp))
-        self.assertEqual(len(calls), 13)
-        self.assertEqual(calls[-1][0][0].name, "attention.sqlite3")
-        self.assertEqual(calls[-1][1]["mysql_settings"], {"table_prefix": "test_"})
+        self.assertEqual(len(calls), 14)
+        attention = next(call for call in calls if call[0] and call[0][0].name == "attention.sqlite3")
+        self.assertEqual(attention[1]["mysql_settings"], {"table_prefix": "test_"})
 
     def test_official_ddl_comments_defaults_indexes_and_runtime_prefix_match(self):
         ddl = (ROOT/"sql"/"mysql.sql").read_text(encoding="utf-8")

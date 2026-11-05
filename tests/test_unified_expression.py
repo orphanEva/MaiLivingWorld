@@ -35,6 +35,52 @@ def parse(raw, records, scope=GROUP, speaker=OWNER, owner=True):
 
 
 class UnifiedExpressionTests(unittest.TestCase):
+    def test_recently_asked_private_owner_marker_does_not_change_source_fingerprint(self):
+        from MaiLivingWorld.growth_store import source_fingerprint
+        from MaiLivingWorld.unified_runtime import _memory_version
+        original = memory(text="主人提到最近在准备考试")
+        record = {**original, "recently_asked": True}
+        before = copy.deepcopy(record)
+        plan = parse(response([{"id": record["id"], "mode": "say"}]), [record], scope="private:"+OWNER)
+        self.assertTrue(plan["memories"][0]["recently_asked"])
+        hint = expression_hint(plan)
+        self.assertIn("这条近况近期已问过，本轮未主动谈及则不再次追问", hint)
+        self.assertNotIn(record["id"], hint)
+        self.assertEqual(record, before)
+        self.assertEqual(source_fingerprint(record), source_fingerprint(original))
+        self.assertNotEqual(_memory_version([record]), _memory_version([original]))
+        self.assertEqual(_memory_version([original]), _memory_version([{key: value for key, value in record.items()
+                                                                     if key != "recently_asked"}]))
+
+    def test_recently_asked_never_crosses_group_other_recipient_or_generalization(self):
+        raw = response([{"id": "event:one", "mode": "say"}])
+        for record, scope, speaker, owner in (
+            (memory(recently_asked=True, scope=GROUP), GROUP, OWNER, True),
+            (memory(recently_asked=True, scope=GROUP), "private:"+OWNER, OWNER, True),
+            (memory(recently_asked=True), "private:"+OWNER, OWNER, False),
+            (memory(recently_asked=True, scope="private:"+OTHER, subject_id=OTHER), "private:"+OTHER, OTHER, False),
+        ):
+            with self.subTest(scope=scope, owner=owner, source=record["scope"]):
+                plan = parse(raw, [record], scope=scope, speaker=speaker, owner=owner)
+                self.assertEqual(len(plan["memories"]), 1)
+                self.assertNotIn("recently_asked", plan["memories"][0])
+                self.assertNotIn("近期已问过", expression_hint(plan))
+        plan = parse(response([{"id": "event:one", "mode": "generalize",
+                                "text": "字典的 get 方法支持设置默认返回值"}]), [memory(recently_asked=True)])
+        reviewed = apply_generalization_review('{"approved_ids":["event:one"]}', plan)
+        self.assertEqual(len(reviewed["memories"]), 1)
+        self.assertNotIn("recently_asked", reviewed["memories"][0])
+        self.assertNotIn("近期已问过", expression_hint(reviewed))
+
+    def test_recently_asked_prompt_copies_only_literal_true(self):
+        for flag in (True, False, 1, "true", {}, None):
+            record = memory(recently_asked=flag)
+            prompt = build_deliberation_prompt([record], query="继续聊聊", audience_scope="private:"+OWNER,
+                                               speaker_id=OWNER, is_owner=True)
+            normalized = json.loads(prompt.split("UNTRUSTED_INPUT_JSON\n", 1)[1])["memories"][0]
+            self.assertEqual("recently_asked" in normalized, flag is True)
+            self.assertIn("该标记不扩大表达权限", prompt)
+
     def test_private_knowledge_can_transfer_after_separate_review(self):
         records = [memory()]
         plan = parse(response([{"id": "event:one", "mode": "generalize",

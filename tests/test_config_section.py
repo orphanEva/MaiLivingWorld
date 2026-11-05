@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.17.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.18.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -34,7 +34,8 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(set(parsed), set(defaults))
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
-        self.assertEqual(total_fields, 162)
+        self.assertEqual(len(defaults), 23)
+        self.assertEqual(total_fields, 168)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -42,6 +43,27 @@ class ConfigSectionTests(unittest.TestCase):
     def test_manifest_version_consistent(self):
         manifest = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], plugin.Config().plugin.config_version)
+
+    def test_dynamic_webui_config_schema_exposes_recollection_and_reply_reserve(self):
+        schema = plugin.Config.model_json_schema()
+        def section(name):
+            ref = schema["properties"][name]["$ref"].rsplit("/", 1)[1]
+            return schema["$defs"][ref]["properties"]
+        self.assertEqual(len(schema["properties"]), 23)
+        recollection = section("recollection")
+        self.assertEqual(set(recollection), {"enabled", "auto_correct", "interval_seconds",
+                                            "max_daily_batches", "repeat_cooldown_hours"})
+        for name, default in plugin.Config().recollection.model_dump().items():
+            self.assertEqual(recollection[name]["default"], default)
+            self.assertTrue(recollection[name]["description"])
+        self.assertFalse(recollection["enabled"]["default"])
+        self.assertEqual(recollection["interval_seconds"]["minimum"], 30)
+        self.assertEqual(recollection["max_daily_batches"]["maximum"], 30)
+        self.assertEqual(recollection["repeat_cooldown_hours"]["minimum"], 1)
+        reserve = section("unified_mind")["reserved_reply_calls"]
+        self.assertEqual((reserve["type"], reserve["default"], reserve["minimum"], reserve["maximum"]),
+                         ("integer", 12, 0, 1000))
+        self.assertIn("23 /", plugin.Recollection.__ui_label__)
 
 
 if __name__ == "__main__":
