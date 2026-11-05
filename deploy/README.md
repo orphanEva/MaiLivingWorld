@@ -50,7 +50,7 @@ docker compose --env-file /absolute/private/path/mcp.env -f deploy/compose.mcp.y
 
 `mailivingworld_cap_mcp_data`（可用 `MLW_CAP_DATA_VOLUME` 修改）保存独立的 `/var/lib/cap/tasks/tasks.sqlite3`、图片、PDF和接收文件。重建容器不清空该卷。它不复用原 cap 实例的任务数据库；**同一卷只允许一个 cap 网关实例、一个 uvicorn worker，不要扩容副本**。源项目也会通过文件锁拒绝任务库的多写者。
 
-cap 返回的本地 PDF 路径属于网关容器。当前 MaiLivingWorld 会隐藏这些路径，没有直接读取/发送本地 PDF 的工具。若另有经管理员配置的文件处理插件需要访问文件，可在 MaiBot 自己的 Compose 中显式把同一卷只读挂载到同一 `/var/lib/cap` 路径，并按那个文件插件的要求限制可读目录；仅挂载不会自动增加 MaiLivingWorld 的文件能力：
+cap 返回的本地 PDF 路径属于网关容器。MaiLivingWorld 会隐藏这些路径。v0.14 可同时启用网关环境 `MLW_CAP_PDF_READ_ENABLED=true` 与插件 `reading.enabled`、`reading.cap_pdf_enabled`，通过 `living_world_reading` 阅读已有 PDF 单页。解析仅访问 `/var/lib/cap/downloads`，拒绝越界路径和链接；默认最多64MiB/1500页/20秒，每页不超过2百万像素/JPEG96KiB。无需给 MaiBot 挂文件卷，不自动发送 PDF。若另有经管理员配置的文件处理插件需要访问文件，可在 MaiBot 自己的 Compose 中显式把同一卷只读挂载到同一 `/var/lib/cap` 路径，并按那个文件插件的要求限制可读目录；仅挂载不会自动增加 MaiLivingWorld 的文件能力：
 
 ```yaml
 services:
@@ -69,7 +69,7 @@ volumes:
 
 ## 边界与排错
 
-网关只暴露本仓库 `mcp_policy.CATALOG` 与实际上游目录的交集，输入 schema 保持原样，工具描述使用本仓库固定说明，不转发上游 instructions。错误仅返回固定状态，已知凭据和原始异常正文被屏蔽。每个调用不会自动重试；超时后先确认任务状态。连接退役后，后续独立请求会先有界关闭旧子进程，再创建一个新实例并重新发现工具；并发请求不会产生多个 cap 写者，也不会重放此前结果不确定的调用。旧进程不能及时退出时，此次恢复失败，需要检查并重启对应服务。
+网关主要暴露本仓库 `mcp_policy.CATALOG` 与实际上游目录的交集，另可显式启用固定 `living_read_pdf_page`，输入 schema 保持原样，工具描述使用本仓库固定说明，不转发上游 instructions。错误仅返回固定状态，已知凭据和原始异常正文被屏蔽。每个调用不会自动重试；超时后先确认任务状态。连接退役后，后续独立请求会先有界关闭旧子进程，再创建一个新实例并重新发现工具；并发请求不会产生多个 cap 写者，也不会重放此前结果不确定的调用。旧进程不能及时退出时，此次恢复失败，需要检查并重启对应服务。
 
 401检查两端Bearer令牌；421检查精确Host名单；403检查Origin；缺少写工具检查Pixiv只读模式；工具错误检查后端/worker状态。网关日志不记录工具参数、返回正文、访问头或密钥。
 

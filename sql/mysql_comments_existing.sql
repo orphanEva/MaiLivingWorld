@@ -1,5 +1,5 @@
 -- MaiLivingWorld 已建表补充中文注释专用脚本（含持续自我身份）
--- 旧库升级请先执行 mysql.sql 创建缺失的身份、成长与工具表，再运行本脚本。
+-- 旧库升级请先执行 mysql.sql 创建缺失的身份、成长、工具与陪伴表，再运行本脚本。
 -- 先备份数据库并在低峰期执行。此脚本不删除、插入或更新业务行，
 -- 但 ALTER TABLE MODIFY COLUMN 可能获取元数据锁并重建部分表，请勿运行在高流量服务上。
 -- 仅适用于由 sql/mysql.sql 创建、字段结构一致的 MySQL 8.4 数据库；
@@ -421,3 +421,62 @@ ALTER TABLE `mlw_tool_research`
   MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '控制行的独立研究日预算起点',
   MODIFY COLUMN `daily_count` BIGINT NOT NULL DEFAULT 0 COMMENT '控制行的当日研究预留次数，失败也计数',
   MODIFY COLUMN `updated` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近调度状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_companion_control`
+  COMMENT = '陪伴账本事务互斥与独立阅读调度预算，构造时不生成控制行',
+  MODIFY COLUMN `slot` BIGINT NOT NULL COMMENT '单例控制位置，恒为1',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近阅读预算预留时间，Unix秒',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '最后一次受信阅读预留的主人标识，不迁移旧计划',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '独立阅读预算的日边界，Unix秒',
+  MODIFY COLUMN `daily_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留阅读周期数，失败也占用',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留阅读周期时间，重启保留冷却';
+
+ALTER TABLE `mlw_companion_readings`
+  COMMENT = '固定资源版本的连续阅读会话，来源失效则暂停且保留已读进度',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '主人与提供者资源版本及根来源指纹绑定的稳定阅读ID',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '发起阅读的可信主人标识，不随主人配置变更迁移',
+  MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '首次发起场合，仅作来源及表达约束',
+  MODIFY COLUMN `provider` VARCHAR(191) NOT NULL COMMENT '固定提供者cap或pixiv',
+  MODIFY COLUMN `resource_type` VARCHAR(191) NOT NULL COMMENT '资源类型pdf、novel或illust',
+  MODIFY COLUMN `resource_id` VARCHAR(191) NOT NULL COMMENT '提供者内资源标识，不是路径或签名URL',
+  MODIFY COLUMN `version` VARCHAR(191) NOT NULL COMMENT '可信资源版本锚，不自动替换',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'active、paused或completed',
+  MODIFY COLUMN `cursor_pos` BIGINT NOT NULL DEFAULT 0 COMMENT '连续已读位置，文本为Unicode字符数，图片及PDF为页数',
+  MODIFY COLUMN `total_units` BIGINT NOT NULL DEFAULT 0 COMMENT '已验证资源总字符或页数，0表示未知不能声称读完',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '阅读任务与派生笔记变更的乐观锁版本',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前读取任务随机租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '当前读取租约截止时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '标题固定版本来源引用与暂停错误码的JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次开启阅读时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近进度任务或笔记变化时间，Unix秒';
+
+ALTER TABLE `mlw_companion_units`
+  COMMENT = '实际读取单元的原文或图片摘要及独立派生笔记，禁止跨页跳过',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '阅读ID与连续单元起点的稳定哈希',
+  MODIFY COLUMN `reading_id` VARCHAR(191) NOT NULL COMMENT '所属固定版本阅读会话',
+  MODIFY COLUMN `unit_index` BIGINT NOT NULL COMMENT '实际读取页码或原文Unicode字符起点，始于0',
+  MODIFY COLUMN `next_cursor` BIGINT NOT NULL COMMENT '本单元真实内容对应的下一个连续游标',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '实际原文图片摘要单元来源及pending或reviewed派生笔记的JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次成功提交该读取单元的时间，Unix秒';
+
+ALTER TABLE `mlw_companion_plans`
+  COMMENT = '主人共同计划，模型提议为草稿且状态切换必须来自可信主人命令',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信主人提议上下文生成的稳定计划ID',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '计划原主人标识，禁止迁移给新主人',
+  MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '首次提议场合，供授权追溯及表达判断',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'proposed、active、paused、completed或cancelled',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '主人命令变更版本，提醒不等于同意修改计划',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '标题下一步到期时间及独立提醒次数游标的JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次草稿创建时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近主人命令修改时间，Unix秒';
+
+ALTER TABLE `mlw_companion_audit`
+  COMMENT = '主人计划命令的幂等和变更审计，不保存原始消息正文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信主人场合与消息ID生成的幂等命令标识',
+  MODIFY COLUMN `entity_id` VARCHAR(191) NOT NULL COMMENT '关联计划ID',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际命令所属可信主人标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '提议接受暂停恢复编辑完成或取消操作',
+  MODIFY COLUMN `message_digest` VARCHAR(191) NOT NULL COMMENT '可信消息ID与场合的SHA256摘要',
+  MODIFY COLUMN `summary_hash` VARCHAR(191) NOT NULL COMMENT '可信原消息摘要的SHA256，不保存原文',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '命令签名及操作前后状态的JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒';

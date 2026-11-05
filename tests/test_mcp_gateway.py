@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import importlib.util
 import json
@@ -9,8 +10,10 @@ import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from MaiLivingWorld.scripts.mcp_gateway import GatewayConfigError, GatewaySettings, create_app
+from MaiLivingWorld.document_reader import DocumentError, PDF_SCHEMA, PDF_TOOL
 
 TOKEN = "test-only-gateway-token-"+"a"*32
 BACKEND_KEY = "test-only-backend-key-"+"b"*32
@@ -81,6 +84,23 @@ async def rpc(http, method, params=None, *, headers=None):
 
 
 class GatewayConfigurationTests(unittest.TestCase):
+    def test_pdf_reading_defaults_off_and_environment_is_explicit(self):
+        self.assertFalse(settings().pdf_read_enabled)
+        env = {"MLW_MCP_GATEWAY_PROVIDER": "cap", "MLW_MCP_GATEWAY_TOKEN": TOKEN,
+               "MLW_MCP_GATEWAY_COMMAND": "/bin/python", "MLW_MCP_GATEWAY_CWD": "/opt/cap",
+               "MLW_CAP_PDF_READ_ENABLED": "true", "MLW_CAP_PDF_ROOT": "/var/lib/cap/downloads"}
+        parsed = GatewaySettings.from_env(env)
+        self.assertTrue(parsed.pdf_read_enabled)
+        self.assertNotIn("MLW_CAP_PDF_READ_ENABLED", parsed.child_env)
+        self.assertNotIn("MLW_CAP_PDF_ROOT", parsed.child_env)
+        for changes in ({"pdf_read_enabled": "true"}, {"pdf_root": "relative"},
+                        {"pdf_root": "/cache/../other"}, {"provider": "pixiv", "pdf_read_enabled": True}):
+            with self.subTest(changes=changes), self.assertRaises(GatewayConfigError):
+                settings(**changes)
+        env["MLW_CAP_PDF_READ_ENABLED"] = "yes-maybe"
+        with self.assertRaises(GatewayConfigError):
+            GatewaySettings.from_env(env)
+
     def test_invalid_tokens_and_provider_are_rejected_without_echo(self):
         for change in ({"token": "short-secret"}, {"token": "x"*32+"\n"}, {"token": "密"*40},
                        {"provider": "arbitrary"}, {"allowed_origins": ("*",)}, {"allowed_hosts": ("*",)},
@@ -127,6 +147,9 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertIn("additional_contexts:", compose)
         self.assertIn("JM_TASK_DB_PATH: /var/lib/cap/tasks/tasks.sqlite3", compose)
         self.assertIn("external: true", compose)
+        self.assertIn("MLW_CAP_PDF_READ_ENABLED:-false", compose)
+        self.assertIn("MLW_CAP_PDF_ROOT: /var/lib/cap/downloads", compose)
+        self.assertIn('"PyMuPDF>=1.26,<2"', docker)
 
 
 @unittest.skipUnless(HAS_MCP, "requires the optional MCP 2.3 gateway dependencies")
@@ -312,6 +335,118 @@ class GatewayASGITests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(result.is_error)
                     self.assertEqual(result.structured_content["jm_id"], "123")
         self.assertEqual(upstream.closes, 1)
+
+
+class PDFUpstream(FakeUpstream):
+    async def list_tools(self):
+        tools = await super().list_tools()
+        tools["jm_get_cached_pdf"] = {"input_schema": copy.deepcopy(SCHEMA)}
+        # An upstream may try to redefine this tool; the gateway must own it.
+        tools[PDF_TOOL] = {"input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        return tools
+
+
+@unittest.skipUnless(HAS_MCP, "requires optional MCP gateway dependencies")
+class GatewayPDFTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_tool_is_hidden_and_cannot_proxy_upstream_name(self):
+        async with running(PDFUpstream()) as (http, upstream):
+            tools = (await rpc(http, "tools/list")).json()["result"]["tools"]
+            self.assertNotIn(PDF_TOOL, [tool["name"] for tool in tools])
+            result = (await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "123"}})).json()["result"]
+            self.assertTrue(result["isError"])
+            self.assertEqual(upstream.calls, [])
+
+    async def test_tool_is_only_present_when_readonly_cache_lookup_exists(self):
+        async with running(FakeUpstream(), settings(pdf_read_enabled=True)) as (http, upstream):
+            tools = (await rpc(http, "tools/list")).json()["result"]["tools"]
+            self.assertNotIn(PDF_TOOL, [tool["name"] for tool in tools])
+            result = (await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "123"}})).json()["result"]
+            self.assertTrue(result["isError"])
+            self.assertEqual(upstream.calls, [])
+
+    async def test_fixed_schema_and_normalized_id_only_reach_cached_lookup(self):
+        upstream = PDFUpstream()
+        upstream.response = {"jm_id": "123", "cached": True, "pdf": {"file_path": "/cache/private-name.pdf"}}
+        render = AsyncMock(return_value={"kind": "pdf_page", "jm_id": "123", "page_index": 2})
+        with patch("MaiLivingWorld.scripts.mcp_gateway.read_cached_pdf_page", render):
+            async with running(upstream, settings(pdf_read_enabled=True, pdf_root="/cache")) as (http, _):
+                tools = (await rpc(http, "tools/list")).json()["result"]["tools"]
+                advertised = next(tool for tool in tools if tool["name"] == PDF_TOOL)
+                self.assertEqual(advertised["inputSchema"], PDF_SCHEMA)
+                response = await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "000123", "page_index": 2}})
+                self.assertFalse(response.json()["result"].get("isError", False))
+                self.assertEqual(upstream.calls, [("jm_get_cached_pdf", {"jm_id": "123"})])
+                render.assert_awaited_once_with(upstream.response, jm_id="123", page_index=2, root="/cache")
+                self.assertNotIn("/cache", response.text)
+
+    async def test_model_cannot_supply_path_or_unbounded_page_argument(self):
+        async with running(PDFUpstream(), settings(pdf_read_enabled=True)) as (http, upstream):
+            for arguments in ({"jm_id": "123", "path": "/etc/passwd"}, {"jm_id": "../123"},
+                              {"jm_id": "123", "page_index": True}, {"jm_id": "123", "page_index": 1500}):
+                response = await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": arguments})
+                self.assertTrue(response.json()["result"]["isError"])
+            self.assertEqual(upstream.calls, [])
+
+    async def test_reader_errors_are_sanitized_and_never_initiate_download(self):
+        upstream = PDFUpstream()
+        upstream.response = {"jm_id": "123", "cached": True, "pdf": {"file_path": "/secret/private.pdf"}}
+        with patch("MaiLivingWorld.scripts.mcp_gateway.read_cached_pdf_page", side_effect=DocumentError("pdf_path_denied")):
+            async with running(upstream, settings(pdf_read_enabled=True)) as (http, _):
+                response = await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "123"}})
+                self.assertTrue(response.json()["result"]["isError"])
+                self.assertIn("pdf_path_denied", response.text)
+                self.assertNotIn("/secret", response.text)
+                self.assertEqual(upstream.calls, [("jm_get_cached_pdf", {"jm_id": "123"})])
+
+    async def test_confirmed_missing_cache_returns_unavailable_for_source_retraction(self):
+        upstream = PDFUpstream()
+        upstream.response = {"jm_id": "123", "cached": False, "pdf": None}
+        async with running(upstream, settings(pdf_read_enabled=True)) as (http, _):
+            response = await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "123"}})
+            result = response.json()["result"]
+            self.assertFalse(result.get("isError", False))
+            self.assertEqual(result["structuredContent"], {"provider": "cap", "kind": "pdf_page", "jm_id": "123",
+                                                         "available": False, "reason": "source_unavailable"})
+            self.assertEqual(upstream.calls, [("jm_get_cached_pdf", {"jm_id": "123"})])
+
+    async def test_image_is_not_duplicated_in_text_and_fits_default_client_budget(self):
+        image = base64.b64encode(b"\xff\xd8\xff"+b"x"*(96*1024-3)).decode()
+        rendered = {"kind": "pdf_page", "image_base64": image, "text": "文"*6000}
+        with patch("MaiLivingWorld.scripts.mcp_gateway.read_cached_pdf_page", return_value=rendered):
+            async with running(PDFUpstream(), settings(pdf_read_enabled=True)) as (http, _):
+                response = await rpc(http, "tools/call", {"name": PDF_TOOL, "arguments": {"jm_id": "123"}})
+                body = response.json()["result"]
+                self.assertFalse(body.get("isError", False))
+                self.assertEqual(body["structuredContent"]["image_base64"], image)
+                self.assertNotIn(image, json.dumps(body["content"]))
+                self.assertLess(len(response.content), 230*1024)
+
+    @unittest.skipUnless(importlib.util.find_spec("pymupdf"), "requires optional gateway PyMuPDF")
+    async def test_real_synthetic_pdf_through_gateway_and_official_sdk(self):
+        import httpx2
+        import pymupdf
+        from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "123.pdf"
+            with pymupdf.open() as document:
+                document.new_page().insert_text((20, 40), "Gateway synthetic page")
+                document.save(path)
+            upstream = PDFUpstream()
+            upstream.response = {"jm_id": "123", "cached": True, "pdf": {"file_path": str(path)}}
+            app = create_app(settings(pdf_read_enabled=True, pdf_root=folder), client_factory=upstream.factory)
+            async with app.router.lifespan_context(app):
+                async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
+                        headers={"Authorization": "Bearer "+TOKEN}) as http:
+                    async with Client(streamable_http_client("http://cap-mcp:8000/mcp", http_client=http),
+                                      mode="legacy", read_timeout_seconds=10) as client:
+                        result = await client.call_tool(PDF_TOOL, {"jm_id": "123"})
+                        self.assertFalse(result.is_error)
+                        self.assertIn("Gateway synthetic page", result.structured_content["text"])
+                        self.assertEqual(result.structured_content["total_pages"], 1)
+                        self.assertTrue(result.structured_content["image_base64"])
+                        self.assertNotIn(folder, result.model_dump_json())
+            self.assertEqual(upstream.calls, [("jm_get_cached_pdf", {"jm_id": "123"})])
 
 
 if __name__ == "__main__":

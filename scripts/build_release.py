@@ -37,6 +37,9 @@ version = manifest["version"]
 required = (
     "__init__.py", "_manifest.json", "plugin.py", "policy.py", "explore.py",
     "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "mysql_compat.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "self_state.py", "unified_memory.py", "unified_expression.py", "unified_runtime.py", "growth_store.py", "growth_model.py", "growth_runtime.py", "tool_store.py", "mcp_client.py", "mcp_policy.py", "mcp_runtime.py", "mcp_media.py",
+    "companion_runtime.py", "companion_store.py", "reading_model.py", "document_reader.py", "dashboard.py", "webui.json", "webui/index.html",
+    "scripts/backup_state.py", "scripts/migrate_all_sqlite_to_mysql.py", "scripts/migrate_sqlite_to_mysql.py",
+    "sql/mysql.sql", "sql/mysql_comments_existing.sql", "deploy/BACKUP.md",
     "scripts/mcp_gateway.py", "deploy/README.md", "deploy/compose.mcp.yml", "deploy/Dockerfile.mcp-gateway", "deploy/mcp.example.env", "deploy/cap-option.example.yml",
     "CHANGELOG.md", "config.example.toml", "README.md", "LICENSE",
 )

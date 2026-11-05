@@ -7,12 +7,14 @@ RUN python -m venv /opt/gateway-venv \
     && groupadd --gid 10001 gateway \
     && useradd --uid 10001 --gid 10001 --create-home gateway
 WORKDIR /opt
-COPY __init__.py mcp_client.py mcp_policy.py /opt/MaiLivingWorld/
+COPY __init__.py mcp_client.py mcp_policy.py document_reader.py /opt/MaiLivingWorld/
 COPY scripts/mcp_gateway.py /opt/MaiLivingWorld/scripts/mcp_gateway.py
 EXPOSE 8000
 ENTRYPOINT ["/opt/gateway-venv/bin/python", "-m", "MaiLivingWorld.scripts.mcp_gateway"]
 
 FROM gateway-base AS cap
+# Optional local rendering belongs to the gateway, not cap's MCP v1 environment.
+RUN /opt/gateway-venv/bin/pip install --no-cache-dir "PyMuPDF>=1.26,<2"
 # Explicit source allowlist: no .env, nacos_config.yaml, bot plugins or user data.
 COPY --from=cap_source /requirements-mcp.txt /opt/cap/requirements-mcp.txt
 RUN python -m venv /opt/cap-venv \

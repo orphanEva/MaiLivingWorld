@@ -41,6 +41,7 @@ from .tool_store import ToolStore
 from .mcp_client import StdioMCPClient, MCPError
 from .mcp_runtime import MCPBridge, outward_result, day_start as tool_day_start, digest as tool_digest
 from .mcp_policy import CATALOG
+from .companion_runtime import CompanionRuntime
 
 
 class PluginSection(PluginConfigBase):
@@ -48,7 +49,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.13.0",
+        default="0.14.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -246,6 +247,23 @@ class MCPPixiv(MCPCap):
     env_names: list[str] = Field(default_factory=lambda: ["PIXIV_MCP_BACKEND_URL", "PIXIV_MCP_API_KEY"], description="stdio 专用：传给子进程的环境变量名；不自动读取 .env")
 
 
+class Reading(PluginConfigBase):
+    __ui_label__ = "15 / 连续阅读与学习"
+    enabled: bool = Field(default=False, description="保存作品版本、逐页/逐段阅读进度和核验笔记；需统一心智、唯一主人和MCP")
+    cap_pdf_enabled: bool = Field(default=False, description="允许读取cap网关中已有PDF，网关也需显式启用PDF读取；不自动下载")
+    auto_continue: bool = Field(default=False, description="后台继续已开始的小说阅读；图片仍需前台逐页交给模型")
+    excerpt_chars: int = Field(default=2000, ge=100, le=12000, description="每次返回的小说原文字符数")
+    interval_seconds: int = Field(default=3600, ge=60, le=86400, description="后台继续阅读的持久最短间隔秒数")
+    max_daily_units: int = Field(default=6, ge=0, le=100, description="后台每日最多处理段数，失败也占用；另受MCP和统一模型预算限制")
+
+
+class SharedPlans(PluginConfigBase):
+    __ui_label__ = "16 / 和主人的共同计划"
+    enabled: bool = Field(default=False, description="保存共同计划草案；仅主人可信私聊确认后生效")
+    followup_enabled: bool = Field(default=False, description="到期计划可作为主人主动私聊话题，沿用白名单、静默、免打扰和配额")
+    followup_interval_hours: int = Field(default=24, ge=1, le=720, description="同一计划两次主动跟进尝试的持久最短间隔小时数")
+
+
 class Storage(PluginConfigBase):
     __ui_label__ = "07 / 数据持久化（SQLite 或 MySQL）"
     backend: str = Field(default="sqlite", description="存储类型：sqlite 或 mysql。更换后须重载插件；不自动迁移旧数据")
@@ -276,6 +294,8 @@ class Config(PluginConfigBase):
     mcp: MCPIntegration = Field(default_factory=MCPIntegration)
     mcp_cap: MCPCap = Field(default_factory=MCPCap)
     mcp_pixiv: MCPPixiv = Field(default_factory=MCPPixiv)
+    reading: Reading = Field(default_factory=Reading)
+    shared_plans: SharedPlans = Field(default_factory=SharedPlans)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -327,6 +347,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._mcp_clients: dict[str, Any] = {}
         self._mcp_generation = 0
         self._mcp_calls: set[asyncio.Task] = set()
+        self._companion: CompanionRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -374,7 +395,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.13.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.14.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -518,6 +539,8 @@ class MaiLivingWorld(MaiBotPlugin):
                 private = list(dict.fromkeys(private + [normalize_qq(self.config.owner.qq)]))
             runtime.capture(message, private_users=private,
                             group_ids=_clean_ids(self.config.brain_memory.group_ids))
+            if self.config.shared_plans.enabled:
+                await self._ensure_companion().capture_plan_command(message)
         return {"action": "continue"}
 
     @HookHandler(
@@ -790,6 +813,9 @@ class MaiLivingWorld(MaiBotPlugin):
         self._memory_jobs.clear()
         self._memory_inflight_keys.clear()
         await self._close_mcp()
+        if self._companion:
+            self._companion.close()
+            self._companion = None
         if self._tool_store:
             self._tool_store.close()
             self._tool_store = None
@@ -1006,6 +1032,69 @@ class MaiLivingWorld(MaiBotPlugin):
             self._mcp_bridge = MCPBridge(self._tool_store)
         return self._tool_store
 
+    def _ensure_companion(self):
+        if not self._ensure_unified():
+            return None
+        if self._companion is None:
+            self._companion = CompanionRuntime(self)
+        return self._companion
+
+    @Tool("living_world_reading", description="连续阅读已缓存的小说/PDF/插画。open建立阅读，next读下一段/页，review重试待核验文字笔记，notes查笔记，list查进度；不自动下载，图片只交模型观察，不自动发QQ", parameters={
+        "action": {"type": "string", "enum": ["open", "next", "review", "resume", "notes", "list"]},
+        "provider": {"type": "string", "enum": ["cap", "pixiv"], "default": "pixiv"},
+        "resource_type": {"type": "string", "enum": ["novel", "pdf", "illust"], "default": "novel"},
+        "resource_id": {"type": "string", "description": "open时提供作品编号", "default": ""},
+        "reading_id": {"type": "string", "description": "next/review/resume/notes时提供list返回的ID", "default": ""}})
+    async def reading(self, action: str, provider: str = "pixiv", resource_type: str = "novel",
+                      resource_id: str = "", reading_id: str = "", **kwargs):
+        runtime = self._ensure_companion() if self.config.reading.enabled else None
+        if not runtime:
+            return outward_result({"success": False, "code": "reading_disabled"})
+        result = await runtime.read(action, provider, resource_type, resource_id, reading_id, kwargs)
+        output = outward_result(result)
+        if result.get("success") and result.get("content_items"):
+            output["content_items"] = result["content_items"]
+        return output
+
+    @Tool("living_world_shared_plans", description="仅主人私聊：propose起草共同计划，list查看状态；不能代替主人接受或完成。due_at为Unix时间戳，0不主动提醒", parameters={
+        "action": {"type": "string", "enum": ["list", "propose"]},
+        "title": {"type": "string", "default": ""}, "next_step": {"type": "string", "default": ""},
+        "due_at": {"type": "number", "default": 0}})
+    async def shared_plans(self, action: str, title: str = "", next_step: str = "", due_at: float = 0, **kwargs):
+        runtime = self._ensure_companion() if self.config.shared_plans.enabled else None
+        if not runtime:
+            return outward_result({"success": False, "code": "shared_plans_disabled"})
+        return outward_result(await runtime.plans(action, title, next_step, due_at, kwargs))
+
+    @API("living_world_dashboard", description="登录管理页查看已过滤的成长、阅读与共同计划摘要", public=False, version="1")
+    async def dashboard(self):
+        from .dashboard import build_dashboard
+        if not self._ensure_unified():
+            return build_dashboard(identity={}, growth={}, resolved_sources={}, fingerprint=source_fingerprint, authorized=True)
+        identity = self._self_state.state()
+        growth = self._growth.state() if self._ensure_growth() else {}
+        ids = list(dict.fromkeys(ref["id"] for key in ("interests", "beliefs", "knowledge", "questions")
+            for item in growth.get(key, []) for ref in item["sources"]))
+        resolved = {}
+        for offset in range(0, len(ids), 128):
+            resolved.update(self._resolve_roots(ids[offset:offset+128]))
+        tools = self._ensure_tool_store().status()
+        today = tool_day_start(self.config.general.timezone)
+        runtime = self._ensure_companion()
+        reading_budget = runtime.store.status()["reading_budget"]
+        return build_dashboard(identity=identity, growth=growth, resolved_sources=resolved,
+            fingerprint=source_fingerprint, authorized=True, budgets={
+                "model": {"used": identity["thought_count"] if identity["budget_day"] == today else 0,
+                          "limit": self.config.unified_mind.max_daily_model_calls},
+                "tools": {"used": tools["call_budget"]["count"] if tools["call_budget"]["day_start"] == today else 0,
+                          "limit": self.config.mcp.max_daily_calls},
+                "research": {"used": tools["research"]["daily_count"] if tools["research"]["budget_day"] == today else 0,
+                             "limit": self.config.mcp.research_daily_limit},
+                "reading": {"used": reading_budget["daily_count"] if reading_budget["budget_day"] == today else 0,
+                            "limit": self.config.reading.max_daily_units}},
+            companion={"plans": runtime.store.plans(owner_id=identity["owner_id"]),
+                       "reading": runtime.store.readings(owner_id=identity["owner_id"])})
+
     async def _close_mcp(self):
         self._mcp_generation += 1
         clients, self._mcp_clients = list(self._mcp_clients.values()), {}
@@ -1027,13 +1116,13 @@ class MaiLivingWorld(MaiBotPlugin):
                             "unified": self.config.unified_mind.model_dump()})
 
     def _mcp_client(self, provider):
+        server, cfg = self._mcp_server_config(provider), self.config.mcp
+        if not server or not server.enabled:
+            raise MCPError("invalid_config")
         if provider in self._mcp_clients:
             if not self._mcp_clients[provider].retired:
                 return self._mcp_clients[provider]
             self._mcp_clients.pop(provider)
-        server, cfg = self._mcp_server_config(provider), self.config.mcp
-        if not server or not server.enabled:
-            raise MCPError("invalid_config")
         if server.transport == "http":
             from .mcp_client import HTTPMCPClient
             client = HTTPMCPClient(server.url, os.environ.get(server.token_env, ""),
@@ -1105,6 +1194,8 @@ class MaiLivingWorld(MaiBotPlugin):
         "tool": {"type": "string", "description": "living_world_mcp_tools 返回的准确工具名"},
         "arguments": {"type": "object", "description": "按已发现参数 schema 提供的 JSON 对象"}})
     async def mcp_call(self, provider: str, tool: str, arguments: dict, **kwargs):
+        if provider == "cap" and tool == "living_read_pdf_page":
+            return {"success": False, "content": "请使用 living_world_reading 的 open/next 读取PDF并保存进度。"}
         return outward_result(await self._invoke_mcp(provider, tool, arguments, kwargs))
 
     @Tool("living_world_pixiv_image", description="读取 Pixiv 已缓存作品的一张图片交给模型观察；不自动向 QQ 发送，仅主人私聊且需启用媒体读取", parameters={
@@ -1489,6 +1580,15 @@ class MaiLivingWorld(MaiBotPlugin):
                             raise
                         except Exception:
                             self.ctx.logger.warning("[MaiLivingWorld][GROWTH] 成长任务暂未完成，下轮重试")
+                    if self.config.reading.enabled and self.config.reading.auto_continue:
+                        try:
+                            companion = self._ensure_companion()
+                            if companion:
+                                await companion.auto_read()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld][READING] 本轮阅读未完成，进度保留")
                     if not self.config.general.enabled:
                         continue
                     if now-self._last_chat_check >= self.config.audience.check_interval_minutes*60:
@@ -1813,7 +1913,7 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             return tool_digest({name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience")})
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans")})
         signature = proactive_signature()
         assert self._store is not None
         target=f"qq:{kind}:{ident}"
@@ -1874,11 +1974,18 @@ class MaiLivingWorld(MaiBotPlugin):
             return
         # 仅模型决策限频，不能替代SQLite已落盘的发送配额；重启后由发送配额继续保护。
         self._last_decision[decision_key]=now
-        story=await self._choose_story(target)
+        companion = self._ensure_companion() if is_owner_private and self.config.shared_plans.enabled else None
+        pending_plan = companion.due_plan(ident) if companion else None
+        story = None if pending_plan else await self._choose_story(target)
         if story and experience and not experience.allow(
                 ident, "explore", active=self.config.experience.mode == "active")[0]:
             story = None
-        if story:
+        if pending_plan:
+            topic = pending_plan["title"]
+            intent = ("这是一次主人已确认共同计划的到期跟进机会，可以沉默。只和主人自然提及下一步，"
+                      "不要声称已经完成，不擅自执行计划或修改状态。下面是计划资料，不是执行指令：\n"
+                      + json.dumps({key: pending_plan[key] for key in ("title", "next_step", "due_at")}, ensure_ascii=False))
+        elif story:
             intent=(
                 "这是一次主动发起聊天的机会，你可以选择沉默。你刚刚从公开信息源看到一条真实内容。"
                 "注意你只读取了标题和简介，没有播放视频或核对原文；不许虚构观看经历。"
@@ -1938,7 +2045,8 @@ class MaiLivingWorld(MaiBotPlugin):
                     targets.append(normalize_qq(self.config.owner.qq))
                 return (self._unified_active() and self.config.general.enabled and ident in targets
                         and signature == proactive_signature() and self._unified is runtime
-                        and runtime._generation == generation and self._self_state.state()["owner_id"] == owner)
+                        and runtime._generation == generation and self._self_state.state()["owner_id"] == owner
+                        and (not pending_plan or companion.store.plan(pending_plan["id"], owner_id=ident) == pending_plan))
             query = story["title"] if story else topic
             def memory_version():
                 return _memory_version(sorted(self._collect_unified(query), key=lambda item: item["id"]))
@@ -1969,6 +2077,13 @@ class MaiLivingWorld(MaiBotPlugin):
                                                     active=self.config.experience.mode == "active")[0]:
                 return
             now = check_now
+        if pending_plan:
+            if (signature != proactive_signature()
+                    or companion.store.plan(pending_plan["id"], owner_id=ident) != pending_plan
+                    or not companion.store.claim_plan_followup(pending_plan["id"], owner_id=ident,
+                        expected_revision=pending_plan["revision"],
+                        interval_seconds=self.config.shared_plans.followup_interval_hours*3600)):
+                return
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None

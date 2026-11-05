@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>成长手记</title>
+<style>
+:root{color-scheme:light dark;--bg:#f4f5f2;--card:#fff;--ink:#21332f;--muted:#66756f;--line:#dce4de;--accent:#36705b;--wash:#edf4ef;--warn:#96632f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1180px;margin:auto;padding:32px 24px 50px}header{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:26px}h1{font-size:28px;margin:3px 0;letter-spacing:.04em}h2{font-size:17px;margin:0 0 16px}p{margin:6px 0}.eyebrow{font-size:12px;letter-spacing:.15em;color:var(--accent)}.muted,small{color:var(--muted)}button,input{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 13px;background:var(--card);color:var(--ink)}button{cursor:pointer}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}button.active{color:#fff;background:var(--accent);border-color:var(--accent)}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}.card,section{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:20px}.card strong{font-size:29px;display:block;font-weight:650}.card span{font-size:13px;color:var(--muted)}.columns{display:grid;grid-template-columns:minmax(0,2fr) minmax(255px,1fr);gap:20px}.stack{display:grid;gap:20px;align-content:start}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:17px}.toolbar input{min-width:160px;flex:1;width:100%}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}.tabs button{font-size:13px;padding:5px 10px}.row{border-top:1px solid var(--line);padding:15px 0}.row:first-child{border-top:0;padding-top:0}.row:last-child{padding-bottom:0}.row-title{font-weight:650;overflow-wrap:anywhere}.row p{font-size:14px;overflow-wrap:anywhere;white-space:pre-wrap}.tag{display:inline-block;font-size:11px;line-height:1.9;border-radius:5px;padding:0 6px;background:var(--wash);color:var(--accent);margin:5px 5px 0 0}.tag.warn{color:var(--warn);background:transparent;border:1px solid var(--line)}.empty{padding:22px 0;color:var(--muted);font-size:14px}.meter{margin:14px 0}.meter-label{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}.track{height:7px;border-radius:5px;background:var(--wash);overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:5px;max-width:100%}.notice{font-size:13px;color:var(--muted);padding:13px 0 0}.error{color:var(--warn);padding:16px;border:1px solid var(--line);border-radius:8px;margin-bottom:18px}.counts{display:flex;justify-content:space-between;gap:6px;margin:10px 0}.counts strong{font-size:20px;display:block}.counts span{font-size:12px;color:var(--muted)}footer{margin-top:24px;font-size:12px;color:var(--muted)}[hidden]{display:none!important}@media(max-width:760px){main{padding:22px 16px}.columns{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start}h1{font-size:24px}.card,section{padding:17px}}@media(prefers-color-scheme:dark){:root{--bg:#17211e;--card:#202d28;--ink:#e5eee8;--muted:#a4b8ad;--line:#34493e;--accent:#8fc8a9;--wash:#2c4035;--warn:#efbc78}button.active{color:#17211e}}
+</style></head><body><main>
+<header><div><div class="eyebrow">MAI LIVING WORLD</div><h1>成长手记</h1><p id="identity" class="muted">正在读取持续档案</p></div><button id="refresh" type="button">刷新状态</button></header>
+<div id="error" role="alert" class="error" hidden></div>
+<div id="content" hidden><div class="cards"><div class="card"><strong id="revision">—</strong><span>成长修订</span></div><div class="card"><strong id="questions">—</strong><span>仍在探索的问题</span></div><div class="card"><strong id="reading">—</strong><span>阅读记录</span></div><div class="card"><strong id="plans">—</strong><span>共同计划</span></div></div>
+<div class="columns"><div class="stack"><section><h2>我在逐渐形成的想法</h2><div class="toolbar"><input id="search" type="search" aria-label="筛选成长、计划和阅读" placeholder="搜索主题、计划或阅读"></div><nav class="tabs" aria-label="成长分类"><button type="button" class="active" data-tab="interests">兴趣</button><button type="button" data-tab="beliefs">观点</button><button type="button" data-tab="knowledge">知识候选</button><button type="button" data-tab="questions">未解问题</button></nav><div id="growth-list"></div><p class="notice">这些是有来源的偏好与推断，不代表已经证实的事实；来源失效后暂停展示内容。</p></section><section><h2>与主人一起的计划</h2><div id="plan-list"></div></section><section><h2>阅读进度</h2><div id="reading-list"></div></section></div>
+<aside class="stack"><section><h2>长期性格 · 短期状态</h2><div id="traits"></div><div id="mood"></div><p class="notice">性格缓慢变化；情绪与精力会随时间恢复。数值用于观察变化，不是心理诊断。</p></section><section><h2>今天的使用额度</h2><div id="budgets"></div><p class="notice">额度不足时等待恢复，不会通过重启重置。</p></section><section><h2>来源健康度</h2><div class="counts"><div><strong id="valid">0</strong><span>可展示</span></div><div><strong id="invalid">0</strong><span>来源已失效</span></div><div><strong id="protected">0</strong><span>隐私保护</span></div></div><p class="notice">按成长条目统计。第三方私人原文、密钥及来源身份不会返回到此页面。</p></section></aside></div></div>
+<footer id="footer">只读面板 · 通过宿主管理员认证访问</footer>
+</main><script id="snapshot" type="application/json">null</script><script>
+"use strict";
+
+(()=>{const $=id=>document.getElementById(id);
+let state=null,tab="interests",offline=false;
+const labels={active:"进行中",open:"待探索",resolved:"已解决",proposed:"待确认",accepted:"已接受",planned:"已计划",reading:"阅读中",complete:"已完成",completed:"已完成",paused:"已暂停",cancelled:"已取消",canceled:"已取消",failed:"待处理",stale:"来源已变化",pending:"等待中",running:"进行中",done:"已完成",queued:"排队中"};
+
+const node=(tag,text,cls)=>{const n=document.createElement(tag);
+if(text!==undefined)n.textContent=String(text);
+if(cls)n.className=cls;
+return n};
+const rows=x=>Array.isArray(x)?x:[];
+const number=x=>typeof x==="number"&&Number.isFinite(x)?x:0;
+const stamp=x=>{const d=new Date(x);
+return x&&!Number.isNaN(d.valueOf())?d.toLocaleString():""};
+const empty=(el,text)=>el.append(node("div",text,"empty"));
+const tag=(el,text,warn=false)=>el.append(node("span",text,"tag"+(warn?" warn":"")));
+const matches=x=>[x.topic,x.text,x.title,x.next_step].filter(Boolean).join(" ").toLowerCase().includes($("search").value.toLowerCase().trim());
+
+function meter(el,label,value,detail){const block=node("div",undefined,"meter"),line=node("div",undefined,"meter-label");
+line.append(node("span",label),node("span",detail));
+const track=node("div",undefined,"track"),fill=node("div",undefined,"fill");
+fill.style.width=Math.max(0,Math.min(100,value*100))+"%";
+track.append(fill);
+block.append(line,track);
+el.append(block)}
+function lists(){const gl=$("growth-list");
+gl.replaceChildren();
+const selected=rows(state.growth?.[tab]).filter(x=>!$("search").value||matches(x));
+for(const x of selected){const row=node("article",undefined,"row");
+if(x.source_status!=="valid"){row.append(node("div",x.source_status==="invalid"?"来源失效，暂停展示":"已保护的私人经历","row-title"));
+tag(row,x.source_status==="invalid"?"需重新核验来源":"仅显示存在性",true)}else{row.append(node("div",x.topic||"未命名主题","row-title"));
+if(x.text)row.append(node("p",x.text));
+tag(row,labels[x.status]||"状态未知");
+if(typeof x.value==="number")tag(row,tab==="interests"?(x.value<0?"倾向不喜欢 ":"兴趣倾向 ")+Math.abs(x.value).toFixed(2):"置信度 "+x.value.toFixed(2))}tag(row,number(x.source_count)+" 条来源");
+gl.append(row)}if(!selected.length)empty(gl,"尚无符合条件的记录。开启并完成学习后会逐渐出现。");
+
+for(const [key,id] of [["plans","plan-list"],["reading","reading-list"]]){const el=$(id);
+el.replaceChildren();
+const items=rows(state[key]).filter(matches);
+for(const x of items){const row=node("article",undefined,"row");
+row.append(node("div",x.title,"row-title"));
+tag(row,labels[x.status]||"状态未知");
+if(key==="plans"){if(x.next_step)row.append(node("p","下一步："+x.next_step));
+if(x.due_at)row.append(node("small","计划时间："+stamp(x.due_at)))}else{const total=number(x.total),cur=number(x.current);
+meter(row,x.provider==="cap"?"cap 阅读":x.provider==="pixiv"?"Pixiv 阅读":"阅读",total?cur/total:0,cur+" / "+(total||"待识别")+" "+x.unit)}el.append(row)}if(!items.length)empty(el,key==="plans"?"还没有可展示的主人共同计划。":"还没有可展示的阅读记录。")}}
+function render(data){if(!data||data.format!=="mailivingworld.dashboard.v1")throw Error("invalid");
+state=data;
+$("content").hidden=false;
+$("error").hidden=true;
+$("identity").textContent=(data.identity?.agent_label||"持续自我")+" · "+(data.identity?.owner_bound?"主人关系已绑定":"尚未绑定主人");
+$("revision").textContent=number(data.revision);
+$("questions").textContent=rows(data.growth?.questions).filter(x=>x.status==="open").length;
+$("reading").textContent=rows(data.reading).length;
+$("plans").textContent=rows(data.plans).length;
+$("traits").replaceChildren();
+for(const x of rows(data.traits))meter($("traits"),x.label,number(x.value),x.value===null?"尚无记录":number(x.value).toFixed(2));
+$("mood").replaceChildren();
+meter($("mood"),"当前情绪",(number(data.mood?.valence)+1)/2,data.mood?.valence===null?"尚无记录":number(data.mood?.valence).toFixed(2));
+meter($("mood"),"当前精力",number(data.mood?.energy),data.mood?.energy===null?"尚无记录":number(data.mood?.energy).toFixed(2));
+$("budgets").replaceChildren();
+for(const [k,label] of [["model","模型调用"],["tools","工具调用"],["research","自主查阅"],["reading","连续阅读"]]){const b=data.budgets?.[k]||{};
+meter($("budgets"),label,number(b.limit)?number(b.used)/number(b.limit):0,number(b.used)+" / "+number(b.limit))}for(const k of ["valid","invalid","protected"])$(k).textContent=number(data.source_counts?.[k]);
+$("footer").textContent=(offline?"离线只读快照":"宿主管理员只读面板")+" · "+(stamp(data.generated_at)||"时间未知")+" · 统一记忆，按表达权限展示";
+lists()}
+async function refresh(){if(offline)return;
+$("refresh").disabled=true;
+try{if(!window.maibot)throw Error("host_missing");
+await window.maibot.ready;
+render(await window.maibot.query("summary"))}catch(_){$("error").textContent="暂时无法读取成长状态。请确认已登录管理员账号，插件已启用，且 Host 与 Dashboard 支持 WebUI v2。";
+$("error").hidden=false;
+$("content").hidden=true}finally{$("refresh").disabled=false}}
+$("refresh").addEventListener("click",refresh);
+$("search").addEventListener("input",()=>state&&lists());
+for(const button of document.querySelectorAll("[data-tab]"))button.addEventListener("click",()=>{tab=button.dataset.tab;
+for(const b of document.querySelectorAll("[data-tab]"))b.classList.toggle("active",b===button);
+if(state)lists()});
+try{const data=JSON.parse($("snapshot").textContent);
+if(data){offline=true;
+$("refresh").disabled=true;
+$("refresh").textContent="离线快照";
+render(data)}else refresh()}catch(_){$("error").textContent="快照格式无效，无法展示。";
+$("error").hidden=false}
+})();
+
+</script></body></html>

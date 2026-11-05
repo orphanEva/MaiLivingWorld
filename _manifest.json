@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "唯一主人与跨窗口持续成长；cap/Pixiv MCP 工具、带来源的工具记忆、有限自主查阅和场景表达判断",
+  "description": "唯一主人与跨窗口持续成长；连续阅读、主人共同计划、成长面板、备份恢复和 cap/Pixiv MCP",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"

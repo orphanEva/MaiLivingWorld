@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 九套数据共 39 表（含持续自我、成长与工具记忆）
+-- MaiLivingWorld MySQL 8.4 十套数据共 44 表（含持续自我、成长、工具与陪伴记忆）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -371,3 +371,66 @@ CREATE TABLE IF NOT EXISTS `mlw_tool_research` (
     daily_count BIGINT NOT NULL DEFAULT 0 COMMENT '控制行的当日研究预留次数，失败也计数',
     updated DOUBLE NOT NULL DEFAULT 0 COMMENT '最近调度状态变化时间，Unix秒'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='跨重启研究轮转租约退避及独立预算，本地检索轮转不消耗网络额度';
+
+CREATE TABLE IF NOT EXISTS `mlw_companion_control` (
+    slot BIGINT PRIMARY KEY CHECK(slot=1) COMMENT '单例控制位置，恒为1',
+    updated DOUBLE NOT NULL DEFAULT 0 COMMENT '最近阅读预算预留时间，Unix秒',
+    owner_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '最后一次受信阅读预留的主人标识，不迁移旧计划',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '独立阅读预算的日边界，Unix秒',
+    daily_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留阅读周期数，失败也占用',
+    last_cycle DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留阅读周期时间，重启保留冷却'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='陪伴账本事务互斥与独立阅读调度预算，构造时不生成控制行';
+
+CREATE TABLE IF NOT EXISTS `mlw_companion_readings` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '主人与提供者资源版本及根来源指纹绑定的稳定阅读ID',
+    owner_id VARCHAR(191) NOT NULL COMMENT '发起阅读的可信主人标识，不随主人配置变更迁移',
+    scope VARCHAR(191) NOT NULL COMMENT '首次发起场合，仅作来源及表达约束',
+    provider VARCHAR(191) NOT NULL COMMENT '固定提供者cap或pixiv',
+    resource_type VARCHAR(191) NOT NULL COMMENT '资源类型pdf、novel或illust',
+    resource_id VARCHAR(191) NOT NULL COMMENT '提供者内资源标识，不是路径或签名URL',
+    version VARCHAR(191) NOT NULL COMMENT '可信资源版本锚，不自动替换',
+    status VARCHAR(191) NOT NULL COMMENT 'active、paused或completed',
+    cursor_pos BIGINT NOT NULL DEFAULT 0 COMMENT '连续已读位置，文本为Unicode字符数，图片及PDF为页数',
+    total_units BIGINT NOT NULL DEFAULT 0 COMMENT '已验证资源总字符或页数，0表示未知不能声称读完',
+    revision BIGINT NOT NULL COMMENT '阅读任务与派生笔记变更的乐观锁版本',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前读取任务随机租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '当前读取租约截止时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '标题固定版本来源引用与暂停错误码的JSON',
+    created DOUBLE NOT NULL COMMENT '首次开启阅读时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近进度任务或笔记变化时间，Unix秒',
+    KEY `idx_companion_readings_owner` (owner_id,status,updated)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='固定资源版本的连续阅读会话，来源失效则暂停且保留已读进度';
+
+CREATE TABLE IF NOT EXISTS `mlw_companion_units` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '阅读ID与连续单元起点的稳定哈希',
+    reading_id VARCHAR(191) NOT NULL COMMENT '所属固定版本阅读会话',
+    unit_index BIGINT NOT NULL COMMENT '实际读取页码或原文Unicode字符起点，始于0',
+    next_cursor BIGINT NOT NULL COMMENT '本单元真实内容对应的下一个连续游标',
+    payload LONGTEXT NOT NULL COMMENT '实际原文图片摘要单元来源及pending或reviewed派生笔记的JSON',
+    created DOUBLE NOT NULL COMMENT '首次成功提交该读取单元的时间，Unix秒',
+    UNIQUE KEY `uq_companion_units_position` (reading_id,unit_index)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='实际读取单元的原文或图片摘要及独立派生笔记，禁止跨页跳过';
+
+CREATE TABLE IF NOT EXISTS `mlw_companion_plans` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信主人提议上下文生成的稳定计划ID',
+    owner_id VARCHAR(191) NOT NULL COMMENT '计划原主人标识，禁止迁移给新主人',
+    scope VARCHAR(191) NOT NULL COMMENT '首次提议场合，供授权追溯及表达判断',
+    status VARCHAR(191) NOT NULL COMMENT 'proposed、active、paused、completed或cancelled',
+    revision BIGINT NOT NULL COMMENT '主人命令变更版本，提醒不等于同意修改计划',
+    payload LONGTEXT NOT NULL COMMENT '标题下一步到期时间及独立提醒次数游标的JSON',
+    created DOUBLE NOT NULL COMMENT '首次草稿创建时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近主人命令修改时间，Unix秒',
+    KEY `idx_companion_plans_owner` (owner_id,status,updated)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人共同计划，模型提议为草稿且状态切换必须来自可信主人命令';
+
+CREATE TABLE IF NOT EXISTS `mlw_companion_audit` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信主人场合与消息ID生成的幂等命令标识',
+    entity_id VARCHAR(191) NOT NULL COMMENT '关联计划ID',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际命令所属可信主人标识',
+    action VARCHAR(191) NOT NULL COMMENT '提议接受暂停恢复编辑完成或取消操作',
+    message_digest VARCHAR(191) NOT NULL COMMENT '可信消息ID与场合的SHA256摘要',
+    summary_hash VARCHAR(191) NOT NULL COMMENT '可信原消息摘要的SHA256，不保存原文',
+    payload LONGTEXT NOT NULL COMMENT '命令签名及操作前后状态的JSON',
+    created DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒',
+    KEY `idx_companion_audit_entity` (entity_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人计划命令的幂等和变更审计，不保存原始消息正文';

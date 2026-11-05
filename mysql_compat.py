@@ -24,6 +24,7 @@ TABLES = (
     "self_identity", "self_owner_history",
     "growth_state", "growth_jobs", "growth_history", "growth_consumed",
     "tool_observations", "tool_calls", "tool_tasks", "tool_research",
+    "companion_control", "companion_readings", "companion_units", "companion_plans", "companion_audit",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

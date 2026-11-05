@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.13.0"
+config_version = "0.14.0"
 
 # ====================================================================
 # 10 / 统一心智与唯一主人（沿用 brain_memory 的输入名单）
@@ -295,6 +295,30 @@ webui_port = 8001
 import_max_wait_seconds = 45
 # 旧版兼容字段；v0.6.0 的 WebUI 导入桥不使用这个值，写入 global 公共作用域。
 chat_id = "living_world_explore"
+
+# 连续阅读需要 mcp、提供者、unified_mind 和可信主人绑定同时启用。
+[reading]
+# 保存连续阅读进度，需要可信主人和统一心智。
+enabled = false
+# cap已有PDF读取，网关也必须启用。
+cap_pdf_enabled = false
+# 后台继续已开始的小说；不会自动下载。
+auto_continue = false
+# 每段小说字符数。
+excerpt_chars = 2000
+# 后台阅读持久最短间隔秒数。
+interval_seconds = 3600
+# 后台每日最多段数，失败计数。
+max_daily_units = 6
+
+# 草案经主人私聊确认后才生效。提醒仍需主动联系白名单和总开关。
+[shared_plans]
+# 共同计划总开关，主人确认后生效。
+enabled = false
+# 主人私聊跟进，沿用主动联系限制。
+followup_enabled = false
+# 同计划跟进尝试间隔小时数。
+followup_interval_hours = 24
 
 # ====================================================================
 # 12 / MCP 工具与自主查阅

@@ -9,6 +9,7 @@ import re
 
 # kind: read, write, account (persistent/remote account changes), transfer.
 CAP_TOOLS = {
+    "living_read_pdf_page": ("read", "读取网关已有PDF的一页；请通过living_world_reading保存阅读进度"),
     "jm_get_album": ("read", "按作品编号读取标题、作者、标签与页数"),
     "jm_get_cached_pdf": ("read", "查询作品是否已有本地 PDF 缓存"),
     "jm_start_download": ("write", "创建后台下载和 PDF 生成任务；受理不代表完成"),

@@ -1,6 +1,21 @@
-# MaiLivingWorld · 麦麦的小世界 v0.13.0（统一成长与 MCP 工具）
+# MaiLivingWorld · 麦麦的小世界 v0.14.0（阅读、共同计划与成长面板）
 
 > MaiBot WebUI 可上传 ZIP 安装，独立于 MaiBot 本体。主动联系默认关闭并保留演练模式；成长与 MCP 默认关闭。使用 MCP 时可另部署两个 Docker 网关，连接既有服务。
+
+
+## v0.14.0 · 连续阅读、共同计划和成长面板
+
+- **连续阅读**：`living_world_reading` 支持 Pixiv 缓存小说、插画和 cap 网关已有 PDF。`open` 建立固定版本的阅读，`next` 读取下一段/页，`list` 查看进度，`notes` 查看核验笔记，`review` 重试待核验文字笔记，`resume` 重新检查后恢复暂停任务。小说按 Unicode 字符、PDF/插画按页推进。来源撤回或版本改变使记录暂停；同版本重新获取而来源指纹变化时建立新阅读，保留旧记录。
+- **阅读学习**：文字笔记需逐字引用原文并独立复核，失败或预算不足保留 pending。真实原文进入统一工具记忆，后续成长仍受证据、变化上限与复核约束，不把小说当现实事实。图片通过 Host `content_items` 交给当前模型，后台文字笔记不冒充视觉理解。`auto_continue` 只继续已开始的小说，不自行下载；后台次数及模型/MCP预算跨重启保留。
+- **共同计划**：`living_world_shared_plans` 只能起草和列出计划。主人私聊发送 `/共同计划 接受 <计划ID> <当前版本>` 后生效；`暂停`、`继续`、`完成`、`取消` 使用同样格式。模型不能代替主人提交状态变更。`due_at=0` 不提醒；开启跟进后，到期计划进入已有主动聊天流程，仍受白名单、静默、免打扰、拒绝联系与配额限制。
+- **成长面板**：`webui.json` + `webui/index.html` 使用 Host 自定义页面协议 v2，经登录管理端查询 `living_world_dashboard`。展示身份连续性、性格/情绪、带来源的成长结论、阅读/计划进度和预算；第三方私人内容只统计、不输出正文。需要支持 `custom_pages` 的 Host；旧 Host 可调用同名管理 API，不能仅凭 SDK 版本断言页面可用。
+- **备份恢复**：`scripts/backup_state.py` 提供 SQLite/MySQL 备份、校验与空目标恢复演练。恢复默认只检查，执行另需 `--apply --confirm RESTORE_EMPTY_TARGET`；不覆盖运行数据、不打包配置密钥。数据库备份含私人记忆，须妥善保存。具体参数见 `python scripts/backup_state.py --help`。
+
+新增 `companion.sqlite3` 或五张 MySQL `companion_` 表，共十套账本、44 张 MySQL 表；旧备份没有新库时可省略迁移。`[reading]` 和 `[shared_plans]` 的所有功能开关默认关闭。cap PDF 还需网关环境 `MLW_CAP_PDF_READ_ENABLED=true` 和插件 `reading.cap_pdf_enabled=true`，无需给 MaiBot 挂载 cap 文件卷。PyMuPDF 仅安装在 cap 网关环境。
+
+主动聊天的 `general.dry_run` 不替代 MCP、阅读或计划的独立开关。显式启用阅读/计划后会保存进度与确认记录；它们不会直接发送 QQ。备份和恢复具体步骤见 [备份说明](deploy/BACKUP.md)，实际备份前须停止所有写入者以保证跨库一致性。
+
+保存的是可检查的状态、证据和短篇结论，不保存模型隐藏思维链，也不代表模型具有人类意识。
 
 ## v0.13.0 · 工具、带来源的学习与 Docker 接入
 

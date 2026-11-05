@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["custom_pages"],
+  "pages": [{
+    "id": "growth", "title": "成长手记", "icon": "chart", "placement": "sidebar",
+    "mode": "custom", "entry": "webui/index.html", "layout": "document",
+    "queries": {"summary": {"api": "living_world_dashboard", "version": "1"}}
+  }]
+}

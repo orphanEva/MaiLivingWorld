@@ -27,6 +27,9 @@ services:
       MLW_MCP_GATEWAY_CWD: /opt/cap
       MLW_MCP_GATEWAY_ALLOWED_HOSTS: '["cap-mcp:8000"]'
       MLW_MCP_GATEWAY_TIMEOUT_SECONDS: '90'
+      MLW_CAP_PDF_READ_ENABLED: ${MLW_CAP_PDF_READ_ENABLED:-false}
+      # Fixed mounted cache root, never supplied by the model or a tool argument.
+      MLW_CAP_PDF_ROOT: /var/lib/cap/downloads
       JM_CONFIG_PATH: /opt/cap/config/mcp-option.yml
       JM_TASK_DB_PATH: /var/lib/cap/tasks/tasks.sqlite3
       JM_MAX_CONCURRENT_DOWNLOADS: '2'

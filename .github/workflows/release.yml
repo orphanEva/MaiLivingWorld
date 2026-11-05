@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=2.3,<3' 'jsonschema>=4,<5'
+        run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=2.3,<3' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2'
       - name: Test
         run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -v
       - name: Package WebUI plugin ZIP

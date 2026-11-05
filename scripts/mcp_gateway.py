@@ -15,11 +15,13 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from MaiLivingWorld.mcp_client import MCPError, StdioMCPClient
 from MaiLivingWorld.mcp_policy import CATALOG
+from MaiLivingWorld.document_reader import (DocumentError, PDF_DESCRIPTION, PDF_SCHEMA, PDF_TOOL,
+                                           pdf_arguments, read_cached_pdf_page)
 
 _CHILD_NAMES = {
     "cap": {"JM_CONFIG_PATH", "JM_TASK_DB_PATH", "JM_MAX_CONCURRENT_DOWNLOADS",
@@ -62,6 +64,8 @@ class GatewaySettings:
     timeout_seconds: float = 60
     max_response_bytes: int = 1024 * 1024
     close_seconds: float = 12
+    pdf_read_enabled: bool = False
+    pdf_root: str = field(default="/var/lib/cap/downloads", repr=False)
 
     def __post_init__(self):
         if (self.provider not in CATALOG or not isinstance(self.token, str)
@@ -75,6 +79,11 @@ class GatewaySettings:
                 or type(self.close_seconds) not in (int, float) or not math.isfinite(self.close_seconds)
                 or not 0 < self.close_seconds <= 30
                 or type(self.max_response_bytes) is not int or not 1024 <= self.max_response_bytes <= 4*1024*1024):
+            raise GatewayConfigError()
+        if (type(self.pdf_read_enabled) is not bool or self.pdf_read_enabled and self.provider != "cap"
+                or not isinstance(self.pdf_root, str) or not self.pdf_root or len(self.pdf_root) > 4096
+                or "\0" in self.pdf_root or ".." in Path(self.pdf_root).parts
+                or not (Path(self.pdf_root).is_absolute() or PurePosixPath(self.pdf_root).is_absolute())):
             raise GatewayConfigError()
         for origin in self.allowed_origins:
             try:
@@ -103,6 +112,9 @@ class GatewaySettings:
         env = os.environ if env is None else env
         try:
             provider = env["MLW_MCP_GATEWAY_PROVIDER"]
+            pdf_enabled = env.get("MLW_CAP_PDF_READ_ENABLED", "false").lower()
+            if pdf_enabled not in {"true", "false", "1", "0"}:
+                raise GatewayConfigError()
             child = {key: env[key] for key in _CHILD_NAMES[provider] if env.get(key)}
             child.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
             if provider == "pixiv":
@@ -122,6 +134,8 @@ class GatewaySettings:
                 allowed_hosts=tuple(_json_list(env.get("MLW_MCP_GATEWAY_ALLOWED_HOSTS", json.dumps([provider+"-mcp:8000"])))),
                 timeout_seconds=float(env.get("MLW_MCP_GATEWAY_TIMEOUT_SECONDS", "60")),
                 max_response_bytes=int(env.get("MLW_MCP_GATEWAY_MAX_RESPONSE_BYTES", "1048576")),
+                pdf_read_enabled=pdf_enabled in {"true", "1"},
+                pdf_root=env.get("MLW_CAP_PDF_ROOT", "/var/lib/cap/downloads"),
             )
         except (KeyError, TypeError, ValueError, OSError, UnicodeError):
             raise GatewayConfigError() from None
@@ -155,6 +169,12 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
     from starlette.routing import Route
 
     state = {"client": None, "tools": {}, "ready": False, "running": False, "restart_needed": False}
+    catalog = dict(CATALOG[settings.provider])
+    # The gateway owns this schema and implementation. Never proxy a provider's
+    # similarly named tool, even when its name appears in the plugin catalog.
+    catalog.pop(PDF_TOOL, None)
+    if settings.provider == "cap" and settings.pdf_read_enabled:
+        catalog[PDF_TOOL] = ("read", PDF_DESCRIPTION)
     operation_lock = asyncio.Lock()
     secrets = [settings.token] + [v for k, v in settings.child_env.items()
                                   if len(v) >= 16 and re.search(r"KEY|TOKEN|PASSWORD|COOKIE", k)]
@@ -185,7 +205,7 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
                 discovered = await client.list_tools()
             selected = {}
             for name, info in discovered.items():
-                if name not in CATALOG[settings.provider]:
+                if name not in catalog or name == PDF_TOOL:
                     continue
                 schema = info.get("input_schema")
                 encoded = json.dumps(schema, ensure_ascii=False, allow_nan=False)
@@ -193,6 +213,8 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
                         or any(secret in encoded for secret in secrets)):
                     raise ValueError("invalid_schema")
                 selected[name] = copy.deepcopy(schema)
+            if PDF_TOOL in catalog and "jm_get_cached_pdf" in selected:
+                selected[PDF_TOOL] = copy.deepcopy(PDF_SCHEMA)
             state["tools"] = selected
             state["ready"] = True
         except BaseException:
@@ -206,13 +228,13 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
             async with operation_lock:
                 await ensure_client()
                 return types.ListToolsResult(tools=[types.Tool(
-                    name=name, description=CATALOG[settings.provider][name][1],
+                    name=name, description=catalog[name][1],
                     input_schema=copy.deepcopy(schema)) for name, schema in sorted(state["tools"].items())])
         except Exception:
             raise ProtocolError(-32603, "upstream_unavailable") from None
 
     async def call_tool(_context, params):
-        if params.name not in CATALOG[settings.provider]:
+        if params.name not in catalog:
             return failed("tool_not_available")
         try:
             async with operation_lock:
@@ -220,7 +242,12 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
                 if params.name not in state["tools"]:
                     return failed("tool_not_available")
                 try:
-                    result = await state["client"].call_tool(params.name, params.arguments or {})
+                    if params.name == PDF_TOOL:
+                        ident, index = pdf_arguments(params.arguments or {})
+                        cached = await state["client"].call_tool("jm_get_cached_pdf", {"jm_id": ident})
+                        result = await read_cached_pdf_page(cached, jm_id=ident, page_index=index, root=settings.pdf_root)
+                    else:
+                        result = await state["client"].call_tool(params.name, params.arguments or {})
                 except MCPError as exc:
                     if exc.code not in {"tool_error", "invalid_request", "queue_full"}:
                         state["restart_needed"], state["ready"] = True, False
@@ -231,7 +258,20 @@ def create_app(settings: GatewaySettings, *, client_factory=None):
             raw = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             if len(raw.encode("utf-8")) > settings.max_response_bytes:
                 return failed()
-            return types.CallToolResult(content=[types.TextContent(text=raw)], structured_content=result)
+            # Duplicating image base64 in text would exceed the client's default
+            # 256 KiB aggregate result limit and turn visual input into raw text.
+            content = "已读取一页缓存 PDF；文字和图片位于结构化结果，尚未进行视觉理解。" if params.name == PDF_TOOL else raw
+            return types.CallToolResult(content=[types.TextContent(text=content)], structured_content=result)
+        except DocumentError as exc:
+            if params.name == PDF_TOOL and exc.code == "pdf_not_cached":
+                # A successful cache lookup established absence. Keep this
+                # distinguishable from a transport/parser failure so consumers
+                # can withdraw dependent observations without inspecting errors.
+                unavailable = {"provider": "cap", "kind": "pdf_page", "jm_id": ident,
+                               "available": False, "reason": "source_unavailable"}
+                return types.CallToolResult(content=[types.TextContent(text="当前没有这部作品的可读 PDF 缓存。")],
+                                            structured_content=unavailable)
+            return failed(exc.code)
         except Exception:
             # Never include provider errors, argv, environment or stack traces.
             return failed()

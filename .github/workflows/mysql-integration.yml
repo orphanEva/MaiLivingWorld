@@ -39,4 +39,18 @@ jobs:
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_ledgers_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_growth_mysql_live.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_tool_mysql_live.py' -v
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_companion_mysql_live.py' -v
+      - name: Create isolated backup restore database
+        run: |
+          python - <<'PY'
+          import pymysql
+          with pymysql.connect(host='127.0.0.1', user='root', password='ci-test-root-only', autocommit=True) as db:
+              with db.cursor() as cur:
+                  cur.execute('CREATE DATABASE mlw_backup_test CHARACTER SET utf8mb4')
+                  cur.execute("GRANT ALL ON mlw_backup_test.* TO 'mlw_test'@'%'")
+          PY
+      - name: Verify backup restore against real MySQL
+        env:
+          MLW_BACKUP_MYSQL_DATABASE: mlw_backup_test
+        run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_backup_state.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mysql_schema_comments.py' -v
