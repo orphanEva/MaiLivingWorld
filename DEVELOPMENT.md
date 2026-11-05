@@ -19,6 +19,8 @@
 - 发行ZIP固定54文件，含迁移/备份脚本、SQL与部署说明，排除配置凭据/实际数据库。尚未启动用户Docker、QQ或真实模型；实际验收留给用户。真实MySQL8.4（含独立空库恢复/计数器高水位）由推送后CI验证，结果以对应HEAD为准。
 - 首轮Linux Python CI全部通过；真实MySQL已有账本、成长、工具、阅读与计划测试通过，备份演练暴露SHOW TABLE STATUS缓存自增计数器与结构判断混用的问题。备份工具现每次禁用当前连接的统计缓存，按列Extra再验证真实高水位，缺失即拒绝且不强制NULL为1；新增3项离线回归通过，live加强为插入高位ID后删除、恢复后新ID不得复用。该独立备份工具要求MySQL8+，原运行存储后端不受影响。
 - 真实CI进一步定位新建且未打开的brain_decisions表：自增列存在而初次状态返回NULL。结合MySQL8.4官方实现，备份与恢复均先SHOW CREATE TABLE打开表、初始化引擎原生计数器，再单表刷新状态并校验，不解析DDL推测计数、不填默认值。新增未打开表回归，备份专项28项中27通过、1live由CI验证；临时诊断已移除。
+- 最终运行代码 `6c17214870e9f9bb4971a27d6614372347763dad` 已推送并通过两项CI：[Linux Python](https://github.com/orphanEva/MaiLivingWorld/actions/runs/41948964045) 全量546项（518通过、28真实MySQL跳过）；[MySQL 8.4](https://github.com/orphanEva/MaiLivingWorld/actions/runs/41948964145) 全部账本/成长/工具/阅读计划/SQL结构专项以及独立44表备份恢复、高位自增ID不复用演练通过。后续仅追加本条交付记录，不改变已验证代码。
+- 最终安装包 `MaiLivingWorld-v0.14.0-WebUI.zip`，54文件，SHA256 `39d042019fac17560696b3ca0158058f741af99d1231773d1e0aee996e162e04`。用户工作区outputs另有Docker部署说明与备份恢复说明。下一步是用户实际Docker/QQ/模型验收及反馈；不要把图片取回或短篇文字核验描述成已经理解整本漫画。
 
 ## 此前实现（v0.13.0）
 
