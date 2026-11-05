@@ -949,19 +949,27 @@ class MaiLivingWorld(MaiBotPlugin):
                         if runtime.context(kwargs) != before:
                             prompt = ""
                         else:
-                            prompt += "\n\n" + attention.hint(kwargs)
+                            extra = attention.hint(kwargs)
+                            if extra:
+                                prompt += "\n\n" + extra
                     recollection = self._ensure_recollection()
                     if recollection and runtime.context(kwargs) == before:
-                        prompt += "\n\n" + recollection.repeat_hint(kwargs)
+                        extra = recollection.repeat_hint(kwargs)
+                        if extra:
+                            prompt += "\n\n" + extra
                     habits = self._ensure_habits()
                     if habits and runtime.context(kwargs) == before:
                         mode = attention.effective_mode(kwargs) if attention else None
                         if mode is None:
                             continuity = self._ensure_continuity()
                             mode = continuity.store.state(habits.owner())["support"]["effective_mode"] if continuity else "normal"
-                        prompt += "\n\n" + habits.hint(kwargs, current_mode=mode)
+                        extra = habits.hint(kwargs, current_mode=mode)
+                        if extra:
+                            prompt += "\n\n" + extra
                     if runtime.context(kwargs) == before:
-                        prompt += "\n\n" + self._followthrough_hint(kwargs)
+                        extra = self._followthrough_hint(kwargs)
+                        if extra:
+                            prompt += "\n\n" + extra
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -982,7 +990,9 @@ class MaiLivingWorld(MaiBotPlugin):
     async def owner_planner_prompt(self, **kwargs):
         prompt = self._owner_prompt_for(kwargs)
         if prompt:
-            prompt += "\n\n" + self._followthrough_hint(kwargs)
+            extra = self._followthrough_hint(kwargs)
+            if extra:
+                prompt += "\n\n" + extra
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
         if updated is not None:
             self.ctx.logger.info("[MaiLivingWorld][OWNER] 私聊 Planner 主人提示注入成功")

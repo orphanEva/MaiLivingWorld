@@ -232,3 +232,13 @@ class FollowthroughPluginTests(unittest.IsolatedAsyncioTestCase):
         planner = await self.bot.owner_planner_prompt(session_id="other-session", reply_message_id="other",
             messages=[{"role": "system", "content": "test"}])
         self.assertNotIn("living_world_followthrough", json.dumps(planner))
+
+    async def test_empty_hints_never_modify_invalid_or_missing_reply_context(self):
+        self.bot.config.habits.enabled = True
+        self.bot.config.recollection.enabled = True
+        self.bot.config.attention.enabled = True
+        for options in ({}, {"session_id": "missing"}, {"session_id": "group-one"},
+                        {"session_id": "private-one", "reply_message_id": "old"}):
+            result = await self.bot.brain_reply_hint(**options, messages=[{"role": "system", "content": "original"}])
+            self.assertEqual(result, {"action": "continue"})
+        self.bot.ctx.llm.generate.assert_not_called()
