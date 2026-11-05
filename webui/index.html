@@ -7,6 +7,7 @@
 <div id="error" role="alert" class="error" hidden></div>
 <div id="content" hidden><div class="cards"><div class="card"><strong id="revision">—</strong><span>成长修订</span></div><div class="card"><strong id="questions">—</strong><span>仍在探索的问题</span></div><div class="card"><strong id="reading">—</strong><span>阅读记录</span></div><div class="card"><strong id="plans">—</strong><span>共同计划</span></div></div>
 <div class="columns"><div class="stack">
+<section><h2>此刻的关注</h2><div id="attention-state"></div><p class="notice">聊天时先回应眼前的人；后台阅读与研究保留进度，之后再续。这里只展示活动状态。</p></section>
 <section><h2>最近放在心上的事</h2><div id="continuity-state"></div><div id="continuity-threads"></div><p class="notice">近况来自主人的原话，经复核后留下摘要；不代表已承诺提醒，也不代表已经发出关心。自然聊天中逐渐了解后才会出现。</p></section>
 <section><h2>我们的相处方式</h2><div id="bond-profile"></div><p class="notice">称呼与边界来自主人明确的约定，可在私聊中用 /相处 指令查看和修改。</p></section>
 <section><h2>留下的回忆与纪念日</h2><div id="bond-moments"></div><p class="notice">展示主人明确记下的事项。草稿、未完成的计划和发送尝试不会自动成为共同回忆。</p></section>
@@ -115,7 +116,20 @@ fill.style.width=Math.max(0,Math.min(100,value*100))+"%";
 track.append(fill);
 block.append(line,track);
 el.append(block)}
-function lists(){renderBond();renderContinuity();
+function renderAttention(){
+  const a=state?.attention||{},el=$("attention-state");el.replaceChildren();
+  if(!a.enabled){empty(el,"统一关注尚未启用。");return}
+  const engaged=a.engaged&&new Date(a.engaged_until).valueOf()>Date.now();
+  el.append(node("p",engaged?"正在优先回应当前对话":a.working?"正在推进一项后台阅读或查阅":"等待下一次合适的行动机会"));
+  const focus={reading:"还有一项阅读可以续接",research:"还有一个问题可以继续查阅"};
+  if(focus[a.focus_kind])el.append(node("p",focus[a.focus_kind]));
+  const modes={listen:"先倾听",advice:"一起想办法",repair:"核对并修正刚才的理解",light:"轻松聊聊"};
+  const c=a.conversation||{};
+  if(c.active&&new Date(c.until).valueOf()>Date.now()&&modes[c.mode])el.append(node("p","当前交流："+modes[c.mode]));
+  const outcomes={progress:"上次后台行动已取得进展",blocked:"上次行动暂未推进，等待条件合适",interrupted:"上次行动被打断，关注保留",failed:"上次行动未完成，稍后再安排"};
+  if(outcomes[a.last_outcome])el.append(node("p",outcomes[a.last_outcome],"muted"));
+}
+function lists(){renderBond();renderContinuity();renderAttention();
 const gl=$("growth-list");
 gl.replaceChildren();
 const selected=rows(state.growth?.[tab]).filter(x=>!$("search").value||matches(x));
@@ -164,7 +178,7 @@ $("error").hidden=false;
 $("content").hidden=true}finally{$("refresh").disabled=false}}
 $("refresh").addEventListener("click",refresh);
 $("search").addEventListener("input",()=>state&&lists());
-setInterval(()=>{if(state)renderContinuityState()},30000);
+setInterval(()=>{if(state){renderContinuityState();renderAttention()}},30000);
 for(const button of document.querySelectorAll("[data-tab]"))button.addEventListener("click",()=>{tab=button.dataset.tab;
 for(const b of document.querySelectorAll("[data-tab]"))b.classList.toggle("active",b===button);
 if(state)lists()});

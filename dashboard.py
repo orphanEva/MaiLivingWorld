@@ -142,8 +142,30 @@ def _continuity_view(value, *, now):
     return result
 
 
+def _attention_view(value, *, now):
+    value = _dict(value)
+    if value.get("enabled") is not True:
+        return {"enabled": False}
+    until = value.get("engaged_until", 0)
+    if isinstance(until, str):
+        try:
+            until = datetime.fromisoformat(until).timestamp()
+        except (ValueError, OverflowError):
+            until = 0
+    engaged = value.get("engaged") is True and _number(until, 0, 253402300799) is not None and until > now
+    return {"enabled": True, "engaged": engaged, "engaged_until": _date(until) if engaged else "",
+            "focus_kind": value.get("focus_kind") if value.get("focus_available") is True
+                and value.get("focus_kind") in {"reading", "research"} else "",
+            "focus_available": value.get("focus_available") is True,
+            "working": value.get("working") is True and not engaged and value.get("focus_available") is True,
+            "conversation": _phase_view(value.get("conversation"), ("listen", "advice", "repair", "light"), now),
+            "last_outcome": value.get("last_outcome") if value.get("last_outcome") in
+                {"progress", "blocked", "interrupted", "failed"} else "",
+            "last_finished": _date(value.get("last_finished")), "cycle_count": _count(value.get("cycle_count"))}
+
+
 def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fingerprint,
-                    budgets=None, companion=None, bond=None, continuity=None, authorized=False, now=None) -> dict:
+                    budgets=None, companion=None, bond=None, continuity=None, attention=None, authorized=False, now=None) -> dict:
     """Caller must authenticate the Host WebUI administrator or the private owner.
 
     ``authorized`` is a server decision, never a user/model argument. Invalid or
@@ -254,6 +276,7 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
                             "status": "open", "updated_at": item.get("updated"), "source_count": len(refs)})
         result["continuity"] = _continuity_view({"enabled": True, "contact": current.get("contact"),
             "support": current.get("support"), "threads": threads}, now=now)
+    result["attention"] = _attention_view(attention if owner and _dict(attention).get("owner_id") == owner else None, now=now)
     return result
 
 
@@ -298,6 +321,7 @@ def _export(snapshot):
             result[key].append(row)
     result["bond"] = _bond_view(snapshot.get("bond"))
     result["continuity"] = _continuity_view(snapshot.get("continuity"), now=time.time())
+    result["attention"] = _attention_view(snapshot.get("attention"), now=time.time())
     return result
 
 

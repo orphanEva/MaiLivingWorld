@@ -239,7 +239,7 @@ class CompanionRuntime:
         resolved = self.bot._tool_store.resolve([ref["id"] for ref in reading["source_refs"]])
         return [self._ref(record) for record in resolved]
 
-    async def read(self, action, provider, kind, resource, reading_id, kwargs, *, internal=False):
+    async def read(self, action, provider, kind, resource, reading_id, kwargs, *, internal=False, external_valid=None):
         b = self.bot
         trusted = self.owner_context(kwargs, mcp=True) if not internal else None
         if not b.config.reading.enabled or not b.config.mcp.enabled or (not internal and not trusted):
@@ -247,7 +247,10 @@ class CompanionRuntime:
         owner = b._self_state.state()["owner_id"]
         if action == "list":
             return {"success": True, "data": [safe_reading(r) for r in self.store.readings(owner_id=owner)]}
-        valid = self.validity(trusted)
+        base_valid = self.validity(trusted)
+        valid = lambda: base_valid() and (external_valid is None or external_valid())
+        if not valid():
+            return {"success": False, "code": "context_changed"}
         try:
             row = None if action in {"open", "list"} else self.store.reading(reading_id, owner_id=owner)
         except ValueError:
@@ -388,21 +391,23 @@ class CompanionRuntime:
         finally:
             b._mcp_calls.discard(task)
 
-    async def auto_read(self):
+    async def auto_read(self, *, reading_id=None, external_valid=None):
         b = self.bot
         if not (b.config.reading.enabled and b.config.reading.auto_continue and b.config.mcp.enabled
                 and b._ensure_unified()):
             return
         owner = b._self_state.state()["owner_id"]
-        rows = self.store.readings(owner_id=owner, status="active", resource_type="novel", order="oldest", limit=1)
-        if not rows:
+        rows = self.store.readings(owner_id=owner, status="active", resource_type="novel", order="oldest", limit=100 if reading_id else 1)
+        if reading_id is not None:
+            rows = [row for row in rows if row["id"] == reading_id]
+        if not rows or external_valid is not None and not external_valid():
             return
         if not self.store.reserve_reading_cycle(owner_id=owner,
             interval_seconds=b.config.reading.interval_seconds, daily_limit=b.config.reading.max_daily_units,
             day_start=day_start(b.config.general.timezone)):
             return
         row = min(rows, key=lambda r: (r["updated"], r["id"]))
-        await self.read("next", "", "", "", row["id"], {}, internal=True)
+        return await self.read("next", "", "", "", row["id"], {}, internal=True, external_valid=external_valid)
 
     def due_plan(self, owner):
         if not self.bot.config.shared_plans.enabled or not self.bot.config.shared_plans.followup_enabled:

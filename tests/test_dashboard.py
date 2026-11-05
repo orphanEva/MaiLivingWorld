@@ -38,6 +38,32 @@ class DashboardTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(dashboard.DashboardError, "access_denied"):
                 self.build(authorized=value)
 
+    def test_attention_projection_never_exposes_refs_or_private_text(self):
+        value = {"enabled": True, "owner_id": self.owner, "engaged": True, "engaged_until": 150,
+                 "focus_kind": "research", "focus_available": True, "focus": {"key": "private-source"},
+                 "conversation": {"mode": "repair", "until": 160, "active": True, "text": "private original"},
+                 "last_outcome": "interrupted", "cycle_count": 2}
+        result = self.build(attention=value)["attention"]
+        self.assertTrue(result["engaged"])
+        self.assertEqual(result["focus_kind"], "research")
+        self.assertEqual(result["conversation"]["mode"], "repair")
+        for secret in (self.owner, "private-source", "private original"):
+            self.assertNotIn(secret, json.dumps(result))
+        self.assertFalse(self.build(attention=dict(value, owner_id="87654321"))["attention"]["enabled"])
+
+    def test_attention_export_expires_transient_state_and_drops_unknown_fields(self):
+        value = {"enabled": True, "owner_id": self.owner, "engaged": True, "engaged_until": 150,
+                 "focus_kind": "reading", "focus_available": True,
+                 "conversation": {"mode": "listen", "until": 160, "active": True}, "last_outcome": "forged text"}
+        snapshot = self.build(attention=value)
+        snapshot["attention"]["secret"] = "secret private original"
+        with patch.object(dashboard.time, "time", return_value=200):
+            exported = dashboard._export(snapshot)["attention"]
+        self.assertFalse(exported["engaged"])
+        self.assertFalse(exported["conversation"]["active"])
+        self.assertEqual(exported["last_outcome"], "")
+        self.assertNotIn("secret", json.dumps(exported))
+
     def test_public_growth_summary_but_no_original_or_identity(self):
         result = self.build()
         text = json.dumps(result, ensure_ascii=False)

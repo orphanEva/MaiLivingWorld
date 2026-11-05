@@ -37,6 +37,7 @@ class UnifiedRuntime:
     def __init__(self, state, *, profile=None):
         self.state = state
         self.profile = profile
+        self.latest_private_only = False
         self._contexts: dict[tuple[str, str], dict] = {}
         self._private: dict[str, str] = {}
         self._cache: dict[tuple, tuple[float, str]] = {}
@@ -105,6 +106,9 @@ class UnifiedRuntime:
             mid = self._private.get(sid, "")
         item = self._contexts.get((sid, mid))
         if not item or time.monotonic() - item["seen"] > 90:
+            return None
+        if (self.latest_private_only and item["scope"].startswith("private:")
+                and self._private.get(sid) != mid):
             return None
         return dict(item)
 

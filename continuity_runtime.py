@@ -142,11 +142,11 @@ class ContinuityRuntime:
     def contact_allowed(self, *, now=None):
         return not self.enabled() or not self.store.state(self.owner(), now=now)["contact"]["active"]
 
-    def style(self, query=""):
+    def style(self, query="", *, support_override=None):
         if not self.enabled():
             return ""
         state = self.store.state(self.owner())
-        hint = continuity_style_hint(state["support"]["effective_mode"], returning=_short(query) in _RETURNS)
+        hint = continuity_style_hint(support_override or state["support"]["effective_mode"], returning=_short(query) in _RETURNS)
         if state["contact"]["active"]:
             hint += "\n对方已明确希望暂缓主动联系；当前是对方发起的对话，照常回应，不追问去向或要求解释。"
         return hint

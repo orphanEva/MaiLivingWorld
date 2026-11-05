@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十二套数据共 51 表（含持续自我、成长、工具、陪伴、相处约定与聊天连续性）
+-- MaiLivingWorld MySQL 8.4 十三套数据共 54 表（含持续自我、成长、工具、陪伴、聊天连续性与注意安排）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -519,3 +519,39 @@ CREATE TABLE IF NOT EXISTS `mlw_continuity_audit` (
     created DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒',
     KEY `idx_continuity_audit_owner` (owner_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='连续性提取与明确联系节奏修改审计，不证明机器人已经问候';
+
+CREATE TABLE IF NOT EXISTS `mlw_attention_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '注意安排控制状态的乐观锁版本',
+    payload LONGTEXT NOT NULL COMMENT '关注事项对话活动来源摘要及连续状态JSON，不保存聊天正文',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '自主活动额度所属日期起点，Unix秒',
+    cycle_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的活动批次次数',
+    last_started DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次活动批次开始时间，Unix秒',
+    engaged_until DOUBLE NOT NULL DEFAULT 0 COMMENT '主人当前互动保留窗口截止时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前独占活动批次租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '活动批次租约失效时间，Unix秒',
+    lease_revision BIGINT NOT NULL DEFAULT 0 COMMENT '领取活动时控制状态版本，防止旧任务提交',
+    last_finished DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次活动批次完成时间，Unix秒',
+    last_outcome VARCHAR(191) NOT NULL DEFAULT '' COMMENT '最近活动结果，不据此推断消息已成功送达',
+    created DOUBLE NOT NULL COMMENT '首次接收可信互动或活动安排时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态变化时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人互动与自主活动的持久注意安排，尝试不等于执行或发送成功';
+
+CREATE TABLE IF NOT EXISTS `mlw_attention_receipts` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信入站消息与场合的稳定摘要',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际消息所属的可信主人标识',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重放冲突检测',
+    revision BIGINT NOT NULL COMMENT '该消息首次更新注意安排时的控制版本',
+    mode_hash VARCHAR(191) NOT NULL DEFAULT '' COMMENT '该消息应用时模式配置的摘要',
+    created DOUBLE NOT NULL COMMENT '首次采集该可信消息的时间，Unix秒',
+    KEY `idx_attention_receipts_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='可信主人入站互动去重凭据，只保存摘要而非聊天正文';
+
+CREATE TABLE IF NOT EXISTS `mlw_attention_events` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '稳定活动或状态变更审计标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '该条活动审计所属的可信主人标识',
+    action VARCHAR(191) NOT NULL COMMENT '实际已发生的控制变更或批次结果',
+    payload LONGTEXT NOT NULL COMMENT '有界结构化活动结果JSON，不保存隐藏推理或聊天正文',
+    created DOUBLE NOT NULL COMMENT '事件提交时间，Unix秒',
+    KEY `idx_attention_events_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='注意安排与活动结果审计，不存正文且不冒称已经关心';

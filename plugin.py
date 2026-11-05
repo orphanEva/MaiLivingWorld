@@ -44,6 +44,7 @@ from .mcp_policy import CATALOG
 from .companion_runtime import CompanionRuntime
 from .bond_runtime import BondRuntime
 from .continuity_runtime import ContinuityRuntime
+from .attention_runtime import AttentionRuntime
 
 
 class PluginSection(PluginConfigBase):
@@ -51,7 +52,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.16.0",
+        default="0.17.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -295,6 +296,14 @@ class Continuity(PluginConfigBase):
     rest_hours: int = Field(default=8, ge=1, le=24, description="明确说晚安或去睡后暂停主动联系的小时数；不会因此停止正常回复")
 
 
+class Attention(PluginConfigBase):
+    enabled: bool = Field(default=False, description="启用统一关注与后台行动选择，需统一心智active")
+    dialogue_enabled: bool = Field(default=True, description="按当前主人私聊判断短时倾听、建议和误会修复")
+    engagement_seconds: int = Field(default=90, ge=15, le=600, description="收到主人私聊后优先当前对话的秒数")
+    interval_seconds: int = Field(default=300, ge=30, le=86400, description="统一后台行动的最小间隔秒数")
+    max_daily_actions: int = Field(default=12, ge=0, le=100, description="统一后台行动每天最多尝试次数，仍遵守原工具和阅读预算")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -316,6 +325,7 @@ class Config(PluginConfigBase):
     shared_plans: SharedPlans = Field(default_factory=SharedPlans)
     bond: Bond = Field(default_factory=Bond)
     continuity: Continuity = Field(default_factory=Continuity)
+    attention: Attention = Field(default_factory=Attention)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -370,6 +380,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._companion: CompanionRuntime | None = None
         self._bond: BondRuntime | None = None
         self._continuity: ContinuityRuntime | None = None
+        self._attention: AttentionRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -417,7 +428,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.16.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.17.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -435,6 +446,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._growth_runtime.reset()
         if self._continuity:
             self._continuity.reset()
+        if self._attention:
+            self._attention.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -575,6 +588,12 @@ class MaiLivingWorld(MaiBotPlugin):
                     self.ctx.logger.info("[MaiLivingWorld][BOND] 相处指令无效或版本已变化，保留原状态")
             if self.config.shared_plans.enabled:
                 await self._ensure_companion().capture_plan_command(message)
+        attention = self._ensure_attention()
+        if attention:
+            try:
+                attention.capture(message)
+            except (ValueError, TypeError):
+                self.ctx.logger.info("[MaiLivingWorld][ATTENTION] 输入未通过核验，保留当前关注")
         continuity = self._ensure_continuity()
         if continuity:
             try:
@@ -704,7 +723,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._pending_proactive.pop(sid, None)
         return {"action": "continue"}
 
-    def _relation_for(self, kind: str, query: str = "") -> str:
+    def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
             return ""
@@ -716,7 +735,7 @@ class MaiLivingWorld(MaiBotPlugin):
             hint += "\n\n" + bond.style()
         continuity = self._ensure_continuity() if kind == "private" else None
         if continuity:
-            hint += "\n\n" + continuity.style(query)
+            hint += "\n\n" + continuity.style(query, support_override="normal" if dialogue_managed else None)
         return hint
 
     def _owner_prompt_for(self, kwargs: dict[str, Any]) -> str:
@@ -746,8 +765,10 @@ class MaiLivingWorld(MaiBotPlugin):
             return ""
         bond = self._ensure_bond()
         context = self._unified.context(kwargs) if self._unified else None
+        attention = self._ensure_attention()
         hint = owner_hint(bond.address() if bond else cfg.title, "private",
-                          self._relation_for("private", context["query"] if context else ""))
+                          self._relation_for("private", context["query"] if context else "",
+                              dialogue_managed=bool(attention and self.config.attention.dialogue_enabled and attention.trusted(kwargs))))
         if self.config.mind.enabled and self._mind and not self._unified_active():
             note = self._mind.private_hint(normalize_qq(cfg.qq), mode=self.config.mind.mode)
             if note:
@@ -789,6 +810,9 @@ class MaiLivingWorld(MaiBotPlugin):
             runtime = self._ensure_unified()
             context = runtime.context(kwargs) if runtime else None
             prompt = runtime.self_hint(context) if context else ""
+            attention = self._ensure_attention()
+            if attention and context:
+                prompt += "\n\n" + attention.hint(kwargs)
             updated = inject_brain_prompt(kwargs, BRAIN_MARKER + "\n" + prompt) if prompt else None
             return {"action": "continue", "modified_kwargs": updated} if updated else {"action": "continue"}
         prompt = self._brain_hint_for(kwargs)
@@ -805,11 +829,20 @@ class MaiLivingWorld(MaiBotPlugin):
             runtime = self._ensure_unified()
             if runtime:
                 try:
+                    attention = self._ensure_attention()
+                    before = runtime.context(kwargs)
+                    if attention:
+                        await attention.prepare_dialogue(kwargs)
                     prompt = await runtime.reply_hint(
                         kwargs, self.config.unified_mind, recall=self._collect_unified,
                         generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                         timezone=self.config.general.timezone,
                     )
+                    if attention and self._unified_active():
+                        if runtime.context(kwargs) != before:
+                            prompt = ""
+                        else:
+                            prompt += "\n\n" + attention.hint(kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -875,6 +908,9 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._bond:
             self._bond.close()
             self._bond = None
+        if self._attention:
+            self._attention.close()
+            self._attention = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -998,6 +1034,7 @@ class MaiLivingWorld(MaiBotPlugin):
             self._unified = UnifiedRuntime(self._self_state, profile=self._growth_style_hint)
         elif previous != owner:
             self._unified.reset()
+        self._unified.latest_private_only = bool(self.config.attention.enabled and self._unified_active())
         return self._unified
 
     def _memory_sources(self) -> dict[str, Any]:
@@ -1119,6 +1156,19 @@ class MaiLivingWorld(MaiBotPlugin):
             self._mcp_bridge = MCPBridge(self._tool_store)
         return self._tool_store
 
+    def _ensure_attention(self):
+        if not (self.config.attention.enabled and self._unified_active() and self._ensure_unified()
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq)):
+            return None
+        if self._attention is None:
+            self._attention = AttentionRuntime(self)
+        return self._attention
+
+    @Tool("living_world_attention", description="主人私聊只读查看当前关注、倾听方式和后台活动状态，不写记忆或授权行动")
+    async def attention(self, **kwargs):
+        runtime = self._ensure_attention()
+        return runtime.inspect(kwargs) if runtime else {"success": False, "code": "attention_disabled"}
+
     def _ensure_continuity(self):
         if not (self.config.plugin.enabled and self.config.continuity.enabled and self.config.owner.enabled
                 and normalize_qq(self.config.owner.qq)):
@@ -1227,7 +1277,8 @@ class MaiLivingWorld(MaiBotPlugin):
             bond={"profile": bond.store.profile(identity["owner_id"]),
                   "moments": bond.store.moments(identity["owner_id"], limit=200)} if bond else None,
             continuity={"state": continuity.store.state(identity["owner_id"]),
-                        "threads": continuity.store.threads(identity["owner_id"], limit=20)} if continuity else None)
+                        "threads": continuity.store.threads(identity["owner_id"], limit=20)} if continuity else None,
+            attention=self._ensure_attention().snapshot() if self._ensure_attention() else None)
 
     async def _close_mcp(self):
         self._mcp_generation += 1
@@ -1385,13 +1436,17 @@ class MaiLivingWorld(MaiBotPlugin):
                 "pixiv_enabled": self.config.mcp_pixiv.enabled, "connected": list(self._mcp_clients),
                 "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
 
-    async def _research_tools(self):
+    async def _research_tools(self, *, question_key=None, external_valid=None):
         cfg = self.config.mcp
         if not (cfg.enabled and cfg.research_enabled and cfg.remember_results and self.config.mcp_pixiv.enabled
                 and self._ensure_growth() and self.config.growth.mode == "active"):
             return
         state = self._growth_snapshot()
         questions = {item["key"]: item for item in state["questions"] if item["status"] == "open"}
+        if question_key is not None:
+            questions = {key: value for key, value in questions.items() if key == question_key}
+        if external_valid is not None and not external_valid():
+            return False
         store = self._ensure_tool_store()
         claim = store.claim_research(list(questions), interval_seconds=cfg.research_interval_seconds,
             daily_limit=cfg.research_daily_limit, day_start=tool_day_start(self.config.general.timezone))
@@ -1402,7 +1457,8 @@ class MaiLivingWorld(MaiBotPlugin):
         context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "internal-research",
                    "mid": claim["token"], "query": questions[claim["question_key"]]["topic"]}
         def valid():
-            return (generation == self._mcp_generation and signature == self._mcp_signature("pixiv")
+            return ((external_valid is None or external_valid())
+                    and generation == self._mcp_generation and signature == self._mcp_signature("pixiv")
                     and self._self_state.state()["owner_id"] == owner and self.config.growth.enabled
                     and self.config.growth.mode == "active" and self.config.unified_mind.enabled
                     and any(item == questions[claim["question_key"]]
@@ -1429,7 +1485,9 @@ class MaiLivingWorld(MaiBotPlugin):
         except Exception:
             pass
         finally:
+            success = success and valid()
             store.finish_research(claim["question_key"], success, token=claim["token"])
+        return success
 
     @API("living_world_growth_status", description="管理员查看成长状态和恢复队列的计数，不返回私人正文", public=False)
     async def growth_status(self) -> dict[str, Any]:
@@ -1708,7 +1766,8 @@ class MaiLivingWorld(MaiBotPlugin):
                             self.ctx.logger.exception("[MaiLivingWorld][COGNITION] 公开认知失败，其他功能继续")
                     if self.config.growth.enabled:
                         try:
-                            await self._research_tools()
+                            if not self._ensure_attention():
+                                await self._research_tools()
                             await self._grow()
                         except asyncio.CancelledError:
                             raise
@@ -1716,7 +1775,15 @@ class MaiLivingWorld(MaiBotPlugin):
                             self.ctx.logger.warning("[MaiLivingWorld][GROWTH] 成长任务暂未完成，下轮重试")
                     if self.config.continuity.enabled:
                         await self._process_continuity()
-                    if self.config.reading.enabled and self.config.reading.auto_continue:
+                    attention = self._ensure_attention()
+                    if attention:
+                        try:
+                            await attention.tick()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld][ATTENTION] 本轮行动未完成，保留进度")
+                    if not attention and self.config.reading.enabled and self.config.reading.auto_continue:
                         try:
                             companion = self._ensure_companion()
                             if companion:
@@ -2049,11 +2116,13 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             config = {name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity")}
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention")}
             bond = self._ensure_bond()
             config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
             continuity = self._ensure_continuity()
             config["continuity_revision"] = continuity.store.state(continuity.owner())["revision"] if continuity else 0
+            attention = self._ensure_attention()
+            config["attention_revision"] = attention.store.state(attention.owner())["revision"] if attention else 0
             return tool_digest(config)
         signature = proactive_signature()
         assert self._store is not None
@@ -2072,6 +2141,9 @@ class MaiLivingWorld(MaiBotPlugin):
         continuity = self._ensure_continuity() if is_owner_private else None
         if allowed and continuity and not continuity.contact_allowed():
             allowed, reason = False, "owner_contact_paused"
+        attention = self._ensure_attention()
+        if allowed and attention and not attention.proactive_allowed():
+            allowed, reason = False, "conversation_has_attention"
         experience = self._ensure_experience() if is_owner_private else None
         if allowed and experience:
             allowed, reason = experience.allow(ident, "history", active=False)
@@ -2228,7 +2300,8 @@ class MaiLivingWorld(MaiBotPlugin):
                         expected_revision=pending_plan["revision"],
                         interval_seconds=self.config.shared_plans.followup_interval_hours*3600)):
                 return
-        if signature != proactive_signature() or continuity and not continuity.contact_allowed():
+        if (signature != proactive_signature() or continuity and not continuity.contact_allowed()
+                or attention and not attention.proactive_allowed()):
             return
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)

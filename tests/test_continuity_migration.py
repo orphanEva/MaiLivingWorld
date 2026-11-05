@@ -43,7 +43,7 @@ class ContinuityMigrationTests(unittest.TestCase):
         self.assertEqual(migration.LEDGERS["continuity.sqlite3"], CONTINUITY_TABLES)
         self.assertEqual(set(migration.ALL_TABLES), set(backup.TABLES))
         self.assertEqual(set(TABLES) | {"stories", "attempts", "story_attempts"}, set(backup.TABLES))
-        self.assertEqual(len(backup.TABLES), 51)
+        self.assertEqual(len(backup.TABLES), 54)
         self.assertIn("continuity.sqlite3", migration.OPTIONAL_LEDGERS)
 
     def test_old_eleven_library_migration_does_not_invent_continuity_or_owner(self):
@@ -94,11 +94,12 @@ class ContinuityMigrationTests(unittest.TestCase):
             def close(self):
                 pass
         names = ("MySQLStore", "BrainBook", "MindStore", "CognitiveStore", "ExperienceLoop", "ProactiveFeedback",
-                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore")
+                 "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore", "AttentionStore")
         with patch.multiple(migration, **{name: EmptyStore for name in names}), tempfile.TemporaryDirectory() as temp:
             migration.ensure_schema({"table_prefix": "test_"}, Path(temp))
-        self.assertEqual(len(calls), 12)
-        self.assertEqual(calls[-1][0][0].name, "continuity.sqlite3")
+        self.assertEqual(len(calls), 13)
+        continuity = next(call for call in calls if call[0] and call[0][0].name == "continuity.sqlite3")
+        self.assertEqual(continuity[1]["mysql_settings"], {"table_prefix": "test_"})
 
     def test_official_ddl_comments_and_runtime_sql_match_real_schema(self):
         ddl = (ROOT/"sql"/"mysql.sql").read_text(encoding="utf-8")

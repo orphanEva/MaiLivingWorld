@@ -560,3 +560,37 @@ ALTER TABLE `mlw_continuity_audit`
   MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '可信来源正文或批次摘要',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '修改前后结构化状态及来源引用JSON',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒';
+
+ALTER TABLE `mlw_attention_control`
+  COMMENT = '主人互动与自主活动的持久注意安排，尝试不等于执行或发送成功',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '注意安排控制状态的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '关注事项对话活动来源摘要及连续状态JSON，不保存聊天正文',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '自主活动额度所属日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的活动批次次数',
+  MODIFY COLUMN `last_started` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次活动批次开始时间，Unix秒',
+  MODIFY COLUMN `engaged_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '主人当前互动保留窗口截止时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前独占活动批次租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '活动批次租约失效时间，Unix秒',
+  MODIFY COLUMN `lease_revision` BIGINT NOT NULL DEFAULT 0 COMMENT '领取活动时控制状态版本，防止旧任务提交',
+  MODIFY COLUMN `last_finished` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近一次活动批次完成时间，Unix秒',
+  MODIFY COLUMN `last_outcome` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '最近活动结果，不据此推断消息已成功送达',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次接收可信互动或活动安排时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_attention_receipts`
+  COMMENT = '可信主人入站互动去重凭据，只保存摘要而非聊天正文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信入站消息与场合的稳定摘要',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际消息所属的可信主人标识',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重放冲突检测',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '该消息首次更新注意安排时的控制版本',
+  MODIFY COLUMN `mode_hash` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '该消息应用时模式配置的摘要',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次采集该可信消息的时间，Unix秒';
+
+ALTER TABLE `mlw_attention_events`
+  COMMENT = '注意安排与活动结果审计，不存正文且不冒称已经关心',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '稳定活动或状态变更审计标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '该条活动审计所属的可信主人标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际已发生的控制变更或批次结果',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界结构化活动结果JSON，不保存隐藏推理或聊天正文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '事件提交时间，Unix秒';

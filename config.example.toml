@@ -1,4 +1,4 @@
-# MaiLivingWorld v0.16.0 · 全字段中文注释配置模板
+# MaiLivingWorld v0.17.0 · 全字段中文注释配置模板
 # 此文件是安全的源码默认配置，不包含私人QQ号或数据库密码。
 # MaiBot Runner 默认生成的是 config.toml，不会自动加载本文件；请在 WebUI「原始 TOML」中对照使用。
 # 保存前请备份原配置，避免用默认值覆盖当前已测试通过的设置。
@@ -13,7 +13,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.16.0"
+config_version = "0.17.0"
 
 # ====================================================================
 # 10 / 统一心智与唯一主人（沿用 brain_memory 的输入名单）
@@ -422,3 +422,15 @@ max_daily_batches = 6
 busy_hours = 3
 # 明确晚安或去睡后暂缓主动联系的小时数，不推断真实睡眠。
 rest_hours = 8
+
+[attention]
+# 启用统一关注与后台行动选择，需要统一心智active；默认关闭。
+enabled = false
+# 当前主人私聊的短时语境判断；明确短句不调用模型，其他每消息至多一次共享预算调用。
+dialogue_enabled = true
+# 收到主人私聊后优先对话的秒数；后台阅读与查阅暂缓，普通回复不延迟。
+engagement_seconds = 90
+# 统一后台行动的最小间隔秒数；原有阅读与工具配额继续生效。
+interval_seconds = 300
+# 每天后台行动最多尝试次数；失败计数，重启不重置。
+max_daily_actions = 12
