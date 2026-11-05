@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.22.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.23.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -35,7 +35,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 29)
-        self.assertEqual(total_fields, 187)
+        self.assertEqual(total_fields, 189)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -75,6 +75,18 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual((reserve["type"], reserve["default"], reserve["minimum"], reserve["maximum"]),
                          ("integer", 12, 0, 1000))
         self.assertIn("23 /", plugin.Recollection.__ui_label__)
+
+    def test_personality_and_activity_require_opt_in_with_webui_descriptions(self):
+        config = plugin.Config.model_validate({"growth": {"enabled": True}, "attention": {"enabled": True}})
+        schema = plugin.Config.model_json_schema()
+        for section, name in (("growth", "personality_tensions"), ("attention", "activity_awareness")):
+            with self.subTest(section=section, name=name):
+                self.assertFalse(getattr(getattr(config, section), name))
+                ref = schema["properties"][section]["$ref"].rsplit("/", 1)[1]
+                field = schema["$defs"][ref]["properties"][name]
+                self.assertEqual(field["type"], "boolean")
+                self.assertFalse(field["default"])
+                self.assertTrue(field["description"])
 
     def test_dynamic_webui_config_includes_safe_habits_and_followthrough_defaults(self):
         schema = plugin.Config.model_json_schema()

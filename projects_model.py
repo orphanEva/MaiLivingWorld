@@ -86,12 +86,16 @@ def review_prompt(question, records, result):
     )
 
 
-async def understand_project(question, records, *, generate, reserve, valid, task_name, timeout=30):
+async def understand_project(question, records, *, generate, reserve, valid, task_name, timeout=30, on_dispatch=None):
     prompt = result_prompt(question, records)
     if not prompt:
         return None
     async def request(prompt):
         if not valid() or not reserve():
+            return None
+        if on_dispatch is not None and not on_dispatch():
+            return None
+        if on_dispatch is not None and not valid():
             return None
         result = await asyncio.wait_for(generate(prompt, task_name=task_name, temperature=.1, max_tokens=1200), timeout)
         return result if valid() else None

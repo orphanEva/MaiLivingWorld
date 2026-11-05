@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 from .attention_store import AttentionStore
+from .activity_context import ACTIVITY_TTL, activity_question, activity_hint
 from .dialogue_policy import (understand_dialogue, dialogue_hint, literal_mode,
                              should_classify, current_reaction, current_reaction_hint)
 from .mcp_runtime import digest, day_start
@@ -23,6 +24,8 @@ class AttentionRuntime:
         self._current_mode = None
         self._text_key = None
         self._reaction = None
+        self._activity_question = False
+        self._active_activity = None
         self._generation = 0
         self._dialogue_lock = asyncio.Lock()
         self._work_lock = asyncio.Lock()
@@ -34,6 +37,8 @@ class AttentionRuntime:
         self._current_mode = None
         self._text_key = None
         self._reaction = None
+        self._activity_question = False
+        self._active_activity = None
 
     def close(self):
         self.reset()
@@ -66,6 +71,7 @@ class AttentionRuntime:
             self._current_mode = None
             self._text_key = None
             self._reaction = None
+            self._activity_question = False
             text = message.get("processed_plain_text")
             parts = message.get("raw_message")
             if (isinstance(text, str) and 0 < len(text) <= 600 and not text.lstrip().startswith("/")
@@ -77,6 +83,7 @@ class AttentionRuntime:
                 # Keep only the enum from original text. The normalized recall
                 # query may have lost quote boundaries or invalid controls.
                 self._reaction = current_reaction(text)
+                self._activity_question = activity_question(text)
             self.last_status = "conversation"
         return changed
 
@@ -111,6 +118,8 @@ class AttentionRuntime:
                 return
             message = pending[1]
             text = message.get("processed_plain_text", "")
+            if self.activity_enabled() and activity_question(text):
+                return
             if current_reaction(text):
                 # This finite current-turn reaction does not consume a model
                 # call or overwrite the saved communication preference.
@@ -159,7 +168,11 @@ class AttentionRuntime:
 
     def effective_mode(self, kwargs):
         trusted = self.trusted(kwargs)
-        if not trusted or not self.bot.config.attention.dialogue_enabled:
+        if not trusted:
+            return None
+        if self.current_activity_question(kwargs):
+            return "explicit_normal"
+        if not self.bot.config.attention.dialogue_enabled:
             return None
         if self.current_reaction(kwargs):
             # Use the existing per-turn override contract with Habits; keep the
@@ -192,11 +205,106 @@ class AttentionRuntime:
 
     def hint(self, kwargs):
         mode = self.effective_mode(kwargs)
-        if mode is None:
-            return ""
-        hint = "[MaiLivingWorld:conversation-attention]\n"+dialogue_hint("normal" if mode == "explicit_normal" else mode)
+        hint = ("[MaiLivingWorld:conversation-attention]\n"+dialogue_hint("normal" if mode == "explicit_normal" else mode)) if mode else ""
         reaction = current_reaction_hint(self.current_reaction(kwargs))
-        return hint+("\n\n"+reaction if reaction else "")
+        activity = self.activity_hint(kwargs)
+        return "\n\n".join(part for part in (hint, reaction, activity) if part)
+
+    def activity_enabled(self):
+        return self.enabled() and bool(getattr(self.bot.config.attention, "activity_awareness", False))
+
+    def current_activity_question(self, kwargs):
+        trusted = self.trusted(kwargs) if self.activity_enabled() else None
+        return bool(trusted and self._activity_question and self._text_key == (trusted[0]["sid"], trusted[0]["mid"]))
+
+    def _activity_signature(self):
+        # Configuration provenance must survive restarts; process generations and
+        # current conversation receipts are intentionally not part of this hash.
+        b = self.bot
+        return digest([self.owner(), b.config.plugin.enabled, b.config.attention.model_dump(),
+                       b.config.unified_mind.model_dump(), b.config.reading.model_dump(),
+                       b.config.growth.model_dump(), b.config.projects.model_dump(),
+                       b._mcp_signature("pixiv"), b._mcp_source_signature("pixiv")])
+
+    def _activity_record(self, focus):
+        """A content-free fingerprint of the still-valid original work and progress."""
+        b, owner = self.bot, self.owner()
+        try:
+            if focus["kind"] == "reading":
+                if not (b.config.reading.enabled and b.config.reading.auto_continue
+                        and b.config.mcp.enabled and b.config.mcp_pixiv.enabled):
+                    return None
+                companion = b._ensure_companion()
+                row = companion.store.reading(focus["key"], owner_id=owner)
+                if (not row or row["status"] not in {"active", "completed"}
+                        or row["provider"] != "pixiv" or not row["source_refs"]
+                        or companion._current_refs(row) != row["source_refs"]):
+                    return None
+                progress = row["cursor"]
+                proof = digest([row["id"], owner, row["version"], row["status"], row["source_refs"], progress])
+            elif focus["kind"] == "project":
+                projects = b._ensure_projects()
+                if not projects:
+                    return None
+                row = projects.store.get(owner, focus["key"])
+                if (not row or row["status"] not in {"active", "completed", "unresolved"}
+                        or not projects._current(row)):
+                    return None
+                progress = digest([row["stage"], row["evidence_refs"], row["result"]])
+                proof = digest([row["id"], owner, row["status"], row["seed"], progress])
+            elif focus["kind"] == "research":
+                if not (b.config.mcp.enabled and b.config.mcp.research_enabled and b.config.mcp.remember_results
+                        and b.config.mcp_pixiv.enabled and b.config.growth.enabled and b.config.growth.mode == "active"):
+                    return None
+                row = next((r for r in b._growth_snapshot()["questions"] if r["key"] == focus["key"]), None)
+                if not row:
+                    return None
+                progress, proof = None, digest(row)
+            else:
+                return None
+            return {"proof": proof, "progress": progress}
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def activity_hint(self, kwargs):
+        if not self.current_activity_question(kwargs):
+            return ""
+        now, owner = time.time(), self.owner()
+        state = self.store.state(owner, now=now)
+        events = self.store.events(owner, limit=200)
+        starts = [event for event in events if event["action"] == "activity_start"
+                  and 0 <= now-event["created"] <= ACTIVITY_TTL]
+        if not starts:
+            return activity_hint()
+        latest = max(starts, key=lambda event: (event["created"], event.get("budget_day", 0),
+                                               event.get("cycle_count", 0), event["id"]))
+        focus, proof, signature = latest.get("focus"), latest.get("proof"), latest.get("signature")
+        if signature != self._activity_signature():
+            return activity_hint()
+        record = self._activity_record(focus)
+        finishes = [e for e in events if e["action"] == "finish" and isinstance(e.get("activity"), dict)
+                    and e["activity"].get("token_hash") == latest.get("token_hash")
+                    and e["created"] >= latest["created"]]
+        if finishes:
+            finish = max(finishes, key=lambda event: (event["created"], event["id"]))
+            proof = finish["activity"].get("proof")
+            outcome = finish.get("outcome")
+        else:
+            lease = state["lease"]
+            activity = lease.get("activity")
+            if not isinstance(activity, dict) or activity.get("token_hash") != latest.get("token_hash"):
+                return activity_hint()
+            captures = [event for event in events if event["action"] == "capture"
+                        and event["created"] >= latest["created"] and event.get("revision", -1) > latest["revision"]]
+            if captures:
+                outcome = "interrupted"
+            elif self._active_activity == latest.get("token_hash") and self.store.valid(owner, lease["token"], now=now):
+                outcome = "working"
+            else:
+                outcome = "unfinished"
+        if not record or record["proof"] != proof:
+            return activity_hint()
+        return activity_hint(focus["kind"], outcome, recovering=state["activity"]["recovering"])
 
     def candidates(self):
         b, owner = self.bot, self.owner()
@@ -234,10 +342,12 @@ class AttentionRuntime:
         async with self._work_lock:
             b, owner = self.bot, self.owner()
             cfg, signature = b.config.attention, self.signature()
+            awareness = self.activity_enabled()
             claim = self.store.claim(owner, candidates=self.candidates(),
                 day_start=day_start(b.config.general.timezone), daily_limit=cfg.max_daily_actions,
                 interval_seconds=cfg.interval_seconds,
-                lease_seconds=min(900, max(180, b.config.unified_mind.model_timeout_seconds*2+120)))
+                lease_seconds=min(900, max(180, b.config.unified_mind.model_timeout_seconds*2+120)),
+                activity_awareness=awareness)
             if not claim:
                 self.last_status = "waiting"
                 return
@@ -248,34 +358,58 @@ class AttentionRuntime:
                         and self.store.valid(owner, token) and focus in self.candidates())
 
             outcome = "blocked"
+            before = self._activity_record(focus) if awareness else None
+            def on_dispatch():
+                if not awareness:
+                    return True
+                if not valid():
+                    return False
+                if self._active_activity is not None:
+                    return True
+                current = self._activity_record(focus)
+                if (not before or current != before or not self.store.start_activity(owner, token,
+                        proof=before["proof"], signature=self._activity_signature())):
+                    return False
+                self._active_activity = self.store.state(owner)["lease"]["activity"]["token_hash"]
+                return True
+            dispatch = {"on_dispatch": on_dispatch} if awareness else {}
             self.last_status = focus["kind"]
             try:
                 if not valid():
                     outcome = "interrupted"
-                elif focus["kind"] == "reading":
-                    result = await b._ensure_companion().auto_read(reading_id=focus["key"], external_valid=valid)
+                if outcome == "interrupted":
+                    return
+                if focus["kind"] == "reading":
+                    result = await b._ensure_companion().auto_read(reading_id=focus["key"], external_valid=valid, **dispatch)
                     if isinstance(result, dict) and result.get("success"):
                         outcome = "progress"
                 elif focus["kind"] == "project":
                     projects = b._ensure_projects()
-                    result = await projects.tick(project_id=focus["key"], external_valid=valid) if projects else None
+                    result = await projects.tick(project_id=focus["key"], external_valid=valid, **dispatch) if projects else None
                     if isinstance(result, dict) and result.get("success"):
                         outcome = "progress"
                 else:
-                    result = await b._research_tools(question_key=focus["key"], external_valid=valid)
+                    result = await b._research_tools(question_key=focus["key"], external_valid=valid, **dispatch)
                     if result is True:
                         outcome = "progress"
                 # A completed reading or resolved question may leave candidates;
                 # owner/config/lease still govern whether the attempt was valid.
                 if signature != self.signature() or not self.store.valid(owner, token):
                     outcome = "interrupted"
+                elif awareness and outcome == "progress" and focus["kind"] in {"reading", "project"}:
+                    after = self._activity_record(focus)
+                    if not after or not before or after["progress"] == before["progress"]:
+                        outcome = "blocked"
             except asyncio.CancelledError:
                 outcome = "interrupted"
                 raise
             except Exception:
                 outcome = "failed"
             finally:
-                self.store.finish(owner, token, outcome=outcome)
+                after = self._activity_record(focus) if awareness and signature == self.signature() else None
+                self.store.finish(owner, token, outcome=outcome, activity_awareness=awareness and self.activity_enabled(),
+                                  activity_proof=after["proof"] if after else None)
+                self._active_activity = None
                 self.last_status = outcome
 
     def proactive_allowed(self):
@@ -288,13 +422,20 @@ class AttentionRuntime:
         focus = state.get("focus")
         available = focus is not None and focus in self.candidates()
         working = available and self.store.valid(self.owner(), state["lease"]["token"])
-        return {"enabled": True, "owner_id": self.owner(), "revision": state["revision"],
+        if self.activity_enabled():
+            activity = state["lease"].get("activity")
+            working = (working and isinstance(activity, dict) and self._active_activity is not None
+                       and activity.get("token_hash") == self._active_activity)
+        result = {"enabled": True, "owner_id": self.owner(), "revision": state["revision"],
                 "engaged": state["engaged_until"] > time.time(), "engaged_until": state["engaged_until"],
                 "focus_kind": focus["kind"] if available else "", "focus_available": available,
                 "working": bool(working),
                 "conversation": state["conversation"], "last_outcome": state["last_outcome"],
                 "last_finished": state["last_finished"], "cycle_count": state["cycle_count"]
                     if state["budget_day"] == day_start(self.bot.config.general.timezone) else 0}
+        if self.activity_enabled():
+            result["recovering"] = state["activity"]["recovering"]
+        return result
 
     def inspect(self, kwargs):
         if not self.trusted(kwargs):

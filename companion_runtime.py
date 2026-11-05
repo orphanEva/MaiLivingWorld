@@ -125,7 +125,7 @@ class CompanionRuntime:
         return {"id": record["id"], "digest": source_fingerprint(record),
                 "scope": record["scope"], "sensitivity": record["sensitivity"]}
 
-    async def _fetch(self, provider, kind, resource, index, context, valid):
+    async def _fetch(self, provider, kind, resource, index, context, valid, on_dispatch=None):
         b = self.bot
         if not b.config.reading.enabled or (provider, kind) not in {("pixiv", "novel"), ("pixiv", "illust"), ("cap", "pdf")}:
             raise ValueError("reading_not_permitted")
@@ -135,7 +135,8 @@ class CompanionRuntime:
         async def invoke(tool, args):
             result = await b._mcp_bridge.execute(provider, tool, args, config=b.config.mcp,
                 context=context, owner=context["speaker_id"], client=b._mcp_client(provider), valid=valid,
-                timezone=b.config.general.timezone, record_observations=b.config.mcp.remember_results)
+                timezone=b.config.general.timezone, record_observations=b.config.mcp.remember_results,
+                **({"on_dispatch": on_dispatch} if on_dispatch is not None else {}))
             if not result.get("success"):
                 raise ValueError(result.get("code", "read_failed"))
             if not valid():
@@ -239,7 +240,8 @@ class CompanionRuntime:
         resolved = self.bot._tool_store.resolve([ref["id"] for ref in reading["source_refs"]])
         return [self._ref(record) for record in resolved]
 
-    async def read(self, action, provider, kind, resource, reading_id, kwargs, *, internal=False, external_valid=None):
+    async def read(self, action, provider, kind, resource, reading_id, kwargs, *, internal=False, external_valid=None,
+                   on_dispatch=None):
         b = self.bot
         trusted = self.owner_context(kwargs, mcp=True) if not internal else None
         if not b.config.reading.enabled or not b.config.mcp.enabled or (not internal and not trusted):
@@ -284,7 +286,7 @@ class CompanionRuntime:
                     lease_seconds=360)
                 if not claim:
                     return {"success": False, "code": "reading_busy_or_paused"}
-            page = await self._fetch(provider, kind, resource, index, context, valid)
+            page = await self._fetch(provider, kind, resource, index, context, valid, on_dispatch=on_dispatch)
             if not valid():
                 raise ValueError("context_changed")
             if row and (page["version"] != row["version"] or page["total_units"] != row["total_units"]):
@@ -395,7 +397,7 @@ class CompanionRuntime:
         finally:
             b._mcp_calls.discard(task)
 
-    async def auto_read(self, *, reading_id=None, external_valid=None):
+    async def auto_read(self, *, reading_id=None, external_valid=None, on_dispatch=None):
         b = self.bot
         if not (b.config.reading.enabled and b.config.reading.auto_continue and b.config.mcp.enabled
                 and b._ensure_unified()):
@@ -411,7 +413,8 @@ class CompanionRuntime:
             day_start=day_start(b.config.general.timezone)):
             return
         row = min(rows, key=lambda r: (r["updated"], r["id"]))
-        return await self.read("next", "", "", "", row["id"], {}, internal=True, external_valid=external_valid)
+        return await self.read("next", "", "", "", row["id"], {}, internal=True, external_valid=external_valid,
+                               on_dispatch=on_dispatch)
 
     def due_plan(self, owner):
         if not self.bot.config.shared_plans.enabled or not self.bot.config.shared_plans.followup_enabled:

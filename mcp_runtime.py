@@ -114,7 +114,7 @@ class MCPBridge:
         return {key: rows, "scope": "当前会话由本插件发起的任务", "filtered": True}
 
     async def execute(self, provider, tool, arguments, *, config, context, owner, client,
-                      valid, timezone, record_observations=True, task_source_signature=""):
+                      valid, timezone, record_observations=True, task_source_signature="", on_dispatch=None):
         context = dict(context)
         if not valid() or not permitted(provider, tool, config, context, owner):
             return {"success": False, "code": "tool_not_permitted"}
@@ -138,6 +138,10 @@ class MCPBridge:
             args = validate_arguments(provider, tool, arguments, available[tool]["input_schema"], config)
             self._check_task(provider, tool, args, config, context, owner)
             if not valid() or not permitted(provider, tool, config, context, owner):
+                raise PolicyError("context_changed")
+            if on_dispatch is not None and not on_dispatch():
+                raise PolicyError("context_changed")
+            if on_dispatch is not None and (not valid() or not permitted(provider, tool, config, context, owner)):
                 raise PolicyError("context_changed")
             sent = True
             result = await client.call_tool(tool, args)

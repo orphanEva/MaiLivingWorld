@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -138,8 +139,31 @@ class GrowthRuntime:
                 self.last_status = "learning_failed"
 
 
-def style_hint(state: dict) -> str:
+_TENSIONS = {
+    "curiosity": (
+        "好奇时更容易被新细节吸引，也容易展开得太远；相关时可以轻提一个想继续了解的方向，先接住眼前的话题。",
+        "偏爱熟悉的方向，接触新话题时可能需要多一点铺垫；可以保留偏好，也给眼前的新内容一次了解的机会。"),
+    "sociability": (
+        "更愿意分享自己的反应，有时会想多说几句；给对方接话的空间，不把交流变成连续自述。",
+        "表达更内敛，有时需要对方问到才展开；可以简短真诚，明确被问到时仍把意思说清。"),
+    "patience": (
+        "愿意慢慢理解和展开细节，也容易解释过多；对方只要重点时先给重点，确有需要再展开。",
+        "倾向先抓重点，有时容易略过铺垫；可以直接说当前看法，遇到复杂感受时先听完整再下结论。"),
+    "caution": (
+        "习惯先看限定条件，有时不容易马上拿定主意；确实拿不准时可以承认犹豫，并说明当前能判断的部分。",
+        "较愿意先给出判断，有时需要再核对细节；保留直接表达的风格，依据不足处仍说清不确定。"),
+}
+
+
+def _number(mapping, key, default, low=0., high=1.):
+    value = mapping.get(key, default) if isinstance(mapping, dict) else default
+    return value if type(value) in (int, float) and low <= value <= high and math.isfinite(value) else default
+
+
+def style_hint(state: dict, *, personality_tensions=False) -> str:
     """Only fixed style phrases leave this boundary, never private source/trait reasons."""
+    if not isinstance(state, dict):
+        return ""
     traits, mood = state.get("traits", {}), state.get("mood", {})
     phrases = []
     rules = {
@@ -149,17 +173,30 @@ def style_hint(state: dict) -> str:
         "caution": ("对不确定内容谨慎措辞，区分观点和事实。", "可以直接表达判断，同时承认不确定性。"),
     }
     for key, (high, low) in rules.items():
-        value = traits.get(key, .5)
+        value = _number(traits, key, .5)
         if value >= .55:
             phrases.append(high)
         elif value <= .45:
             phrases.append(low)
-    if mood.get("valence", 0) >= .15:
+    if _number(mood, "valence", 0, -1., 1.) >= .15:
         phrases.append("当前语气可略轻快。")
-    elif mood.get("valence", 0) <= -.15:
+    elif _number(mood, "valence", 0, -1., 1.) <= -.15:
         phrases.append("当前语气可平静克制，避免把情绪发泄给他人。")
-    if mood.get("energy", .5) <= .35:
+    if _number(mood, "energy", .5) <= .35:
         phrases.append("当前倾向简短回应。")
+    if personality_tensions is True:
+        # Stable, bounded choice from existing traits; no random flaws or new state.
+        ranked = sorted(enumerate(_TENSIONS), key=lambda pair: (-abs(_number(traits, pair[1], .5)-.5), pair[0]))
+        selected = []
+        for _, key in ranked:
+            value = _number(traits, key, .5)
+            if value >= .55 or value <= .45:
+                selected.append(_TENSIONS[key][0 if value >= .55 else 1])
+        if selected:
+            phrases.append("[MaiLivingWorld:personality-tensions]\n"+"".join(selected[:2])+
+                "这些是已有性格的表达取舍，只在当前内容相关时自然体现，不必每轮展示或自报性格。"
+                "当前明确请求、纠正、倾诉与相处边界优先；不为表现缺点而故意犯错、遗漏关键事实、制造争执或冷落对方。"
+                "犹豫和没把握须来自实际信息不足，不能编造错误、身体感受、共同经历或把责任推给对方。")
     if not phrases:
         return ""
     return "[MaiLivingWorld:grown-style]\n" + "".join(phrases) + "这些是缓慢成长的表达倾向，不覆盖唯一主人关系和本轮表达边界。"

@@ -176,11 +176,12 @@ class ProjectsRuntime:
         return {reading["id"] for row in self.store.items(self.owner()) if row["id"] in valid and row["stage"] == "gather"
                 for reading in [self._reading_for(row["seed"])] if reading} if self.enabled() else set()
 
-    async def _gather(self, row, valid):
+    async def _gather(self, row, valid, on_dispatch=None):
         b = self.bot
         reading = self._reading_for(row["seed"])
         if reading:
-            result = await b._ensure_companion().auto_read(reading_id=reading["id"], external_valid=valid)
+            result = await b._ensure_companion().auto_read(reading_id=reading["id"], external_valid=valid,
+                **({"on_dispatch": on_dispatch} if on_dispatch is not None else {}))
             if not valid():
                 return None
             if not isinstance(result, dict) or result.get("success") is not True:
@@ -195,9 +196,10 @@ class ProjectsRuntime:
                    for offset in range(0, min(len(excerpt), 4000), 500)]
             resolved = b._resolve_roots(ids)
             return {"success": True, "records": [resolved[ident] for ident in ids if ident in resolved]}
-        return await b._research_tools(question_key=row["seed"]["question_key"], external_valid=valid, with_evidence=True)
+        return await b._research_tools(question_key=row["seed"]["question_key"], external_valid=valid, with_evidence=True,
+            **({"on_dispatch": on_dispatch} if on_dispatch is not None else {}))
 
-    async def tick(self, project_id=None, external_valid=None):
+    async def tick(self, project_id=None, external_valid=None, on_dispatch=None):
         if not self.enabled() or self._lock.locked():
             return None
         async with self._lock:
@@ -234,7 +236,7 @@ class ProjectsRuntime:
                 if not valid():
                     return None
                 if row["stage"] == "gather":
-                    fetched = await self._gather(row, valid)
+                    fetched = await self._gather(row, valid, on_dispatch=on_dispatch)
                     if not valid():
                         return None
                     if fetched is None:
@@ -255,7 +257,7 @@ class ProjectsRuntime:
                     originals = [resolved[ref["id"]] for ref in row["evidence_refs"]] if resolved else []
                     result = await understand_project(row["seed"]["question"], originals, generate=b.ctx.llm.generate,
                         reserve=reserve, valid=valid, task_name=b.config.brain.model_task,
-                        timeout=b.config.unified_mind.model_timeout_seconds)
+                        timeout=b.config.unified_mind.model_timeout_seconds, on_dispatch=on_dispatch)
                     if not valid():
                         return None
                     action = "reviewed" if result else "deferred" if exhausted else "failed"

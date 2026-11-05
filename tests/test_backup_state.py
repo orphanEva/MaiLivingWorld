@@ -30,10 +30,35 @@ def attention_message():
 def seed_attention(store):
     store.capture(attention_message(), owner_id="12345678", now=100, engagement_seconds=1)
     claimed = store.claim("12345678", candidates=[{"kind": "reading", "key": "reading:"+"a"*64, "version": "b"*64}],
-                          day_start=0, daily_limit=6, interval_seconds=0, now=101)
-    if not claimed or not store.finish("12345678", claimed["token"], outcome="progress", now=102):
+                          day_start=0, daily_limit=6, interval_seconds=0, now=101, activity_awareness=True)
+    if (not claimed or not store.start_activity("12345678", claimed["token"], proof="a"*64, signature="b"*64, now=101)
+            or not store.finish("12345678", claimed["token"], outcome="progress", now=102,
+                                activity_awareness=True, activity_proof="c"*64)):
         raise AssertionError("expected a confirmed attention batch")
     return store.state("12345678", now=103)
+
+
+def assert_attention_restore(case, store, expected):
+    owner = "12345678"
+    case.assertEqual(store.state(owner, now=103), expected)
+    before = dict(store.con.execute("SELECT * FROM attention_control WHERE owner_id=?", (owner,)).fetchone())
+    saved = json.loads(before["payload"])["activity"]
+    case.assertEqual(saved, {"load": .25, "at": 102.})
+    case.assertAlmostEqual(expected["activity"]["load"], .25-.25/3600, places=7)
+    case.assertFalse(expected["activity"]["recovering"])
+    case.assertEqual(store.state(owner, now=100)["activity"]["load"], .25)
+    case.assertEqual(store.state(owner, now=100)["activity"]["at"], 102.)
+    case.assertEqual(store.state(owner, now=3702)["activity"]["load"], 0.)
+    case.assertEqual(dict(store.con.execute("SELECT * FROM attention_control WHERE owner_id=?", (owner,)).fetchone()), before)
+    events = store.events(owner)
+    started = next(row for row in events if row["action"] == "activity_start")
+    finished = next(row for row in events if row["action"] == "finish")
+    case.assertEqual(started["proof"], "a"*64)
+    case.assertEqual(finished["activity"]["proof"], "c"*64)
+    case.assertEqual(started["token_hash"], finished["activity"]["token_hash"])
+    case.assertNotIn(attention_message()["processed_plain_text"], json.dumps(events, ensure_ascii=False))
+    case.assertFalse(store.capture(attention_message(), owner_id=owner, now=104, engagement_seconds=1))
+    case.assertEqual(store.state(owner, now=103), expected)
 
 
 def seed_belief_revision(store):
@@ -507,6 +532,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.21"].values())), 78)
         self.assertEqual(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
+        self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
+        self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -527,7 +554,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22"):
+        for version in ("v0.21", "v0.22", "v0.23"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -892,13 +919,60 @@ class SQLiteBackupTests(unittest.TestCase):
                 backup._validate_manifest(candidate)
 
     def test_v21_archive_restores_without_new_database_requirements(self):
-        archive = self.legacy_archive(explicit=True, catalog="v0.21")
+        self.check_same_schema_archive("v0.21")
+
+    def test_v22_archive_restores_without_new_database_requirements(self):
+        self.check_same_schema_archive("v0.22")
+
+    def test_v22_real_attention_payload_restores_without_invented_workload(self):
+        from MaiLivingWorld.attention_store import AttentionStore
+        owner = "12345678"
+        candidate = {"kind": "reading", "key": "reading:"+"a"*64, "version": "b"*64}
+        store = AttentionStore(self.source/"attention.sqlite3")
+        try:
+            store.capture(attention_message(), owner_id=owner, now=100, engagement_seconds=1)
+            claim = store.claim(owner, candidates=[candidate], day_start=0, daily_limit=6, interval_seconds=0, now=101)
+            self.assertTrue(store.finish(owner, claim["token"], outcome="progress", now=102))
+            payload = json.loads(store.con.execute("SELECT payload FROM attention_control WHERE owner_id=?", (owner,)).fetchone()[0])
+            payload.pop("activity")
+            payload.pop("lease_activity")
+            with store.con:
+                store.con.execute("UPDATE attention_control SET payload=? WHERE owner_id=?", (json.dumps(payload), owner))
+        finally:
+            store.close()
+        self.archive_now()
+        def old_catalog(members):
+            manifest = json.loads(members["manifest.json"])
+            manifest["catalog"] = "v0.22"
+            members["manifest.json"] = json.dumps(manifest).encode()
+        archive = self.tamper(old_catalog)
+        backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        restored = AttentionStore(self.target/"attention.sqlite3")
+        try:
+            state = restored.state(owner, now=103)
+            self.assertEqual(state["focus"], candidate)
+            self.assertEqual(state["cycle_count"], 1)
+            self.assertEqual(state["last_outcome"], "progress")
+            self.assertEqual(state["activity"]["load"], 0.)
+            self.assertFalse(state["activity"]["recovering"])
+            self.assertFalse(any(event["action"] == "activity_start" for event in restored.events(owner)))
+            claim = restored.claim(owner, candidates=[candidate], day_start=0, daily_limit=6,
+                                   interval_seconds=0, now=104, activity_awareness=True)
+            self.assertTrue(restored.start_activity(owner, claim["token"], proof="a"*64, signature="b"*64, now=104))
+            self.assertTrue(restored.finish(owner, claim["token"], outcome="progress", now=105,
+                                           activity_awareness=True, activity_proof="c"*64))
+            self.assertEqual(restored.state(owner, now=105)["activity"]["load"], .25)
+        finally:
+            restored.close()
+
+    def check_same_schema_archive(self, catalog):
+        archive = self.legacy_archive(explicit=True, catalog=catalog)
         checked = backup.verify_archive(archive)
-        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.21", 20, []))
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), (catalog, 20, []))
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True,
                                          confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (20, []))
-        self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V21_LEDGERS))
+        self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.CATALOGS[catalog]))
 
     def test_new_archive_requires_explicit_known_catalog_and_complete_inventory(self):
         self.seed()
@@ -906,7 +980,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.22")
+        self.assertEqual(current["catalog"], "v0.23")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1028,7 +1102,7 @@ class SQLiteBackupTests(unittest.TestCase):
             self.assertEqual(stores[4].threads("12345678", status="all", now=108), continuity_threads)
             self.assertEqual(stores[4].threads("12345678", now=108), [])
             self.assertEqual(stores[4].state("12345678", now=501)["contact"]["effective_mode"], "normal")
-            self.assertEqual(stores[5].state("12345678", now=103), attention)
+            assert_attention_restore(self, stores[5], attention)
             for table in backup.LEDGERS["attention.sqlite3"]:
                 self.assertEqual([dict(row) for row in stores[5].con.execute("SELECT * FROM "+table)], attention_rows[table])
             stores[5].capture(attention_message(), owner_id="12345678", now=104, engagement_seconds=1)
@@ -1345,10 +1419,16 @@ class MySQLBackupTests(unittest.TestCase):
             backup.mysql_config(env)
 
     def test_v21_mysql_archive_restores_into_current_unchanged_schema(self):
-        rows = {table: [] for tables in backup.V21_LEDGERS.values() for table in tables}
+        self.check_same_schema_archive("v0.21")
+
+    def test_v22_mysql_archive_restores_into_current_unchanged_schema(self):
+        self.check_same_schema_archive("v0.22")
+
+    def check_same_schema_archive(self, catalog):
+        rows = {table: [] for tables in backup.CATALOGS[catalog].values() for table in tables}
         rows.update(copy.deepcopy(self.data))
-        source = Path(self.temp.name)/"v21-source.zip"
-        archive = Path(self.temp.name)/"v21-schema.zip"
+        source = Path(self.temp.name)/(catalog+"-source.zip")
+        archive = Path(self.temp.name)/(catalog+"-schema.zip")
         backup.backup_mysql(self.config, source, apply=True, writers_stopped=True,
                             connect=lambda _: FakeMySQL(rows))
         with zipfile.ZipFile(source) as origin, zipfile.ZipFile(archive, "w") as destination:
@@ -1356,12 +1436,12 @@ class MySQLBackupTests(unittest.TestCase):
                 data = origin.read(info)
                 if info.filename == "manifest.json":
                     manifest = json.loads(data)
-                    manifest["catalog"] = "v0.21"
+                    manifest["catalog"] = catalog
                     data = json.dumps(manifest).encode()
                 destination.writestr(info, data)
         target = FakeMySQL({table: [] for table in backup.TABLES})
         checked = backup.verify_archive(archive)
-        self.assertEqual((checked["catalog"], checked["files"]), ("v0.21", 78))
+        self.assertEqual((checked["catalog"], checked["files"]), (catalog, 78))
         restored = backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
                                         confirm=backup.CONFIRM, connect=lambda _: target)
         self.assertEqual(restored["tables"], 78)
@@ -1474,7 +1554,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         growth.close()
                     attention = AttentionStore(directory/"unused-attention.sqlite3", mysql_settings=settings)
                     try:
-                        self.assertEqual(attention.state("12345678", now=103), attention_before)
+                        assert_attention_restore(self, attention, attention_before)
                         attention.capture(attention_message(), owner_id="12345678", now=104, engagement_seconds=1)
                         self.assertEqual(attention.state("12345678", now=104)["revision"], attention_before["revision"])
                         self.assertEqual(attention.state("12345678", now=104)["cycle_count"], 1)

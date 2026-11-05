@@ -60,7 +60,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.22.0",
+        default="0.23.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -216,6 +216,7 @@ class Growth(PluginConfigBase):
     mode: Literal["observe", "active"] = Field(default="observe", description="observe=验证并记录任务结果，不改变人格；active=持久更新兴趣、观点、知识、问题、性格与短期情绪")
     interval_seconds: int = Field(default=3600, ge=60, le=86400, description="新学习任务的最短间隔，任务与时间持久化；与统一联想共用每日模型预算")
     review_beliefs: bool = Field(default=False, description="把旧观点与完整原始依据一起复核；不同依据先保留分歧，变更主张需要独立新来源，不因一句话立即改口")
+    personality_tensions: bool = Field(default=False, description="让已有慢变性格同时体现长处与取舍；当前明确请求优先，不制造错误、经历或关系惩罚")
 
 
 class MCPIntegration(PluginConfigBase):
@@ -309,6 +310,7 @@ class Continuity(PluginConfigBase):
 class Attention(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用统一关注与后台行动选择，需统一心智active")
     dialogue_enabled: bool = Field(default=True, description="按当前主人私聊判断短时倾听、建议和误会修复")
+    activity_awareness: bool = Field(default=False, description="按真实后台进展记录有限注意力负荷并随时间恢复；主人询问时说明可核验的近期活动，正常对话不等待恢复")
     engagement_seconds: int = Field(default=90, ge=15, le=600, description="收到主人私聊后优先当前对话的秒数")
     interval_seconds: int = Field(default=300, ge=30, le=86400, description="统一后台行动的最小间隔秒数")
     max_daily_actions: int = Field(default=12, ge=0, le=100, description="统一后台行动每天最多尝试次数，仍遵守原工具和阅读预算")
@@ -504,7 +506,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.22.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.23.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1446,7 +1448,7 @@ class MaiLivingWorld(MaiBotPlugin):
     def _growth_style_hint(self) -> str:
         if (self.config.growth.enabled and self.config.growth.mode == "active"
                 and self._unified_active() and self._growth):
-            return style_hint(self._growth.state())
+            return style_hint(self._growth.state(), personality_tensions=self.config.growth.personality_tensions)
         return ""
 
     def _ensure_growth(self) -> GrowthRuntime | None:
@@ -2043,7 +2045,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 "pixiv_enabled": self.config.mcp_pixiv.enabled, "connected": list(self._mcp_clients),
                 "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
 
-    async def _research_tools(self, *, question_key=None, external_valid=None, with_evidence=False):
+    async def _research_tools(self, *, question_key=None, external_valid=None, with_evidence=False, on_dispatch=None):
         cfg = self.config.mcp
         if not (cfg.enabled and cfg.research_enabled and cfg.remember_results and self.config.mcp_pixiv.enabled
                 and self._ensure_growth() and self.config.growth.mode == "active"):
@@ -2079,6 +2081,8 @@ class MaiLivingWorld(MaiBotPlugin):
             client = self._mcp_client("pixiv")
             options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,
                            timezone=self.config.general.timezone, record_observations=True)
+            if on_dispatch is not None:
+                options["on_dispatch"] = on_dispatch
             found = await self._mcp_bridge.execute("pixiv", "search_library",
                 {"q": context["query"], "page_size": 1, "x_restrict": 0, "statuses": ["active"]}, **options)
             if found.get("success") and valid():

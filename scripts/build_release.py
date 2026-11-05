@@ -39,7 +39,7 @@ required = (
     "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "mysql_compat.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "self_state.py", "unified_memory.py", "unified_expression.py", "unified_runtime.py", "growth_store.py", "growth_model.py", "growth_runtime.py", "tool_store.py", "mcp_client.py", "mcp_policy.py", "mcp_runtime.py", "mcp_media.py",
     "companion_runtime.py", "companion_store.py", "reading_model.py", "document_reader.py", "dashboard.py", "webui.json", "webui/index.html",
     "bond_store.py", "bond_runtime.py", "companion_style.py", "deploy/COMPANION.md",
-    "attention_store.py", "attention_runtime.py", "dialogue_policy.py",
+    "attention_store.py", "attention_runtime.py", "dialogue_policy.py", "activity_context.py",
     "continuity_store.py", "continuity_runtime.py", "continuity_model.py",
     "recollection_store.py", "recollection_model.py", "recollection_runtime.py", "recall_query.py",
     "habits_store.py", "habits_model.py", "habits_runtime.py",

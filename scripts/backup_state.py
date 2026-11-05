@@ -64,10 +64,13 @@ V21_LEDGERS = MappingProxyType({**V20_LEDGERS,
 })
 # v0.22 stores opinion revisions in existing growth JSON and history rows.
 V22_LEDGERS = MappingProxyType(dict(V21_LEDGERS))
+# v0.23 keeps activity context in the existing attention JSON payload.
+V23_LEDGERS = MappingProxyType(dict(V22_LEDGERS))
 CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS, "v0.16": V16_LEDGERS,
                            "v0.17": V17_LEDGERS, "v0.18": V18_LEDGERS, "v0.19": V19_LEDGERS,
-                           "v0.20": V20_LEDGERS, "v0.21": V21_LEDGERS, "v0.22": V22_LEDGERS})
-CURRENT_CATALOG = "v0.22"
+                           "v0.20": V20_LEDGERS, "v0.21": V21_LEDGERS, "v0.22": V22_LEDGERS,
+                           "v0.23": V23_LEDGERS})
+CURRENT_CATALOG = "v0.23"
 LEDGERS = CATALOGS[CURRENT_CATALOG]
 TABLES = tuple(table for tables in LEDGERS.values() for table in tables)
 MAX_MANIFEST = 1024 * 1024

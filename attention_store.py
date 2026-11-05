@@ -18,6 +18,7 @@ from pathlib import Path
 from .mysql_compat import MySQLCompatConnection
 from .owner import extract_sender, normalize_qq
 from .sql_logging import connect_sqlite
+from .activity_context import LOAD_STEP, load_view
 
 
 def _json(value):
@@ -56,7 +57,8 @@ def _defaults(owner):
     return {"owner_id": owner, "revision": 0, "focus": None, "focus_streak": 0,
             "conversation": {"mode": "normal", "until": 0}, "latest_receipt": "",
             "engaged_until": 0, "lease_token": "", "lease_until": 0, "lease_revision": 0,
-            "lease_focus": None, "last_finished": 0, "last_outcome": "",
+            "lease_focus": None, "lease_activity": None, "activity": {"load": 0., "at": 0.},
+            "last_finished": 0, "last_outcome": "",
             "budget_day": 0, "cycle_count": 0, "last_started": 0, "created": 0, "updated": 0}
 
 
@@ -104,11 +106,15 @@ class AttentionStore:
     def _decode(row):
         result = dict(row)
         result.update(json.loads(result.pop("payload")))
+        if "cycle_count" in result:
+            result.setdefault("activity", {"load": 0., "at": 0.})
+            result.setdefault("lease_activity", None)
         return result
 
     @staticmethod
     def _payload(row):
-        return {key: row[key] for key in ("focus", "focus_streak", "conversation", "latest_receipt", "lease_focus")}
+        return {key: row[key] for key in ("focus", "focus_streak", "conversation", "latest_receipt", "lease_focus",
+                                         "activity", "lease_activity")}
 
     def _read(self, sql, parameters=()):
         if isinstance(self.con, MySQLCompatConnection):
@@ -142,7 +148,9 @@ class AttentionStore:
         conversation["active"] = conversation["mode"] != "normal" and conversation["until"] > now
         conversation["effective_mode"] = conversation["mode"] if conversation["active"] else "normal"
         state["lease"] = {"token": state.pop("lease_token"), "until": state.pop("lease_until"),
-                          "revision": state.pop("lease_revision"), "focus": state.pop("lease_focus")}
+                          "revision": state.pop("lease_revision"), "focus": state.pop("lease_focus"),
+                          "activity": state.pop("lease_activity")}
+        state["activity"] = load_view(state["activity"], now)
         return state
 
     def _event(self, owner, action, payload, now):
@@ -304,10 +312,13 @@ class AttentionStore:
                 return candidates[(index+int(rotate)) % len(candidates)]
         return candidates[0]
 
-    def claim(self, owner_id, *, candidates, day_start, daily_limit, interval_seconds, lease_seconds=180, now=None):
+    def claim(self, owner_id, *, candidates, day_start, daily_limit, interval_seconds, lease_seconds=180, now=None,
+              activity_awareness=False):
         owner, now, day = _owner(owner_id), _now(now), _now(day_start)
         limit, interval = _int(daily_limit, 0, 1000), _int(interval_seconds, 0, 86400)
         seconds = _int(lease_seconds, 1, 3600)
+        if type(activity_awareness) is not bool:
+            raise ValueError("invalid_activity_mode")
         candidates = self._candidates(candidates)
         # Accept a civil day spanning a clock change; the host supplies its start.
         if day > now or now-day > 172800:
@@ -317,6 +328,8 @@ class AttentionStore:
         with self.con:
             row = self._lock(owner, now)
             if row["engaged_until"] > now or (row["lease_token"] and row["lease_until"] > now):
+                return None
+            if activity_awareness and load_view(row["activity"], now)["recovering"]:
                 return None
             count = row["cycle_count"] if row["budget_day"] == day else 0
             if (count >= limit or day < row["budget_day"]
@@ -331,6 +344,7 @@ class AttentionStore:
                 row["focus_streak"] = 0
             row["focus"] = dict(chosen)
             row["lease_focus"] = dict(chosen)
+            row["lease_activity"] = None
             row["lease_token"] = uuid.uuid4().hex
             row["lease_until"] = now+seconds
             row["lease_revision"] = row["revision"]
@@ -338,6 +352,27 @@ class AttentionStore:
             self._save(row, now)
             self._event(owner, "claim", {"focus": chosen, "revision": row["revision"], "lease_until": row["lease_until"]}, now)
             return {"token": row["lease_token"], "focus": dict(chosen), "revision": row["revision"]}
+
+    def start_activity(self, owner_id, token, *, proof, signature, now=None):
+        """Record an actual dispatch only while the claimed work is still valid."""
+        owner, now = _owner(owner_id), _now(now)
+        if (not isinstance(token, str) or not token or any(not isinstance(v, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", v) for v in (proof, signature))):
+            raise ValueError("invalid_activity_start")
+        with self.con:
+            row = self._lock(owner, now)
+            if (row["lease_token"] != token or row["lease_until"] <= now
+                    or row["lease_revision"] != row["revision"] or row["engaged_until"] > now
+                    or row["lease_activity"] is not None):
+                return False
+            activity = {"proof": proof, "signature": signature, "started": now,
+                        "token_hash": _hash(token)}
+            row["lease_activity"] = activity
+            self._save(row, now)
+            self._event(owner, "activity_start", {"focus": row["lease_focus"], **activity,
+                                                  "revision": row["lease_revision"],
+                                                  "budget_day": row["budget_day"], "cycle_count": row["cycle_count"]}, now)
+            return True
 
     def valid(self, owner_id, token, *, now=None):
         owner, now = _owner(owner_id), _now(now)
@@ -348,12 +383,15 @@ class AttentionStore:
         return bool(lease["token"] == token and lease["until"] > now
                     and lease["revision"] == state["revision"] and state["engaged_until"] <= now)
 
-    def finish(self, owner_id, token, *, outcome, now=None):
+    def finish(self, owner_id, token, *, outcome, now=None, activity_awareness=False, activity_proof=None):
         owner, now = _owner(owner_id), _now(now)
         if not isinstance(outcome, str) or outcome not in {"progress", "blocked", "interrupted", "failed"}:
             raise ValueError("invalid_outcome")
         if not isinstance(token, str) or not token:
             return False
+        if type(activity_awareness) is not bool or (activity_proof is not None and (
+                not isinstance(activity_proof, str) or not re.fullmatch(r"[0-9a-f]{64}", activity_proof))):
+            raise ValueError("invalid_activity_finish")
         with self.con:
             row = self._lock(owner, now)
             if row["lease_token"] != token:
@@ -364,9 +402,15 @@ class AttentionStore:
                 outcome = "interrupted"
             if outcome == "progress":
                 row["focus_streak"] = min(2, row["focus_streak"]+1)
+            activity = row["lease_activity"]
+            if activity_awareness and activity and outcome == "progress" and activity_proof:
+                load = load_view(row["activity"], now)
+                row["activity"] = {"load": min(1., round(load["load"]+LOAD_STEP, 8)), "at": max(load["at"], now)}
             self._event(owner, "finish", {"focus": row["lease_focus"], "outcome": outcome,
-                                        "revision": row["revision"], "claim_revision": row["lease_revision"]}, now)
+                                        "revision": row["revision"], "claim_revision": row["lease_revision"],
+                                        "activity": {**activity, "proof": activity_proof} if activity and activity_proof else None}, now)
             row["lease_token"], row["lease_until"], row["lease_revision"], row["lease_focus"] = "", 0, 0, None
+            row["lease_activity"] = None
             row["last_finished"], row["last_outcome"] = now, outcome
             self._save(row, now)
             return accepted
