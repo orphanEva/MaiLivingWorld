@@ -36,7 +36,7 @@ class BondMigrationTests(unittest.TestCase):
         self.assertEqual(migration.LEDGERS["bond.sqlite3"], BOND_TABLES)
         self.assertEqual(set(migration.ALL_TABLES), set(backup.TABLES))
         self.assertEqual(set(TABLES) | {"stories", "attempts", "story_attempts"}, set(backup.TABLES))
-        self.assertEqual(len(backup.TABLES), 47)
+        self.assertEqual(len(backup.TABLES), 51)
         self.assertIn("bond.sqlite3", migration.OPTIONAL_LEDGERS)
 
     def test_old_ten_library_migration_does_not_create_bond_or_new_identity(self):
@@ -81,12 +81,12 @@ class BondMigrationTests(unittest.TestCase):
             def close(self):
                 pass
         names = ("MySQLStore", "BrainBook", "MindStore", "CognitiveStore", "ExperienceLoop",
-                 "ProactiveFeedback", "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore")
+                 "ProactiveFeedback", "SelfState", "GrowthStore", "ToolStore", "CompanionStore", "BondStore", "ContinuityStore")
         with patch.multiple(migration, **{name: EmptyStore for name in names}), tempfile.TemporaryDirectory() as temp:
             migration.ensure_schema({"table_prefix": "test_"}, Path(temp))
-        self.assertEqual(len(calls), 11)
-        self.assertEqual(calls[-1][0][0].name, "bond.sqlite3")
-        self.assertEqual(calls[-1][1]["mysql_settings"], {"table_prefix": "test_"})
+        self.assertEqual(len(calls), 12)
+        bond = next(call for call in calls if call[0] and call[0][0].name == "bond.sqlite3")
+        self.assertEqual(bond[1]["mysql_settings"], {"table_prefix": "test_"})
 
     def test_bond_official_ddl_and_comment_upgrade_match_real_columns(self):
         ddl = (ROOT/"sql"/"mysql.sql").read_text(encoding="utf-8")

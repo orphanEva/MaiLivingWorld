@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十一套数据共 47 表（含持续自我、成长、工具、陪伴与相处约定）
+-- MaiLivingWorld MySQL 8.4 十二套数据共 51 表（含持续自我、成长、工具、陪伴、相处约定与聊天连续性）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -467,3 +467,55 @@ CREATE TABLE IF NOT EXISTS `mlw_bond_audit` (
     created DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒',
     KEY `idx_bond_audit_owner` (owner_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='相处约定与纪念事项的幂等和修改审计，保留原主人归属';
+
+CREATE TABLE IF NOT EXISTS `mlw_continuity_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '可信主人标识，旧主人状态不会自动转移',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '控制状态与待续话题修改的乐观锁版本',
+    payload LONGTEXT NOT NULL COMMENT '明确联系暂停状态及支持方式偏好JSON',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '提取额度所属本地日期起点，Unix秒',
+    cycle_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的连续性提取模型次数',
+    last_cycle DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留模型次数的时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '单主人提取批次独占租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '提取租约失效时间，Unix秒',
+    lease_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次起始输入标识',
+    created DOUBLE NOT NULL COMMENT '首次接收可信主人操作的时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人聊天连续性控制与明确联系节奏，不把未回消息当负面反馈';
+
+CREATE TABLE IF NOT EXISTS `mlw_continuity_inputs` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信主人场合与消息ID的稳定摘要',
+    owner_id VARCHAR(191) NOT NULL COMMENT '原始输入所属的可信主人标识',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于来源变更校验',
+    status VARCHAR(191) NOT NULL COMMENT '待处理运行中已处理过期或撤回状态',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次租约令牌',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许提取时间，Unix秒',
+    expires DOUBLE NOT NULL COMMENT '未处理原文队列的到期时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '有界待处理原文与输入元数据JSON，完成或过期后清除原文',
+    created DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒',
+    KEY `idx_continuity_inputs_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='可信主人私聊的有界提取队列与来源摘要，完成后清除待处理原文';
+
+CREATE TABLE IF NOT EXISTS `mlw_continuity_threads` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '主人话题的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '话题原主人标识，不迁移给新主人',
+    kind VARCHAR(191) NOT NULL COMMENT '事件关心或愿望类型，不等于确认事实',
+    status VARCHAR(191) NOT NULL COMMENT 'open待续resolved已解决或dismissed不再追问',
+    revision BIGINT NOT NULL COMMENT '话题内容和状态的修改版本',
+    payload LONGTEXT NOT NULL COMMENT '标题摘要与可信输入引用JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次提取出话题的时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近话题内容或状态变化时间，Unix秒',
+    KEY `idx_continuity_threads_owner` (owner_id,status,updated)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='有主人原话证据的待续话题，保留已解决与不再追问状态而非关系分';
+
+CREATE TABLE IF NOT EXISTS `mlw_continuity_audit` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '操作来源和批次的幂等审计标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际操作所属的可信主人标识',
+    entity_id VARCHAR(191) NOT NULL COMMENT '关联控制状态话题或输入标识',
+    action VARCHAR(191) NOT NULL COMMENT '实际完成的提取或明确状态修改动作',
+    body_digest VARCHAR(191) NOT NULL COMMENT '可信来源正文或批次摘要',
+    payload LONGTEXT NOT NULL COMMENT '修改前后结构化状态及来源引用JSON',
+    created DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒',
+    KEY `idx_continuity_audit_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='连续性提取与明确联系节奏修改审计，不证明机器人已经问候';

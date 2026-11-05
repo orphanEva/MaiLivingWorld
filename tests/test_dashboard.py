@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("mlw_dashboard_tested", ROOT/"dashboard.py")
@@ -173,6 +174,99 @@ class DashboardTests(unittest.TestCase):
         self.assertIsNone(result["traits"][0]["value"])
         self.assertEqual(result["budgets"]["model"], {"used": 0, "limit": 0})
         self.assertLess(len(json.dumps(result)), 512*1024)
+
+    def continuity(self):
+        return {"state": {"owner_id": self.owner, "revision": 5,
+                    "contact": {"mode": "busy", "until": 500, "active": True, "effective_mode": "busy"},
+                    "support": {"mode": "listen", "until": 0, "active": True, "effective_mode": "listen"},
+                    "lease_token": "private-lease-token", "cycle_count": 3},
+                "threads": [{"id": "continuity-private-key", "owner_id": self.owner, "scope": "private:"+self.owner,
+                    "title": "准备考试", "summary": "最近有些担心考试", "kind": "concern", "status": "open", "updated": 99,
+                    "source_refs": [{"id": "private-source-id", "digest": "private-digest", "scope": "private:"+self.owner, "sensitivity": "personal"}],
+                    "evidence": [{"quote": "private-original-quote"}]}]}
+
+    def test_continuity_projects_only_current_owner_summary_and_effective_status(self):
+        result = self.build(continuity=self.continuity())["continuity"]
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["contact"], {"mode": "busy", "active": True, "until": "1970-01-01T00:08:20+00:00"})
+        self.assertEqual(result["support"], {"mode": "listen", "active": True, "until": ""})
+        self.assertEqual(result["threads"], [{"title": "准备考试", "summary": "最近有些担心考试", "kind": "concern",
+            "status": "open", "updated_at": "1970-01-01T00:01:39+00:00", "source_count": 1}])
+        text = json.dumps(result, ensure_ascii=False)
+        for hidden in (self.owner, "private:", "private-key", "private-lease-token", "private-source-id",
+                       "private-digest", "private-original-quote", "cycle_count", "revision"):
+            self.assertNotIn(hidden, text)
+
+    def test_continuity_disabled_unknown_owner_and_old_owner_are_empty(self):
+        for values in (None, {}, {"state": {"owner_id": "87654321"}, "threads": self.continuity()["threads"]}):
+            result = self.build(continuity=values)["continuity"]
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["threads"], [])
+        result = self.build(identity={}, continuity=self.continuity())["continuity"]
+        self.assertFalse(result["enabled"])
+
+    def test_continuity_rejects_foreign_group_closed_and_sensitive_summaries(self):
+        values = self.continuity()
+        own = values["threads"][0]
+        values["threads"] += [dict(own, owner_id="87654321"), dict(own, scope="group:777777"),
+            dict(own, status="resolved"), dict(own, status="dismissed"), dict(own, kind="unknown"),
+            dict(own, title="密码 secret"), dict(own, summary="QQ 12345678"), dict(own, source_refs=[]),
+            dict(own, source_refs=[{"scope": "private:87654321", "sensitivity": "personal"}]),
+            dict(own, source_refs=[{"scope": "private:"+self.owner, "sensitivity": "confidential"}])]
+        result = self.build(continuity=values)["continuity"]
+        self.assertEqual(len(result["threads"]), 1)
+        self.assertEqual(result["threads"][0]["title"], "准备考试")
+
+    def test_continuity_elapsed_pause_is_normal_even_if_source_active_is_stale(self):
+        for now in (500, 501):
+            result = self.build(continuity=self.continuity(), now=now)["continuity"]
+            self.assertEqual(result["contact"], {"mode": "normal", "active": False, "until": ""})
+            self.assertEqual(result["support"]["mode"], "listen")
+        values = self.continuity()
+        values["state"]["contact"] = {"mode": "manual", "active": True, "until": 0}
+        self.assertEqual(self.build(continuity=values, now=501)["continuity"]["contact"]["mode"], "manual")
+
+    def test_continuity_malformed_pause_fails_closed_without_invented_busy_status(self):
+        for value in ({"mode": "busy", "active": True, "until": 0}, {"mode": "busy", "active": True, "until": float("nan")},
+                      {"mode": "rest", "active": "yes", "until": 500}, {"mode": [], "active": True, "until": 500},
+                      {"mode": "busy", "active": True, "until": "later"}):
+            values = self.continuity()
+            values["state"]["contact"] = value
+            with self.subTest(value=value):
+                self.assertEqual(self.build(continuity=values)["continuity"]["contact"]["mode"], "normal")
+
+    def test_continuity_bounded_empty_state_and_readonly_ui_wording(self):
+        values = self.continuity()
+        values["threads"] *= 1000
+        result = self.build(continuity=values)
+        self.assertEqual(len(result["continuity"]["threads"]), 20)
+        values["threads"] = []
+        empty = self.build(continuity=values)["continuity"]
+        self.assertTrue(empty["enabled"])
+        self.assertEqual(empty["threads"], [])
+        html = dashboard.render_dashboard(result)
+        for label in ("最近放在心上的事", "自然聊天", "不代表已承诺提醒", "不代表已经发出关心", "暂停至", "先倾听"):
+            self.assertIn(label, html)
+        self.assertIn("expires<=Date.now()", html)
+        self.assertIn("setInterval", html)
+        self.assertNotIn("innerHTML", html)
+
+    def test_continuity_offline_export_revalidates_expiry_and_strips_hidden_fields(self):
+        result = self.build(continuity=self.continuity())
+        result["continuity"]["owner_id"] = self.owner
+        thread = result["continuity"]["threads"][0]
+        thread["evidence"] = [{"quote": "never-serialize-quote"}]
+        thread["source_refs"] = [{"id": "never-serialize-id"}]
+        thread["summary"] = "</script><script>alert('continuity')</script>"
+        with patch.object(dashboard.time, "time", return_value=501):
+            exported = dashboard._export(result)
+            html = dashboard.render_dashboard(result)
+        self.assertEqual(exported["continuity"]["contact"]["mode"], "normal")
+        for hidden in (self.owner, "never-serialize-quote", "never-serialize-id", "</script><script>alert('continuity')"):
+            self.assertNotIn(hidden, html)
+        self.assertIn("\\u003c/script\\u003e", html)
+        result["continuity"]["enabled"] = False
+        self.assertNotIn("准备考试", dashboard.render_dashboard(result))
 
     def test_export_escapes_script_and_discards_unlisted_fields(self):
         self.item["topic"] = "</script><script>alert('x')</script>"

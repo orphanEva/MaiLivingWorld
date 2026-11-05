@@ -99,21 +99,68 @@ def _bond_view(value):
     return result
 
 
+def _phase_view(value, allowed, now):
+    """Expose the effective state only; an elapsed pause is never still busy."""
+    value = _dict(value)
+    normal = {"mode": "normal", "active": False, "until": ""}
+    mode, until = value.get("mode"), value.get("until", 0)
+    if isinstance(until, str):
+        if not until:
+            until = 0
+        else:
+            try:
+                date = datetime.fromisoformat(until)
+                until = date.timestamp() if date.tzinfo is not None else None
+            except (ValueError, OSError, OverflowError):
+                until = None
+    until = _number(until, 0, 253402300799)
+    if (mode not in allowed or value.get("active") is not True or until is None
+            or _number(now, 0, 253402300799) is None or (until and until <= now)
+            or (mode in ("busy", "rest") and not until)):
+        return normal
+    return {"mode": mode, "active": True, "until": _date(until) if until else ""}
+
+
+def _continuity_view(value, *, now):
+    """Whitelist owner-filtered summaries; no quotes, identities or source IDs."""
+    value = _dict(value)
+    result = {"enabled": False, "contact": _phase_view(None, (), now),
+              "support": _phase_view(None, (), now), "threads": []}
+    if value.get("enabled") is not True:
+        return result
+    result["enabled"] = True
+    result["contact"] = _phase_view(value.get("contact"), ("busy", "rest", "manual"), now)
+    result["support"] = _phase_view(value.get("support"), ("listen", "advice"), now)
+    for item in _rows(value.get("threads"), 20):
+        title, summary = _text(item.get("title"), 60), _text(item.get("summary"), 180)
+        count = _count(item.get("source_count"))
+        if (not title or not summary or item.get("kind") not in ("event", "concern", "wish")
+                or item.get("status") != "open" or not 1 <= count <= 12):
+            continue
+        result["threads"].append({"title": title, "summary": summary, "kind": item["kind"], "status": "open",
+                                  "updated_at": _date(item.get("updated_at")), "source_count": count})
+    return result
+
+
 def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fingerprint,
-                    budgets=None, companion=None, bond=None, authorized=False, now=None) -> dict:
+                    budgets=None, companion=None, bond=None, continuity=None, authorized=False, now=None) -> dict:
     """Caller must authenticate the Host WebUI administrator or the private owner.
 
     ``authorized`` is a server decision, never a user/model argument. Invalid or
     third-party dependencies yield a placeholder, not hidden original content.
     ``growth`` should include invalid items so the panel can count invalidation.
+    ``continuity.threads`` must come from ContinuityStore.threads(status="open"),
+    which validates live source digests; the panel additionally filters audience
+    and fields, and never treats an input queue or raw SQL row as verified.
     """
     if authorized is not True:
         raise DashboardError("dashboard_access_denied")
     if not all(isinstance(item, dict) for item in (identity, growth, resolved_sources)) or not callable(fingerprint):
         raise DashboardError("invalid_dashboard_state")
+    now = time.time() if now is None else now
     owner = identity.get("owner_id")
     owner = owner if isinstance(owner, str) and re.fullmatch(r"[0-9]{5,20}", owner) else ""
-    result = {"format": FORMAT, "generated_at": _date(time.time() if now is None else now),
+    result = {"format": FORMAT, "generated_at": _date(now),
               "identity": {"owner_bound": bool(owner), "binding_revision": _count(identity.get("revision")), "agent_label": "持续自我"},
               "revision": _count(growth.get("revision")), "traits": [], "mood": {}, "growth": {},
               "source_counts": {"valid": 0, "invalid": 0, "protected": 0}, "budgets": {}, "plans": [], "reading": []}
@@ -191,6 +238,22 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
         result["bond"] = _bond_view({"enabled": True, "preferred_address": profile.get("preferred_address"),
             "blocked_addresses": profile.get("blocked_addresses"), "affection": profile.get("affection"),
             "boundaries": profile.get("boundaries"), "moments": moments})
+    current = _dict(_dict(continuity).get("state"))
+    result["continuity"] = _continuity_view(None, now=now)
+    if owner and current.get("owner_id") == owner:
+        threads = []
+        for item in _rows(_dict(continuity).get("threads"), 20):
+            if item.get("owner_id") != owner or item.get("scope") != "private:"+owner or item.get("status") != "open":
+                continue
+            refs = item.get("source_refs")
+            if (not isinstance(refs, list) or not 1 <= len(refs) <= 12
+                    or any(not isinstance(ref, dict) or ref.get("scope") != "private:"+owner
+                           or ref.get("sensitivity") != "personal" for ref in refs)):
+                continue
+            threads.append({"title": item.get("title"), "summary": item.get("summary"), "kind": item.get("kind"),
+                            "status": "open", "updated_at": item.get("updated"), "source_count": len(refs)})
+        result["continuity"] = _continuity_view({"enabled": True, "contact": current.get("contact"),
+            "support": current.get("support"), "threads": threads}, now=now)
     return result
 
 
@@ -234,6 +297,7 @@ def _export(snapshot):
                            provider=item.get("provider") if item.get("provider") in ("cap", "pixiv") else "local")
             result[key].append(row)
     result["bond"] = _bond_view(snapshot.get("bond"))
+    result["continuity"] = _continuity_view(snapshot.get("continuity"), now=time.time())
     return result
 
 

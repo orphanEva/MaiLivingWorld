@@ -256,6 +256,8 @@ def _source_id(identity: Any) -> tuple[str, tuple[str, ...]]:
         return "tool", (identity,)
     if re.fullmatch(r"bond:moment:[0-9a-f]{64}", identity):
         return "bond", (identity,)
+    if re.fullmatch(r"continuity:thread:[0-9a-f]{64}", identity):
+        return "continuity", (identity,)
     token = r"([A-Za-z0-9][A-Za-z0-9_-]{0,127})"
     for prefix, source in (("brain:fact:", "brain_fact"),
                            ("brain:event:", "brain_event"),

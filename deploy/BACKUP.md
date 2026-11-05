@@ -16,7 +16,7 @@ python dashboard.py --input dashboard-export.json --output growth-snapshot.html
 
 ## 备份范围与一致性
 
-`scripts/backup_state.py` 支持 SQLite 的十一个固定账本和 MySQL 同结构专用库的 47 张表：
+`scripts/backup_state.py` 支持 SQLite 的十二个固定账本和 MySQL 同结构专用库的 51 张表：
 
 | SQLite 文件 | 内容 |
 | --- | --- |
@@ -31,12 +31,13 @@ python dashboard.py --input dashboard-export.json --output growth-snapshot.html
 | `tool_memory.sqlite3` | 工具观察、调用、任务归属与研究额度 |
 | `companion.sqlite3` | 阅读、已读单元、共同计划、审计与阅读额度 |
 | `bond.sqlite3` | 主人相处约定、明确记录的回忆与纪念日、撤回和命令审计 |
+| `continuity.sqlite3` | 主人聊天中待续的话题、明确忙碌或休息状态、提取去重与审计 |
 
 备份仅包含这些状态账本。插件配置、环境变量、cap 网关缓存卷、PDF 文件、Pixiv 后端数据库和图片库需要分别备份。来源文件丢失或版本变化后，即使恢复了阅读进度，相关来源仍须重新校验；恢复工具不会伪造原始内容。
 
 **所有实际备份和恢复均要求停止写入者。** 对 Docker 部署，先停止所有挂载同一插件状态目录或连接同一插件数据库的 MaiBot 实例，以及迁移或维护任务。其他后台进程如果会直接写这些账本，也必须停止。只关闭成长开关不等于停写，消息采集和调用预算仍可能更新。
 
-SQLite 使用数据库 backup API，包括已经提交到 WAL 的内容；十一库之间的一致性来自停写前提。MySQL 使用 InnoDB 的一致性只读事务快照；仍要求停写，避免 DDL、表清单和自增计数器在备份期间变化。`--writers-stopped` 是操作员声明，工具不能自动证明所有外部进程都已停写。不要把仍在写入的多个 SQLite 文件直接打包后当作一致备份。
+SQLite 使用数据库 backup API，包括已经提交到 WAL 的内容；十二库之间的一致性来自停写前提。MySQL 使用 InnoDB 的一致性只读事务快照；仍要求停写，避免 DDL、表清单和自增计数器在备份期间变化。`--writers-stopped` 是操作员声明，工具不能自动证明所有外部进程都已停写。不要把仍在写入的多个 SQLite 文件直接打包后当作一致备份。
 
 归档内有固定文件清单、大小、SHA-256、行数及结构元数据。恢复前检查所有文件，拒绝额外文件、重复名称、路径穿越、符号链接、过大文件和哈希不符。SQLite 拒绝非预期表、视图与触发器。MySQL 要求专用 InnoDB schema，拒绝额外业务表或触发器；不会执行归档提供的 SQL。
 
@@ -65,7 +66,7 @@ python scripts/backup_state.py restore-sqlite --archive /srv/backups/mlw-state.z
 
 缺省库会明确列在输出 `missing` 中，不会静默补建新身份。检查清单是否符合你的运行版本；若应存在的库缺失，先找到正确的源目录。目标目录有任何文件就拒绝恢复，绝不递归删除目标。数据先恢复到同文件系统的临时目录，全部成功后再移入空目标。
 
-新归档使用 `mailivingworld.state-backup.v2` 格式和明确的 `catalog: v0.15` 清单。旧 v0.14 的 v1 归档固定按原十库清单校验；可恢复其中的十库，输出另外报告 `bond.sqlite3` 未提供，不凭空生成约定或回忆。每种清单都要求归档文件与明确的缺失列表完整且不重叠，不能用旧格式夹带新库、未知表或隐瞒漏项。旧备份脚本不支持新 v2 归档，请使用新脚本校验和恢复。
+新归档使用 `mailivingworld.state-backup.v2` 格式和明确的 `catalog: v0.16` 清单。旧 v0.14 的 v1 归档固定按原十库清单校验，v0.15 的 v2 归档固定按原十一库清单校验。恢复 v0.14 时另外报告 `bond.sqlite3` 和 `continuity.sqlite3` 未提供，恢复 v0.15 时报告 `continuity.sqlite3` 未提供，不凭空生成约定、回忆或待续话题。每种清单都要求归档文件与明确的缺失列表完整且不重叠，不能用旧格式夹带新库、未知表或隐瞒漏项。请使用支持对应清单的新脚本校验和恢复。
 
 恢复后先在隔离环境检查面板中的主人绑定、成长修订、计划、阅读进度和额度，再让停止的实例指向已验收目录。切换前保留原目录。不要同时启动原数据和副本连接同一 QQ 或执行同一计划。
 
@@ -105,10 +106,10 @@ python scripts/backup_state.py restore-mysql --archive /srv/backups/mlw-mysql.zi
 
 这是同后端、同结构的恢复，不负责跨版本降级或 SQLite/MySQL 格式转换。跨后端迁移使用项目已有的 `scripts/migrate_all_sqlite_to_mysql.py`，先在副本上升级和验收。
 
-旧 v0.14 的 44 表 MySQL 归档仍可验证，并恢复到匹配的空 44 表旧结构；直接恢复到新增相处约定表的 47 表结构会返回 `mysql_catalog_requires_matching_schema_then_upgrade`。请先按原版本和建表路径还原并验收，再运行新版本的正式非破坏性建表迁移。工具不会忽略新表、丢弃已有约定或混合执行旧归档的 DDL。
+旧 v0.14 的 44 表与 v0.15 的 47 表 MySQL 归档仍可验证，并恢复到匹配的空旧结构；直接恢复到新增连续性账本的 51 表结构会返回 `mysql_catalog_requires_matching_schema_then_upgrade`。请先按原版本和建表路径还原并验收，再运行新版本的正式非破坏性建表迁移。工具不会忽略新表、丢弃已有约定或混合执行旧归档的 DDL。
 
 ## 验证范围
 
-自动离线演练覆盖十一库 47 表、真实存储类建表、身份与主人恢复、模型额度、成长状态、共同计划、相处约定与撤回回忆、SQLite WAL、旧十库清单兼容、损坏归档、路径攻击和非空目标保护。模拟 MySQL 验证一致性事务、旧 44 表与新 47 表结构差异拒绝、失败回滚与计数器保留。
+自动离线演练覆盖十二库 51 表、真实存储类建表、身份与主人恢复、模型额度、成长状态、共同计划、相处约定与撤回回忆、连续性状态、SQLite WAL、旧十库及十一库清单兼容、损坏归档、路径攻击和非空目标保护。模拟 MySQL 验证一致性事务、旧 44/47 表与新 51 表结构差异拒绝、失败回滚与计数器保留。
 
 真实 MySQL 测试只在 `MLW_LIVE_MYSQL=1` 且指定独立的 `MLW_BACKUP_MYSQL_DATABASE=mlw_backup_test...` 时运行。该测试要求专用库最初完全为空，用当前正式结构演练备份和恢复，结束后删除测试自己创建的表。本机离线测试不能替代这个 CI 检查，也不能替代用户的实际 Docker、存储卷与账号验收。

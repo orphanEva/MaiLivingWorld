@@ -511,3 +511,52 @@ ALTER TABLE `mlw_bond_audit`
   MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原命令正文的SHA256摘要，不保存命令原文',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '命令签名及修改前后结构化状态JSON',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '命令事务提交时间，Unix秒';
+
+ALTER TABLE `mlw_continuity_control`
+  COMMENT = '主人聊天连续性控制与明确联系节奏，不把未回消息当负面反馈',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '可信主人标识，旧主人状态不会自动转移',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '控制状态与待续话题修改的乐观锁版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '明确联系暂停状态及支持方式偏好JSON',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '提取额度所属本地日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的连续性提取模型次数',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留模型次数的时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '单主人提取批次独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '提取租约失效时间，Unix秒',
+  MODIFY COLUMN `lease_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次起始输入标识',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次接收可信主人操作的时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒';
+
+ALTER TABLE `mlw_continuity_inputs`
+  COMMENT = '可信主人私聊的有界提取队列与来源摘要，完成后清除待处理原文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信主人场合与消息ID的稳定摘要',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '原始输入所属的可信主人标识',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于来源变更校验',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '待处理运行中已处理过期或撤回状态',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前提取批次租约令牌',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许提取时间，Unix秒',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '未处理原文队列的到期时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界待处理原文与输入元数据JSON，完成或过期后清除原文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_continuity_threads`
+  COMMENT = '有主人原话证据的待续话题，保留已解决与不再追问状态而非关系分',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '主人话题的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '话题原主人标识，不迁移给新主人',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '事件关心或愿望类型，不等于确认事实',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'open待续resolved已解决或dismissed不再追问',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '话题内容和状态的修改版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '标题摘要与可信输入引用JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次提取出话题的时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近话题内容或状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_continuity_audit`
+  COMMENT = '连续性提取与明确联系节奏修改审计，不证明机器人已经问候',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '操作来源和批次的幂等审计标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际操作所属的可信主人标识',
+  MODIFY COLUMN `entity_id` VARCHAR(191) NOT NULL COMMENT '关联控制状态话题或输入标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际完成的提取或明确状态修改动作',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '可信来源正文或批次摘要',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '修改前后结构化状态及来源引用JSON',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒';

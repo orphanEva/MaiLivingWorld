@@ -7,6 +7,7 @@
 <div id="error" role="alert" class="error" hidden></div>
 <div id="content" hidden><div class="cards"><div class="card"><strong id="revision">—</strong><span>成长修订</span></div><div class="card"><strong id="questions">—</strong><span>仍在探索的问题</span></div><div class="card"><strong id="reading">—</strong><span>阅读记录</span></div><div class="card"><strong id="plans">—</strong><span>共同计划</span></div></div>
 <div class="columns"><div class="stack">
+<section><h2>最近放在心上的事</h2><div id="continuity-state"></div><div id="continuity-threads"></div><p class="notice">近况来自主人的原话，经复核后留下摘要；不代表已承诺提醒，也不代表已经发出关心。自然聊天中逐渐了解后才会出现。</p></section>
 <section><h2>我们的相处方式</h2><div id="bond-profile"></div><p class="notice">称呼与边界来自主人明确的约定，可在私聊中用 /相处 指令查看和修改。</p></section>
 <section><h2>留下的回忆与纪念日</h2><div id="bond-moments"></div><p class="notice">展示主人明确记下的事项。草稿、未完成的计划和发送尝试不会自动成为共同回忆。</p></section>
 <section><h2>我在逐渐形成的想法</h2><div class="toolbar"><input id="search" type="search" aria-label="筛选成长、回忆、计划和阅读" placeholder="搜索主题、回忆、计划或阅读"></div><nav class="tabs" aria-label="成长分类"><button type="button" class="active" data-tab="interests">兴趣</button><button type="button" data-tab="beliefs">观点</button><button type="button" data-tab="knowledge">知识候选</button><button type="button" data-tab="questions">未解问题</button></nav><div id="growth-list"></div><p class="notice">这些是有来源的偏好与推断，不代表已经证实的事实；来源失效后暂停展示内容。</p></section><section><h2>与主人一起的计划</h2><div id="plan-list"></div></section><section><h2>阅读进度</h2><div id="reading-list"></div></section></div>
@@ -65,6 +66,48 @@ function renderBond(){
   if(!items.length) empty(moments,$("search").value?"没有符合搜索条件的记录。":"还没有留下记录。可在主人私聊中用 /相处 记下回忆或纪念日。");
 }
 
+function renderContinuityState(){
+  const continuity=state?.continuity||{}, el=$("continuity-state");
+  el.replaceChildren();
+  if(!continuity.enabled) return;
+  const effective=(value,allowed)=>{
+    if(!value?.active||!allowed.includes(value.mode)) return {mode:"normal",until:""};
+    if(value.until){
+      const expires=new Date(value.until).valueOf();
+      if(!Number.isFinite(expires)||expires<=Date.now()) return {mode:"normal",until:""};
+    }else if(value.mode==="busy"||value.mode==="rest") return {mode:"normal",until:""};
+    return value;
+  };
+  const contact=effective(continuity.contact,["busy","rest","manual"]);
+  const support=effective(continuity.support,["listen","advice"]);
+  const contactLabels={normal:"联系节奏：遵循免打扰与间隔设置",busy:"主人已表示忙碌，暂停主动联系",rest:"主人已表示休息，暂停主动联系",manual:"已暂停主动联系"};
+  const supportLabels={normal:"支持方式：结合当下对话",listen:"支持方式：先倾听，不急着给建议",advice:"支持方式：主人希望一起想办法"};
+  el.append(node("p",contactLabels[contact.mode]),node("p",supportLabels[support.mode]));
+  if(contact.until) el.append(node("p","暂停至 "+stamp(contact.until),"muted"));
+  if(support.until) el.append(node("p","支持方式有效至 "+stamp(support.until),"muted"));
+}
+
+function renderContinuity(){
+  const continuity=state.continuity||{}, el=$("continuity-threads");
+  el.replaceChildren();
+  renderContinuityState();
+  if(!continuity.enabled){
+    empty(el,"聊天连续性尚未启用或主人尚未绑定。");
+    return;
+  }
+  const kinds={event:"最近的事情",concern:"还在牵挂",wish:"想做的事"};
+  const items=rows(continuity.threads).filter(matches);
+  for(const item of items){
+    const row=node("article",undefined,"row");
+    row.append(node("div",item.title,"row-title"),node("p",item.summary));
+    tag(row,kinds[item.kind]||"待续话题");
+    tag(row,number(item.source_count)+" 条原话来源");
+    if(item.updated_at) row.append(node("p","更新于 "+stamp(item.updated_at),"muted"));
+    el.append(row);
+  }
+  if(!items.length) empty(el,$("search").value?"没有符合搜索条件的待续话题。":"还没有待续的近况。可以像平时一样聊聊最近发生的事。");
+}
+
 function meter(el,label,value,detail){const block=node("div",undefined,"meter"),line=node("div",undefined,"meter-label");
 line.append(node("span",label),node("span",detail));
 const track=node("div",undefined,"track"),fill=node("div",undefined,"fill");
@@ -72,7 +115,7 @@ fill.style.width=Math.max(0,Math.min(100,value*100))+"%";
 track.append(fill);
 block.append(line,track);
 el.append(block)}
-function lists(){renderBond();
+function lists(){renderBond();renderContinuity();
 const gl=$("growth-list");
 gl.replaceChildren();
 const selected=rows(state.growth?.[tab]).filter(x=>!$("search").value||matches(x));
@@ -121,6 +164,7 @@ $("error").hidden=false;
 $("content").hidden=true}finally{$("refresh").disabled=false}}
 $("refresh").addEventListener("click",refresh);
 $("search").addEventListener("input",()=>state&&lists());
+setInterval(()=>{if(state)renderContinuityState()},30000);
 for(const button of document.querySelectorAll("[data-tab]"))button.addEventListener("click",()=>{tab=button.dataset.tab;
 for(const b of document.querySelectorAll("[data-tab]"))b.classList.toggle("active",b===button);
 if(state)lists()});

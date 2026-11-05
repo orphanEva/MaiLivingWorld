@@ -26,6 +26,7 @@ TABLES = (
     "tool_observations", "tool_calls", "tool_tasks", "tool_research",
     "companion_control", "companion_readings", "companion_units", "companion_plans", "companion_audit",
     "bond_profiles", "bond_moments", "bond_audit",
+    "continuity_control", "continuity_inputs", "continuity_threads", "continuity_audit",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",
