@@ -13,6 +13,7 @@ from .growth_model import _safe_text
 from .growth_store import source_fingerprint
 from .mcp_runtime import day_start
 from .mind import PRIVATE
+from .memory_archive import tier
 from .owner import extract_sender, normalize_qq
 from .unified_expression import parse_expression
 from .unified_memory import _source_id, _terms
@@ -82,7 +83,7 @@ class AdviceRuntime:
         result = parse_expression(response, sources, audience_scope="private:"+owner, speaker_id=owner, is_owner=True)
         return bool(result and len(result["memories"]) == len(sources))
 
-    async def tool(self, action="list", topic="", advice="", source_ids=None, kwargs=None):
+    async def tool(self, action="list", topic="", advice="", source_ids=None, kwargs=None, *, offset=0):
         context = self.trusted(kwargs or {})
         if not context:
             return {"success": False, "code": "owner_private_required"}
@@ -102,13 +103,24 @@ class AdviceRuntime:
                     break
             return {"success": True, "data": rows, "instructions": "这些是当前允许表达的原始讨论依据，"
                     "可选1到4个id用于prepare，不代表任何建议已经证实有效；不要编造缺失来源。"}
-        if action == "list":
+        if action in {"list", "search"}:
+            try:
+                # Search/forget remains available even after automatic archiving
+                # is disabled; the owner never loses control of old records.
+                rows = self.store.search(self.owner(), topic if action == "search" else "", limit=21, offset=offset)
+            except (ValueError, TypeError):
+                return {"success": False, "code": "invalid_archive_query"}
             items = []
-            for row in self.store.items(self.owner()):
+            for row in rows[:20]:
                 allowed = row["status"] != "forgotten" and self._allowed(self._resolve(row), context)
                 items.append({"id": row["id"], "revision": row["revision"], "status": row["status"],
-                    "topic": row["topic"] if allowed else "已遗忘或来源受限的建议", "outcome": row["outcome"] if allowed else "unknown"})
-            return {"success": True, "data": items, "instructions": "效果仅是主人本人自述，不是客观验证；未反馈不等于有效。"
+                    "memory_tier": tier(row), "topic": row["topic"] if allowed else "已遗忘或来源受限的建议", "outcome": row["outcome"] if allowed else "unknown",
+                    "advice": row["advice"] if allowed and action == "search" else "",
+                    "feedback": row["feedback"] if allowed and action == "search" else ""})
+            return {"success": True, "data": items, "next_offset": offset+20 if len(rows) > 20 else None,
+                    "storage": self.store.archive_status(self.owner()),
+                    "instructions": "效果仅是主人本人自述，不是客观验证；未反馈不等于有效。"
+                    "search用topic检索历史，offset分页；归档只减少默认想起，不是遗忘或新的证据。"
                     "主人完整私聊 /建议 尝试过|没尝试|有用|没用|停止|忘记 <id> <revision>。停止不再参与建议，忘记清除正文。"}
         if action != "prepare":
             return {"success": False, "code": "invalid_advice_action"}
@@ -119,7 +131,8 @@ class AdviceRuntime:
             sources = self.bot._resolve_roots(source_ids)
             if len(sources) != len(source_ids) or not self._allowed(list(sources.values()), context):
                 return {"success": False, "code": "advice_source_not_expressible"}
-            row = self.store.prepare(self.owner(), context["sid"], context["mid"], topic, advice, [_ref(sources[i]) for i in source_ids])
+            row = self.store.prepare(self.owner(), context["sid"], context["mid"], topic, advice, [_ref(sources[i]) for i in source_ids],
+                                     archive_enabled=getattr(self.bot.config.advice, "archive_enabled", False))
             return {"success": True, "data": {"id": row["id"], "revision": row["revision"], "status": row["status"]},
                     "delivery_text": row["delivery_text"], "instructions": "这是供主人选择的建议，不是已经验证的事实或已经执行的行动。"
                     "如决定建议，delivery_text原样独立整条发送才登记送达；不要声称主人会尝试或有效。草稿十分钟过期。"}
@@ -133,7 +146,7 @@ class AdviceRuntime:
         receipt = await verify_owner_delivery(self.bot, kwargs)
         if not receipt or not self.enabled() or signature != self.signature():
             return False
-        rows = [row for row in self.store.items(self.owner()) if row["status"] == "draft" and row.get("delivery_text") == receipt["text"] and row.get("sid") == receipt["sid"]]
+        rows = [row for row in self.store.drafts(self.owner()) if row.get("delivery_text") == receipt["text"] and row.get("sid") == receipt["sid"]]
         if len(rows) != 1:
             return False
         row = rows[0]
@@ -151,7 +164,8 @@ class AdviceRuntime:
                 return self.store.command(message, self.owner()), False
             if not self.bot.config.advice.auto_feedback or not isinstance(body, str) or PRIVATE.search(body):
                 return False, False
-            target = target_for(body, [row for row in self.store.items(self.owner()) if self._resolve(row)])
+            target = target_for(body, [row for row in self.store.feedback_items(self.owner(), body,
+                archive_enabled=getattr(self.bot.config.advice, "archive_enabled", False)) if self._resolve(row)])
             if target is None:
                 return False, False
             return False, bool(self.store.enqueue(message, self.owner(), target["id"], target["revision"]))
@@ -202,7 +216,7 @@ class AdviceRuntime:
         labels = {"tried": "本人报告尝试过，尚未确认效果", "not_tried": "本人报告尚未尝试", "helpful": "本人报告尝试后有帮助", "unhelpful": "本人报告尝试后没有帮助"}
         records = []
         terms = _terms(query)
-        for row in self.store.items(self.owner()):
+        for row in self.store.recall(self.owner(), query, archive_enabled=getattr(self.bot.config.advice, "archive_enabled", False)):
             sources = self._resolve(row)
             if row["status"] != "active" or row["outcome"] not in labels or not sources:
                 continue

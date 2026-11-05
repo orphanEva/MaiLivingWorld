@@ -546,6 +546,135 @@ def assert_repair_restore(case, store, expected):
     case.assertEqual(store.items(owner), items)
 
 
+def seed_v25_state(growth, advice, repair):
+    """Use real public store writes to create mixed feelings and archive turnover."""
+    from MaiLivingWorld.growth_model import empty_growth
+    owner, sid = "12345678", "owner-backup-stream"
+    source = {"id": "brain:event:emotion-backup", "source": "brain_event", "kind": "event",
+        "origin_key": "emotion-backup-original", "scope": "private:"+owner, "subject_id": owner,
+        "text": "这本小说的雪原结局描写细腻，但仍留下许多悬念。", "timestamp": 100,
+        "sensitivity": "personal", "evidence_status": "recorded_event"}
+    proposal = empty_growth(emotional_episodes=True)
+    proposal["emotions"] = [{"topic": "雪原结局", "feeling": feeling, "appraisal": appraisal,
+        "intensity": .4, "evidence_ids": [source["id"]],
+        "quotes": [{"source_id": source["id"], "quote": source["text"]}]}
+        for feeling, appraisal in (("appreciative", "欣赏这本小说结局的细腻描写"),
+                                  ("disappointed", "对这本小说结局仍留下悬念有些失望"))]
+    job_id = growth.enqueue([source], mode="active", now=100)
+    job = growth.claim(now=100)
+    if not job or job["id"] != job_id:
+        raise AssertionError("expected an actual emotion growth claim")
+    completed = growth.complete(job_id, job["token"], proposal, [source], expected_revision=0,
+                                emotional_episodes=True, now=101)
+    if not completed["changed"] or len(growth.state(now=102)["emotions"]) != 2:
+        raise AssertionError("expected two bounded reactions to the same source")
+    result = {"emotion_source": source, "emotion_state": growth.state(now=102), "emotion_job": job_id}
+    refs = [{"id": "brain:fact:archive-backup", "digest": "a"*64,
+             "scope": "private:"+owner, "sensitivity": "personal"}]
+    rows = {"advice": [], "repair": []}
+    receipts, messages, sent_sources = [], [], []
+
+    def create(index):
+        # Distinct days exercise persisted budgets without bypassing the limit.
+        now, topic = index*86400+100, "ArchiveSeed"+str(index).zfill(3)
+        row = advice.prepare(owner, sid, "archive-advice-"+str(index), topic,
+                             topic+"先整理材料，再试一小步。", refs, archive_enabled=True, now=now)
+        if not advice.record_delivery(owner, row["id"], row["revision"], sid, row["delivery_text"],
+                                      "archive-advice-sent-"+str(index), now=now+1):
+            raise AssertionError("expected actual delivered advice before archival")
+        rows["advice"].append(advice.get(owner, row["id"]))
+        old = "你周五有"+topic
+        body = old+"，记得准备材料。"
+        receipt = {"owner": owner, "sid": sid, "mid": "archive-sent-"+str(index), "text": body,
+            "receipt_id": hashlib.sha256(("archive-receipt-"+str(index)).encode()).hexdigest(),
+            "text_digest": hashlib.sha256(body.encode()).hexdigest()}
+        if not repair.record_delivery(owner, receipt, now=now):
+            raise AssertionError("expected actual sent receipt before archival")
+        sent = repair.recent(owner, now=now+1)[0]
+        correction = "你刚才说“"+old+"”，其实我的"+topic+"在周六。"
+        message = dict(attention_message(), message_id="archive-input-"+str(index), processed_plain_text=correction)
+        repair.enqueue(message, owner, sent["id"], sent["digest"], now=now+2)
+        claim = repair.claim(owner, day_start=index*86400, interval_seconds=0, daily_limit=4, now=now+3)
+        if not claim or not repair.finish(owner, claim, {"old_quote": old, "correction_quote": correction},
+                                          archive_enabled=True, now=now+4):
+            raise AssertionError("expected actual accepted repair before archival")
+        item = next(row for row in repair.search(owner, query=topic) if row["status"] == "active")
+        rows["repair"].append(item)
+        receipts.append(receipt)
+        messages.append(message)
+        sent_sources.append(sent)
+
+    for index in range(65):
+        create(index)
+    for name, store, command_name in (("advice", advice, "建议"), ("repair", repair, "修复")):
+        status = store.archive_status(owner)
+        if (status["active"], status["archived"], status["tombstones"]) != (64, 1, 0):
+            raise AssertionError("expected real capacity-triggered archival")
+        old = rows[name][1]
+        command = dict(attention_message(), message_id="archive-forget-"+name,
+            processed_plain_text=f'/{command_name} 忘记 {old["id"]} {old["revision"]}')
+        if not store.command(command, owner, now=65*86400+90):
+            raise AssertionError("expected actual forgotten tombstone")
+    create(65)  # A forgotten marker must not consume the newly available slot.
+    result.update({"items": rows, "receipts": receipts, "messages": messages, "sent_sources": sent_sources})
+    result["tables"] = {}
+    for name, store in (("growth", growth), ("advice", advice), ("repair", repair)):
+        for table in backup.LEDGERS[name+".sqlite3"]:
+            order = "slot" if table == "growth_state" else "revision" if table == "growth_history" else (
+                "source_id" if table == "growth_consumed" else "owner_id" if table.endswith("_control") else "id")
+            result["tables"][table] = (order, [dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order)])
+    return result
+
+
+def assert_v25_restore(case, growth, advice, repair, expected):
+    from MaiLivingWorld.growth_store import source_fingerprint
+    from MaiLivingWorld.unified_memory import derived_memories
+    owner = "12345678"
+    for name, store in (("growth", growth), ("advice", advice), ("repair", repair)):
+        for table in backup.LEDGERS[name+".sqlite3"]:
+            order, rows = expected["tables"][table]
+            case.assertEqual([dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order)], rows)
+    case.assertEqual(growth.state(now=102), expected["emotion_state"])
+    emotions = growth.state(now=101+86400)["emotions"]
+    case.assertEqual({row["feeling"] for row in emotions}, {"appreciative", "disappointed"})
+    case.assertTrue(all(row["intensity"] == .2 for row in emotions))
+    case.assertEqual(growth.state(now=101+7*86400)["emotions"], [])
+    source = expected["emotion_source"]
+    visible = derived_memories(growth.state(now=102), {source["id"]: source},
+                                fingerprint=source_fingerprint, query="雪原结局")
+    case.assertEqual(len([row for row in visible if row["kind"] == "emotion"]), 2)
+    case.assertTrue(all(row["scope"] == "private:"+owner and row["sensitivity"] == "personal" for row in visible))
+    for resolved in ({}, {source["id"]: {**source, "text": "原始来源已经更改"}}):
+        case.assertEqual(derived_memories(growth.state(now=102), resolved,
+                                          fingerprint=source_fingerprint, query="雪原结局"), [])
+    case.assertEqual(growth.enqueue([source], mode="active", now=200), expected["emotion_job"])
+    case.assertIsNone(growth.claim(now=200))
+    for name, store in (("advice", advice), ("repair", repair)):
+        status = store.archive_status(owner)
+        case.assertEqual((status["total"], status["active"], status["archived"], status["tombstones"]), (66, 64, 1, 1))
+        first, forgotten, newest = expected["items"][name][0], expected["items"][name][1], expected["items"][name][-1]
+        restored_first = store.get(owner, first["id"])
+        case.assertEqual(restored_first["memory_tier"], "archive")
+        case.assertEqual(restored_first["revision"], first["revision"])
+        case.assertEqual(restored_first["status"], first["status"])
+        case.assertIn(first["id"], {row["id"] for row in store.search(owner, query="ArchiveSeed000")})
+        case.assertIn(first["id"], {row["id"] for row in store.recall(owner, "ArchiveSeed000", archive_enabled=True)})
+        case.assertNotIn(first["id"], {row["id"] for row in store.recall(owner, "ArchiveSeed000", archive_enabled=False)})
+        case.assertEqual(store.get(owner, forgotten["id"])["status"], "forgotten")
+        case.assertEqual(store.get(owner, newest["id"])["status"], "active")
+        pages = [store.search(owner, limit=20, offset=offset) for offset in range(0, 80, 20)]
+        ids = [row["id"] for page in pages for row in page]
+        case.assertEqual((len(ids), len(set(ids))), (66, 66))
+        serialized = json.dumps([dict(row) for row in store.con.execute("SELECT * FROM "+name+"_items")], ensure_ascii=False)
+        case.assertNotIn("ArchiveSeed001", serialized)
+    case.assertFalse(repair.record_delivery(owner, expected["receipts"][1], now=66*86400))
+    sent = expected["sent_sources"][1]
+    case.assertIsNone(repair.enqueue(expected["messages"][1], owner, sent["id"], sent["digest"], now=66*86400+1))
+    old_advice = expected["items"]["advice"][1]
+    case.assertFalse(advice.record_delivery(owner, old_advice["id"], 1, "owner-backup-stream", old_advice["delivery_text"],
+                                           "archive-advice-sent-1", now=66*86400))
+
+
 class SQLiteBackupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -608,9 +737,11 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.24")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.25")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
+        self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
+        self.assertIsNot(backup.V25_LEDGERS, backup.V24_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -631,7 +762,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1005,6 +1136,33 @@ class SQLiteBackupTests(unittest.TestCase):
         self.check_same_schema_archive("v0.23")
         self.assertFalse((self.target/"repair.sqlite3").exists())
 
+    def test_v24_archive_restores_without_new_database_requirements(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.24")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.24", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
+    def test_emotional_episodes_and_real_memory_archival_survive_restore(self):
+        from MaiLivingWorld.growth_store import GrowthStore
+        from MaiLivingWorld.advice_store import AdviceStore
+        from MaiLivingWorld.repair_store import RepairStore
+        classes = (("growth", GrowthStore), ("advice", AdviceStore), ("repair", RepairStore))
+        stores = [cls(self.source/(name+".sqlite3")) for name, cls in classes]
+        try:
+            expected = seed_v25_state(*stores)
+        finally:
+            for store in stores:
+                store.close()
+        self.archive_now()
+        self.restore_now()
+        stores = [cls(self.target/(name+".sqlite3")) for name, cls in classes]
+        try:
+            assert_v25_restore(self, *stores, expected)
+        finally:
+            for store in stores:
+                store.close()
+
     def test_v22_real_attention_payload_restores_without_invented_workload(self):
         from MaiLivingWorld.attention_store import AttentionStore
         owner = "12345678"
@@ -1062,7 +1220,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.24")
+        self.assertEqual(current["catalog"], "v0.25")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1513,6 +1671,24 @@ class MySQLBackupTests(unittest.TestCase):
     def test_v23_mysql_archive_requires_matching_old_schema(self):
         self.check_same_schema_archive("v0.23")
 
+    def test_v24_mysql_catalog_restores_to_same_current_schema(self):
+        rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
+        current = Path(self.temp.name)/"v25-complete.zip"
+        backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
+        renamed = Path(self.temp.name)/"v24.zip"
+        with zipfile.ZipFile(current) as source, zipfile.ZipFile(renamed, "w") as destination:
+            for info in source.infolist():
+                data = source.read(info)
+                if info.filename == "manifest.json":
+                    manifest = json.loads(data)
+                    manifest["catalog"] = "v0.24"
+                    data = json.dumps(manifest).encode()
+                destination.writestr(info, data)
+        target = FakeMySQL({table: [] for table in backup.TABLES})
+        restored = backup.restore_mysql(renamed, self.config, apply=True, writers_stopped=True,
+                                         confirm=backup.CONFIRM, connect=lambda _: target)
+        self.assertEqual(restored["tables"], 82)
+
     def check_same_schema_archive(self, catalog):
         rows = {table: [] for tables in backup.CATALOGS[catalog].values() for table in tables}
         rows.update(copy.deepcopy(self.data))
@@ -1545,6 +1721,56 @@ class MySQLBackupTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1" and os.getenv("MLW_BACKUP_MYSQL_DATABASE", "").startswith("mlw_backup_test"),
                      "Only with an explicitly configured empty dedicated MySQL CI database")
 class BackupMySQLLiveTests(unittest.TestCase):
+    def test_real_v25_emotions_and_archives_restore_without_reviving_forgotten_memory(self):
+        import pymysql
+        from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
+        from MaiLivingWorld.growth_store import GrowthStore
+        from MaiLivingWorld.advice_store import AdviceStore
+        from MaiLivingWorld.repair_store import RepairStore
+        env = dict(os.environ, MLW_MYSQL_DATABASE=os.environ["MLW_BACKUP_MYSQL_DATABASE"], MLW_MYSQL_PREFIX="v25_backup_")
+        config = backup.mysql_config(env)
+        settings = {key: value for key, value in config.items() if key != "prefix"}
+        settings["table_prefix"] = config["prefix"]
+        connection = pymysql.connect(**{key: value for key, value in config.items() if key != "prefix"}, autocommit=True)
+        created = False
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW TABLES")
+                self.assertEqual(cursor.fetchall(), (), "backup CI database must be empty before this test")
+            with tempfile.TemporaryDirectory() as temp:
+                directory, archive = Path(temp), Path(temp)/"v25-mysql.zip"
+                created = True
+                ensure_schema(settings, directory)
+                classes = (("growth", GrowthStore), ("advice", AdviceStore), ("repair", RepairStore))
+                def open_stores():
+                    return [cls(directory/(name+".sqlite3"), mysql_settings=settings) for name, cls in classes]
+                stores = open_stores()
+                try:
+                    expected = seed_v25_state(*stores)
+                finally:
+                    for store in stores:
+                        store.close()
+                self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.25")
+                with connection.cursor() as cursor:
+                    for table in reversed(backup.TABLES):
+                        cursor.execute("DROP TABLE `v25_backup_"+table+"`")
+                ensure_schema(settings, directory)
+                restored = backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+                self.assertEqual(restored["tables"], 82)
+                stores = open_stores()
+                try:
+                    assert_v25_restore(self, *stores, expected)
+                finally:
+                    for store in stores:
+                        store.close()
+        finally:
+            if created:
+                with connection.cursor() as cursor:
+                    for table in reversed(backup.TABLES):
+                        cursor.execute("DROP TABLE IF EXISTS `v25_backup_"+table+"`")
+            connection.close()
+
     def test_real_82_table_archive_empty_restore_and_counter_high_water(self):
         import pymysql
         from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema

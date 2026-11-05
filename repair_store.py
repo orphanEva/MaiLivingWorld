@@ -15,6 +15,7 @@ import uuid
 
 from .continuity_store import ContinuityStore, _int, _json, _now, _owner, _text
 from .mysql_compat import MySQLCompatConnection
+from . import memory_archive
 from .owner import extract_sender
 from .sql_logging import connect_sqlite
 
@@ -278,7 +279,18 @@ class RepairStore:
         return self._decode(rows[0]) if rows else None
 
     def items(self, owner):
-        return [self._decode(r) for r in self._read("SELECT * FROM repair_items WHERE owner_id=? ORDER BY updated DESC,id", (_owner(owner),))]
+        return self.search(owner, limit=64)
+
+    def search(self, owner, query="", *, limit=20, offset=0):
+        return [self._decode(r) for r in memory_archive.select(self._read, "repair_items", owner,
+            query=query, limit=limit, offset=offset)]
+
+    def recall(self, owner, query="", *, archive_enabled=False, limit=64):
+        return [self._decode(r) for r in memory_archive.select(self._read, "repair_items", owner,
+            query=query, limit=limit, recall=True, archived=archive_enabled)]
+
+    def archive_status(self, owner):
+        return memory_archive.counts(self._read, "repair_items", owner)
 
     def _save(self, row, now, *, new=False):
         core = {"id", "owner_id", "status", "revision", "created", "updated"}
@@ -291,7 +303,7 @@ class RepairStore:
                 (row["status"], row["revision"], payload, now, row["owner_id"], row["id"]))
         self.con.execute("UPDATE repair_control SET revision=revision+1,updated=? WHERE owner_id=?", (now, row["owner_id"]))
 
-    def finish(self, owner, claim, result=None, *, retry=False, now=None):
+    def finish(self, owner, claim, result=None, *, retry=False, archive_enabled=False, now=None):
         owner, now = _owner(owner), _now(now)
         if type(retry) is not bool:
             raise ValueError("invalid_retry")
@@ -317,9 +329,13 @@ class RepairStore:
                 ident = "repair:item:"+digest([owner, source["id"], old_quote])
                 previous = self.con.execute("SELECT * FROM repair_items WHERE owner_id=? AND id=?", (owner, ident)).fetchone()
                 previous = self._decode(previous)
-                count = self.con.execute("SELECT COUNT(*) AS n FROM repair_items WHERE owner_id=?", (owner,)).fetchone()["n"]
-                if (previous is None and count >= MAX_ITEMS):
-                    raise ValueError("repair_capacity")
+                if previous is None:
+                    try:
+                        memory_archive.make_room(self.con, "repair_items", owner, enabled=archive_enabled, now=now)
+                    except ValueError as exc:
+                        if str(exc) == "memory_capacity":
+                            raise ValueError("repair_capacity") from exc
+                        raise
                 if previous is None or previous["status"] == "active" and previous.get("input_id") != row["id"]:
                     item = {"id": ident, "owner_id": owner, "status": "active", "revision": previous["revision"]+1 if previous else 1,
                         "old_quote": old_quote, "correction_quote": correction, "delivery_id": source["id"],
@@ -327,6 +343,8 @@ class RepairStore:
                         "input_id": row["id"], "input_digest": row["body_digest"], "input_at": row["created"],
                         "input_sid": row["sid"], "input_mid": row["mid"],
                         "evidence_status": "owner_reported", "created": previous["created"] if previous else now, "updated": now}
+                    if previous and previous.get("memory_tier") == "archive":
+                        item.update(memory_tier="archive", archived_at=previous["archived_at"])
                     self._save(item, now, new=previous is None)
                     changed = True
             pending = bool(current and retry and current[0]["attempts"] < 3 and result is None)

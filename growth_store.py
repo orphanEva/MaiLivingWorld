@@ -20,6 +20,7 @@ from typing import Any
 from .mysql_compat import MySQLCompatConnection
 from .sql_logging import connect_sqlite
 from .belief_revision import FIELDS as BELIEF_REVIEW_FIELDS, assess as assess_belief
+from .emotion_episodes import active_items as active_emotions, apply_candidates as apply_emotions, receipt_keys as emotion_receipts
 
 TRAITS = ("curiosity", "sociability", "patience", "caution")
 COLLECTIONS = ("interests", "beliefs", "knowledge", "questions")
@@ -113,12 +114,15 @@ def _view(row: dict, now: float) -> dict:
     payload = json.loads(row["payload"])
     return {**{key: copy.deepcopy(payload[key]) for key in (*COLLECTIONS, "traits")},
             "mood": _decayed(payload, now), "revision": int(row["revision"]),
-            "updated": float(row["updated"])}
+            "updated": float(row["updated"]),
+            **({"emotions": active_emotions(payload, now)} if "emotions" in payload else {})}
 
 
 def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
-                    records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False):
-    if not isinstance(proposal, dict) or set(proposal) - {*COLLECTIONS, "traits", "mood"}:
+                    records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False,
+                    emotional_episodes=False):
+    fields = {*COLLECTIONS, "traits", "mood"} | ({"emotions"} if emotional_episodes else set())
+    if not isinstance(proposal, dict) or set(proposal) - fields:
         raise ValueError("invalid_proposal")
     for category in (*COLLECTIONS, "traits"):
         values = proposal.get(category, [])
@@ -129,6 +133,8 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
         raise ValueError("invalid_mood")
     after = copy.deepcopy(before)
     stats = {key: 0 for key in (*COLLECTIONS, "traits", "mood")}
+    if emotional_episodes:
+        stats["emotions"] = 0
     used, scalar_sources = set(), set()
     day = int(now // 86400)
     if day > after["_trait_day"]:
@@ -288,6 +294,14 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             used.update(ref["id"] for ref in refs)
             scalar_sources.update(ref["id"] for ref in fresh)
             stats["mood"] = 1
+    if emotional_episodes:
+        episodes, count, emotion_used, receipts = apply_emotions(before, proposal.get("emotions", []),
+            allowed, records, consumed, now)
+        if count:
+            after["emotions"] = episodes
+            stats["emotions"] = count
+            used.update(emotion_used)
+            scalar_sources.update(receipts)
     return after, stats, used, scalar_sources
 
 
@@ -449,10 +463,13 @@ class GrowthStore:
                      "rolled_back": bool(row["rolled_back"]), **json.loads(row["payload"])} for row in rows]
 
     def complete(self, job_id: str, token: str, proposal: dict, records: list[dict],
-                 now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False) -> dict:
+                 now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False,
+                 emotional_episodes: bool = False) -> dict:
         timestamp = _now(now)
         if type(review_beliefs) is not bool:
             raise ValueError("invalid_belief_review_mode")
+        if type(emotional_episodes) is not bool:
+            raise ValueError("invalid_emotional_episodes_mode")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("invalid_revision")
         refs, lookup = _records(records)
@@ -470,11 +487,15 @@ class GrowthStore:
             if expected_revision is not None and old["revision"] != expected_revision:
                 raise ValueError("revision_conflict")
             before = json.loads(old["payload"])
+            receipt_ids = set(allowed)
+            if emotional_episodes:
+                for sid in allowed:
+                    receipt_ids.update(emotion_receipts(lookup[sid]))
             consumed = {row[0] for row in self.con.execute(
-                "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in allowed) + ")",
-                tuple(allowed)).fetchall()}
+                "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in receipt_ids) + ")",
+                tuple(sorted(receipt_ids))).fetchall()}
             after, stats, used, scalar_sources = _apply_proposal(before, proposal, allowed, lookup, consumed, timestamp,
-                                                               review_beliefs=review_beliefs)
+                review_beliefs=review_beliefs, emotional_episodes=emotional_episodes)
             changed = any(stats.values()) and job["mode"] == "active"
             revision = int(old["revision"])
             if changed:
@@ -530,7 +551,7 @@ class GrowthStore:
     def retire(self, key: str, expected_revision: int, now: float | None = None) -> dict:
         """Explicit administrator retirement of one stale inference, never a model tool."""
         timestamp = _now(now)
-        if not isinstance(key, str) or not re.fullmatch(r"[ibkq]:[0-9a-f]{24}", key):
+        if not isinstance(key, str) or not re.fullmatch(r"[ibkqe]:[0-9a-f]{24}", key):
             raise ValueError("invalid_key")
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("invalid_revision")
@@ -543,8 +564,8 @@ class GrowthStore:
             before = json.loads(current["payload"])
             after = copy.deepcopy(before)
             removed = None
-            for category in COLLECTIONS:
-                item = next((item for item in after[category] if item["key"] == key), None)
+            for category in (*COLLECTIONS, "emotions"):
+                item = next((item for item in after.get(category, []) if item["key"] == key), None)
                 if item is not None:
                     removed = item
                     after[category].remove(item)

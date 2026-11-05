@@ -14,6 +14,7 @@ from typing import Any
 
 from .sql_logging import SQLMySQLCursor
 from .mysql_compat import MySQLCompatConnection
+from .emotion_episodes import expression_detail as emotion_detail
 
 MAX_RESULTS = 50
 MAX_SCAN = 1000
@@ -21,7 +22,7 @@ MAX_QUERY_CHARS = 1200
 MAX_QUERY_TERMS = 24
 MAX_TEXT_CHARS = 600
 MAX_RESOLVE_IDS = 128
-MAX_GROWTH_ITEMS = 128
+MAX_GROWTH_ITEMS = 144
 MAX_GROWTH_SOURCES = 24
 _DAY = 86400
 _STOP_TERMS = {"这个", "那个", "什么", "怎么", "一下", "一个", "我们", "你们", "他们", "可以", "请问"}
@@ -364,7 +365,8 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
     categories = (("interests", "interest", "自我兴趣", "i"),
                   ("beliefs", "belief", "主观看法", "b"),
                   ("knowledge", "knowledge", "待验证知识", "k"),
-                  ("questions", "question", "待解问题", "q"))
+                  ("questions", "question", "待解问题", "q"),
+                  ("emotions", "emotion", "事件感受", "e"))
     terms = _terms(query)
     ranked: dict[str, dict[str, Any]] = {}
     duplicates: set[str] = set()
@@ -391,7 +393,10 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
                 continue
             if kind == "interest" and item.get("status") not in (None, "active"):
                 continue
-            strength = item.get("weight" if kind == "interest" else "confidence")
+            reaction = emotion_detail(item) if kind == "emotion" else None
+            if kind == "emotion" and reaction is None:
+                continue
+            strength = reaction[1] if reaction else item.get("weight" if kind == "interest" else "confidence")
             if (isinstance(strength, bool) or not isinstance(strength, (int, float))
                     or not math.isfinite(strength)
                     or not (-1 if kind == "interest" else 0) <= strength <= 1):
@@ -413,6 +418,8 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
             content = label+"："+_text(topic, 180)
             if kind == "interest":
                 content += f"（偏好强度 {strength:+.2f}，负值表示不喜欢）"
+            elif kind == "emotion":
+                content += "；"+reaction[0]
             if text:
                 content += "；"+_text(text)
             if kind == "belief":
@@ -444,11 +451,17 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
                     continue
             elif kind == "knowledge" and strength < .5:
                 content += "；现有依据较弱，不能据此作确定回答"
+            elif kind == "emotion":
+                content += "；这是针对已记录经历或材料的暂时反应，可同时有不同感受，不是外部事实证明；只在当前相关时自然体现"
+                if len(content) > MAX_TEXT_CHARS:
+                    continue
             if _CONFIDENTIAL.search(content):
                 sensitivity = "confidential"
             stamp = max((_stamp(source.get("timestamp")) for source in sources), default=0.0)
             searchable = unicodedata.normalize("NFKC", topic+" "+content).casefold()
             relevance = sum(token in searchable for token in terms) / len(terms) if terms else 0.0
+            if kind == "emotion" and terms and not relevance:
+                continue
             ranked[identity] = {
                 "id": identity, "source": "growth", "kind": kind,
                 "scope": scope, "subject_id": subject, "text": content[:MAX_TEXT_CHARS],

@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.24.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.25.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -35,7 +35,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 30)
-        self.assertEqual(total_fields, 193)
+        self.assertEqual(total_fields, 197)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -103,6 +103,19 @@ class ConfigSectionTests(unittest.TestCase):
                 self.assertEqual({key: field["default"] for key, field in fields.items()}, defaults)
                 self.assertTrue(all(field["description"] for field in fields.values()))
 
+    def test_reply_emotions_and_archive_features_require_separate_opt_in(self):
+        config = plugin.Config.model_validate({name: {"enabled": True} for name in ("attention", "growth", "advice", "repair")})
+        schema = plugin.Config.model_json_schema()
+        for section, key in (("attention", "reply_coordination"), ("growth", "emotional_episodes"),
+                             ("advice", "archive_enabled"), ("repair", "archive_enabled")):
+            with self.subTest(section=section, key=key):
+                self.assertFalse(getattr(getattr(config, section), key))
+                ref = schema["properties"][section]["$ref"].rsplit("/", 1)[1]
+                field = schema["$defs"][ref]["properties"][key]
+                self.assertEqual(field["type"], "boolean")
+                self.assertFalse(field["default"])
+                self.assertTrue(field["description"])
+
     def test_project_and_shared_reading_defaults_and_bounds_are_explicit(self):
         schema = plugin.Config.model_json_schema()
         expected = {
@@ -123,7 +136,8 @@ class ConfigSectionTests(unittest.TestCase):
 
 
     def test_repair_defaults_and_bounds_are_explicit(self):
-        defaults = {"enabled": False, "auto_review": True, "interval_seconds": 300, "max_daily_batches": 4}
+        defaults = {"enabled": False, "auto_review": True, "interval_seconds": 300, "max_daily_batches": 4,
+                    "archive_enabled": False}
         self.assertEqual(plugin.Config().repair.model_dump(), defaults)
         schema = plugin.Config.model_json_schema()
         ref = schema["properties"]["repair"]["$ref"].rsplit("/", 1)[1]
@@ -137,7 +151,8 @@ class ConfigSectionTests(unittest.TestCase):
     def test_advice_and_reference_defaults_and_bounds_are_explicit(self):
         schema = plugin.Config.model_json_schema()
         expected = {
-            "advice": {"enabled": False, "auto_feedback": True, "interval_seconds": 600, "max_daily_batches": 4},
+            "advice": {"enabled": False, "auto_feedback": True, "interval_seconds": 600, "max_daily_batches": 4,
+                       "archive_enabled": False},
             "reference": {"enabled": False, "ttl_hours": 24},
         }
         for name, defaults in expected.items():

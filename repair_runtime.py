@@ -8,6 +8,7 @@ import time
 
 from .delivery import verify_owner_delivery
 from .mcp_runtime import day_start
+from .memory_archive import tier
 from .owner import extract_sender, normalize_qq
 from .repair_model import safe_text, should_repair, target_for, understand_repair
 from .repair_store import RepairStore, digest, parse_command
@@ -147,7 +148,8 @@ class RepairRuntime:
                 result = await understand_repair(claim["text"], claim["delivery"], generate=b.ctx.llm.generate,
                     reserve=reserve, valid=valid, task_name=b.config.brain.model_task, timeout=b.config.unified_mind.model_timeout_seconds)
                 if result and valid():
-                    changed = self.store.finish(owner, claim, result)
+                    changed = self.store.finish(owner, claim, result,
+                        archive_enabled=getattr(self.bot.config.repair, "archive_enabled", False))
                     self.last_status = "repaired" if changed else "stale"
                 else:
                     self.store.finish(owner, claim, retry=exhausted)
@@ -178,7 +180,8 @@ class RepairRuntime:
             return ""
         context, text = current
         terms = set(_terms(text))-_GENERIC
-        active = [item for item in self.store.items(self.owner()) if item["status"] == "active"
+        active = [item for item in self.store.recall(self.owner(), text,
+                  archive_enabled=getattr(self.bot.config.repair, "archive_enabled", False)) if item["status"] == "active"
                   and safe_text(item.get("old_quote"), 240) and safe_text(item.get("correction_quote"), 240)]
         target = target_for(text, self.store.recent(self.owner()))
         if target and not any(item["delivery_id"] == target["id"] and
@@ -213,20 +216,29 @@ class RepairRuntime:
                 "UNTRUSTED_OWN_REPLY_REPAIRS\n"+json.dumps(rows, ensure_ascii=False))
         return ""
 
-    async def tool(self, action="list", kwargs=None):
+    async def tool(self, action="list", kwargs=None, *, query="", offset=0):
         if not self.trusted(kwargs or {}):
             return {"success": False, "code": "owner_private_required"}
         if action == "status":
             state = self.store.state(self.owner())
+            storage = self.store.archive_status(self.owner())
             return {"success": True, "data": {"last_status": self.last_status, "revision": state["revision"],
-                    "recent_deliveries": len(self.store.recent(self.owner())), "repairs": len(self.store.items(self.owner()))}}
-        if action != "list":
+                    "recent_deliveries": len(self.store.recent(self.owner())), "repairs": storage["total"], **storage}}
+        if action not in {"list", "search"}:
             return {"success": False, "code": "invalid_repair_action"}
+        try:
+            rows = self.store.search(self.owner(), query if action == "search" else "", limit=21, offset=offset)
+        except (ValueError, TypeError):
+            return {"success": False, "code": "invalid_archive_query"}
         items = []
-        for row in self.store.items(self.owner()):
+        for row in rows[:20]:
             items.append({"id": row["id"], "revision": row["revision"], "status": row["status"],
+                "memory_tier": tier(row),
                 "old_quote": row["old_quote"] if row["status"] != "forgotten" else "",
                 "correction_quote": row["correction_quote"] if row["status"] != "forgotten" else "",
                 "evidence_status": "owner_reported"})
-        return {"success": True, "data": items, "instructions": "只读实际表达的修复记录，主人纠正是本人自述而非外部真相证明。"
+        return {"success": True, "data": items, "next_offset": offset+20 if len(rows) > 20 else None,
+            "storage": self.store.archive_status(self.owner()),
+            "instructions": "只读实际表达的修复记录，主人纠正是本人自述而非外部真相证明。"
+            "search用query检索历史，offset分页；归档不改修复内容、版本或来源，不等于忘记。"
             "本人完整私聊 /修复 撤回|忘记 <id> <revision>；撤回停止采用，忘记还清该来源的正文，不改变其他记忆账本。"}

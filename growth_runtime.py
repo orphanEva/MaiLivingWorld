@@ -38,6 +38,7 @@ class GrowthRuntime:
         async with self._lock:
             generation, mode = self._generation, config.mode
             review_beliefs = getattr(config, "review_beliefs", False)
+            emotional_episodes = getattr(config, "emotional_episodes", False)
             owner = self.identity.state()["owner_id"]
             if not owner:
                 self.last_status = "owner_required"
@@ -70,6 +71,7 @@ class GrowthRuntime:
             def current():
                 return (generation == self._generation and config.enabled and config.mode == mode
                         and getattr(config, "review_beliefs", False) == review_beliefs
+                        and getattr(config, "emotional_episodes", False) == emotional_episodes
                         and allowed() and self.identity.state()["owner_id"] == owner)
 
             async def request(prompt, interval):
@@ -108,12 +110,18 @@ class GrowthRuntime:
                 for section in ("interests", "beliefs", "knowledge", "questions"):
                     state[section] = [item for item in state[section] if item["sources"] and all(
                         available.get(ref["id"]) == ref["digest"] for ref in item["sources"])]
-                result = await request(build_growth_prompt(records, state, review_beliefs=review_beliefs), budget.min_interval_seconds)
-                proposal = parse_growth(result, records, review_beliefs=review_beliefs, state=state if review_beliefs else None)
+                if emotional_episodes:
+                    state["emotions"] = [item for item in state.get("emotions", []) if item["sources"] and all(
+                        available.get(ref["id"]) == ref["digest"] for ref in item["sources"])]
+                result = await request(build_growth_prompt(records, state, review_beliefs=review_beliefs,
+                    emotional_episodes=emotional_episodes), budget.min_interval_seconds)
+                proposal = parse_growth(result, records, review_beliefs=review_beliefs, state=state if review_beliefs else None,
+                    emotional_episodes=emotional_episodes)
                 if proposal is None:
                     raise ValueError("invalid_proposal")
-                reviewed = await request(build_growth_review_prompt(proposal, records, review_beliefs=review_beliefs, state=state), 0)
-                proposal = review_growth(reviewed, proposal, review_beliefs=review_beliefs)
+                reviewed = await request(build_growth_review_prompt(proposal, records, review_beliefs=review_beliefs, state=state,
+                    emotional_episodes=emotional_episodes), 0)
+                proposal = review_growth(reviewed, proposal, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes)
                 if proposal is None:
                     raise ValueError("invalid_review")
                 # A rollback, retraction or concurrent writer invalidates the planned update.
@@ -121,7 +129,7 @@ class GrowthRuntime:
                     raise _Changed()
                 records = sources()
                 self.last_counts = self.store.complete(job_id, token, proposal, records,
-                                                       expected_revision=revision, review_beliefs=review_beliefs)
+                    expected_revision=revision, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes)
                 self.last_status = "observed" if mode == "observe" else "learned"
             except _Budget:
                 release("budget_or_cooldown", max(60, budget.min_interval_seconds))

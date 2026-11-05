@@ -11,6 +11,7 @@ import uuid
 from .continuity_store import ContinuityStore, _int, _json, _now, _owner, _text
 from .projects_store import references as _refs
 from .mysql_compat import MySQLCompatConnection
+from . import memory_archive
 from .sql_logging import connect_sqlite
 
 
@@ -102,7 +103,49 @@ class AdviceStore:
         return self._decode(rows[0]) if rows else None
 
     def items(self, owner):
-        return [self._decode(r) for r in self._read("SELECT * FROM advice_items WHERE owner_id=? ORDER BY updated DESC,id", (_owner(owner),))]
+        return self.search(owner, limit=64)
+
+    def search(self, owner, query="", *, limit=20, offset=0):
+        return [self._decode(r) for r in memory_archive.select(self._read, "advice_items", owner,
+            query=query, limit=limit, offset=offset)]
+
+    def recall(self, owner, query="", *, archive_enabled=False, limit=64):
+        return [self._decode(r) for r in memory_archive.select(self._read, "advice_items", owner,
+            query=query, limit=limit, recall=True, archived=archive_enabled)]
+
+    def archive_status(self, owner):
+        return memory_archive.counts(self._read, "advice_items", owner)
+
+    def feedback_items(self, owner, text, *, archive_enabled=False):
+        _text(text, 600)
+        ids = re.findall(r"advice:item:[0-9a-f]{64}", text)
+        quoted = re.findall(r'[“「"]([^”」"\n]{4,240})[”」"]', text)
+        if len(ids)+len(quoted) > 8:
+            return []
+        if ids or quoted:
+            where, args = "owner_id=? AND status='active'", [_owner(owner)]
+            if not archive_enabled:
+                where += " AND INSTR(payload,?)=0"
+                args.append(memory_archive.ARCHIVE_MARKER)
+            clauses = []
+            for ident in ids:
+                clauses.append("id=?")
+                args.append(ident)
+            for quote in quoted:
+                clauses.append("JSON_EXTRACT(payload,'$.advice') LIKE ? ESCAPE '~'")
+                args.append(memory_archive._pattern(quote))
+            rows = self._read("SELECT * FROM advice_items WHERE "+where+" AND ("+" OR ".join(clauses)+") ORDER BY updated DESC,id LIMIT 65", tuple(args))
+            result = [self._decode(r) for r in rows]
+        else:
+            result = self.recall(owner, text, archive_enabled=archive_enabled, limit=65)
+        # Truncation must never make a genuinely ambiguous reference unique.
+        return result if len(result) <= 64 else []
+
+    def drafts(self, owner, *, now=None):
+        rows = self._read("SELECT * FROM advice_items WHERE owner_id=? AND status='draft' AND INSTR(payload,?)=0 ORDER BY updated DESC,id LIMIT 64",
+                          (_owner(owner), memory_archive.ARCHIVE_MARKER))
+        now = _now(now)
+        return [r for raw in rows if (r := self._decode(raw)).get("expires", 0) > now]
 
     def _get(self, owner, ident):
         return self._decode(self.con.execute("SELECT * FROM advice_items WHERE owner_id=? AND id=?", (owner, ident)).fetchone())
@@ -128,7 +171,7 @@ class AdviceStore:
                          (receipt, owner, item, kind, body_digest, now))
         return True
 
-    def prepare(self, owner, sid, mid, topic, advice, source_refs, *, now=None):
+    def prepare(self, owner, sid, mid, topic, advice, source_refs, *, archive_enabled=False, now=None):
         owner, now = _owner(owner), _now(now)
         sid, mid = _text(sid, 200), _text(mid, 200)
         topic, advice, refs = _text(topic, 60), _text(advice, 240), _refs(source_refs)
@@ -143,11 +186,16 @@ class AdviceStore:
                 if existing["status"] != "draft" or existing["expires"] <= now:
                     raise ValueError("advice_already_used")
                 return existing
-            rows = [self._decode(r) for r in self.con.execute("SELECT * FROM advice_items WHERE owner_id=?", (owner,)).fetchall()]
-            if len(rows) >= 64:
-                raise ValueError("advice_capacity")
-            if any(row.get("content_digest") == digest(body) for row in rows):
+            known = self.con.execute("SELECT id FROM advice_items WHERE owner_id=? AND INSTR(payload,?)>0 LIMIT 1",
+                                    (owner, '"content_digest":"'+digest(body)+'"')).fetchone()
+            if known:
                 raise ValueError("advice_already_known")
+            try:
+                memory_archive.make_room(self.con, "advice_items", owner, enabled=archive_enabled, now=now)
+            except ValueError as exc:
+                if str(exc) == "memory_capacity":
+                    raise ValueError("advice_capacity") from exc
+                raise
             row = {"id": ident, "owner_id": owner, "status": "draft", "revision": 1, "topic": topic, "advice": advice,
                    "source_refs": refs, "sid": sid, "mid": mid, "delivery_text": body, "content_digest": digest(body),
                    "expires": now+600, "outcome": "unknown", "feedback": "", "feedback_receipt": "", "created": now, "updated": now}
@@ -194,7 +242,7 @@ class AdviceStore:
                 keep = {k: row[k] for k in ("id", "owner_id", "revision", "content_digest", "created", "updated")}
                 row = {**keep, "status": "forgotten", "topic": "", "advice": "", "source_refs": [], "feedback": "", "outcome": "unknown"}
                 # Remove queued natural evidence for this item, retaining receipt fingerprints.
-                for value in self.con.execute("SELECT * FROM advice_inputs WHERE owner_id=?", (owner,)).fetchall():
+                for value in self.con.execute("SELECT * FROM advice_inputs WHERE owner_id=? AND status IN ('pending','running') LIMIT 32", (owner,)).fetchall():
                     value = self._decode(value)
                     if value.get("item_id") == row["id"]:
                         self.con.execute("UPDATE advice_inputs SET payload=?,status='forgotten',lease_token='',updated=? WHERE id=?", (_json({"text": ""}), now, value["id"]))
