@@ -86,6 +86,25 @@ _REPAIR_CUE = re.compile(
     r"(?i:\b(?:you misunderstood|you misunderstand|i meant|not what i meant)\b)"
 )
 
+# A deliberately small full-clause vocabulary, not a sentiment classifier.
+# Every clause must be an explicit first-person positive report or a simple
+# positive aside; mixed feelings and requests continue through normal dialogue.
+_GOOD_NEWS = re.compile(
+    r"我(?:(?:今天|刚刚|刚才|终于|这次|已经|刚|真的)){0,3}"
+    r"(?:"
+    r"(?:考试|面试|答辩)(?:通过|过关)了?|"
+    r"通过了?(?:考试|面试|答辩)|考过了?|"
+    r"(?:拿到|收到)了?offer|被(?:录取|录用)了?|"
+    r"升职了?|涨工资了?|(?:项目|作品)(?:完成|做完)了?|"
+    r"比赛(?:获奖|拿奖)了?|拿到了?驾照|"
+    r"(?:好|很|特别|真|真的|太)(?:开心|高兴)"
+    r")(?:了|啦|啊|呀|耶)?", re.I
+)
+_POSITIVE_ASIDE = re.compile(
+    r"(?:好|很|特别|真|真的|太)(?:开心|高兴|棒|好了)(?:啊|呀|啦|了|耶)?|"
+    r"(?:跟你分享|告诉你)(?:一个|个)?好消息|好消息|终于成功了"
+)
+
 
 def _valid_text(text: Any) -> bool:
     return (isinstance(text, str) and 0 < len(text) <= MAX_TEXT_CHARS and bool(text.strip())
@@ -104,6 +123,34 @@ def literal_mode(text: str) -> str | None:
     if len(value) > 80:
         return None
     return next((mode for mode, phrases in _LITERALS.items() if value in phrases), None)
+
+
+def current_reaction(text: str) -> str | None:
+    """Recognize a narrow positive report for this turn only, without learning it.
+
+    The caller must verify a current pure-text owner message. This does not
+    certify that the reported event happened or infer an enduring mood.
+    """
+    if (not _valid_text(text) or len(text) > 160 or any(c in text for c in "?？")
+            or _QUOTED.search(text) or _REPORT.search(text) or _HYPOTHETICAL.search(text)
+            or _INSTRUCTION.search(text) or literal_mode(text) is not None
+            or _explicit_request(text) is not None or _REPAIR_CUE.search(text)):
+        return None
+    clauses = [part.strip() for part in re.split(r"[，,。.!！；;\n]+", text) if part.strip()]
+    if not 1 <= len(clauses) <= 3:
+        return None
+    reports = [_GOOD_NEWS.fullmatch(clause) is not None for clause in clauses]
+    return "celebrate" if any(reports) and all(
+        report or _POSITIVE_ASIDE.fullmatch(clause) for clause, report in zip(clauses, reports)
+    ) else None
+
+
+def current_reaction_hint(reaction: str | None) -> str:
+    if reaction != "celebrate":
+        return ""
+    return ("[MaiLivingWorld:current-reaction]\n对方本轮明确分享了好消息或开心感受，先回应其中具体值得高兴的地方，"
+            "自然分享这份高兴；不沿用上一轮的安慰口吻，不空泛夸赞、不立即转成建议或追问。"
+            "只回应对方的自述，不声称已经核实，不编造自己参与了过程或共同经历，也不把这句话写成长期情绪或性格。")
 
 
 def should_classify(text: str) -> bool:

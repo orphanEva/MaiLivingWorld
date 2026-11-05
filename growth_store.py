@@ -19,6 +19,7 @@ from typing import Any
 
 from .mysql_compat import MySQLCompatConnection
 from .sql_logging import connect_sqlite
+from .belief_revision import FIELDS as BELIEF_REVIEW_FIELDS, assess as assess_belief
 
 TRAITS = ("curiosity", "sociability", "patience", "caution")
 COLLECTIONS = ("interests", "beliefs", "knowledge", "questions")
@@ -116,7 +117,7 @@ def _view(row: dict, now: float) -> dict:
 
 
 def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
-                    records: dict[str, dict], consumed: set[str], now: float):
+                    records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False):
     if not isinstance(proposal, dict) or set(proposal) - {*COLLECTIONS, "traits", "mood"}:
         raise ValueError("invalid_proposal")
     for category in (*COLLECTIONS, "traits"):
@@ -202,6 +203,8 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             is_question = category == "questions"
             fields = {"topic", "question", "status", "evidence_ids"} if is_question else {
                 "topic", "statement", "confidence", "evidence_ids"}
+            if category == "beliefs" and review_beliefs:
+                fields |= BELIEF_REVIEW_FIELDS
             item_fields(item, fields)
             topic = _text(item["topic"], 60, "invalid_topic")
             text = _text(item["question"] if is_question else item["statement"], 280)
@@ -216,6 +219,14 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             if key in seen:
                 raise ValueError("duplicate_topic")
             seen.add(key)
+            if category == "beliefs" and review_beliefs:
+                text = _text(item["statement"], 180)
+                checked = {**item, "topic": topic, "statement": text, "confidence": confidence}
+                changed = assess_belief(current, checked, refs, {sid: records[sid] for sid in allowed},
+                                       key=key, merge_sources=merge_sources)
+                if changed:
+                    put(category, current, changed)
+                continue
             if is_question and status == "resolved" and current is None:
                 raise ValueError("question_missing")
             old_refs = {ref["id"]: ref for ref in current["sources"]} if current else {}
@@ -438,8 +449,10 @@ class GrowthStore:
                      "rolled_back": bool(row["rolled_back"]), **json.loads(row["payload"])} for row in rows]
 
     def complete(self, job_id: str, token: str, proposal: dict, records: list[dict],
-                 now: float | None = None, *, expected_revision: int | None = None) -> dict:
+                 now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False) -> dict:
         timestamp = _now(now)
+        if type(review_beliefs) is not bool:
+            raise ValueError("invalid_belief_review_mode")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("invalid_revision")
         refs, lookup = _records(records)
@@ -460,7 +473,8 @@ class GrowthStore:
             consumed = {row[0] for row in self.con.execute(
                 "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in allowed) + ")",
                 tuple(allowed)).fetchall()}
-            after, stats, used, scalar_sources = _apply_proposal(before, proposal, allowed, lookup, consumed, timestamp)
+            after, stats, used, scalar_sources = _apply_proposal(before, proposal, allowed, lookup, consumed, timestamp,
+                                                               review_beliefs=review_beliefs)
             changed = any(stats.values()) and job["mode"] == "active"
             revision = int(old["revision"])
             if changed:

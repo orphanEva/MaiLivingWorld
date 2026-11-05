@@ -36,6 +36,108 @@ def seed_attention(store):
     return store.state("12345678", now=103)
 
 
+def seed_belief_revision(store):
+    """Exercise old JSON, a pending counterview, adoption and rollback on real tables."""
+    def source(letter, text):
+        return {"id": "brain:event:backup-belief-"+letter, "source": "brain_event", "kind": "event",
+                "origin_key": "backup-belief-origin-"+letter, "scope": "private:12345678",
+                "subject_id": "12345678", "text": text, "timestamp": 100,
+                "sensitivity": "personal", "evidence_status": "recorded_event"}
+    original = source("a", "编程工具甲在我的旧项目中运行稳定。")
+    first = source("b", "编程工具甲在新的移动端项目中存在兼容问题。")
+    second = source("c", "编程工具乙在独立的服务器项目中更易维护。")
+    legacy = {"beliefs": [
+        {"topic": "编程工具", "statement": "编程工具甲适合目前的项目", "confidence": .8,
+         "evidence_ids": [original["id"]]},
+        {"topic": "旧阅读偏好", "statement": "阅读时喜欢保留原文依据", "confidence": .6,
+         "evidence_ids": [original["id"]]}],
+        "interests": [{"topic": "编程工具", "delta": .1, "evidence_ids": [original["id"]]}]}
+    def submit(proposal, records, now, reviewed):
+        job_id = store.enqueue(records, mode="active", now=now)
+        job = store.claim(now=now)
+        if not job or job["id"] != job_id:
+            raise AssertionError("expected real growth claim")
+        result = store.complete(job_id, job["token"], proposal, records, now=now+1,
+                                expected_revision=store.state(now=now)["revision"], review_beliefs=reviewed)
+        if not result["changed"]:
+            raise AssertionError("expected persisted belief change")
+        return job_id
+    legacy_job = submit(legacy, [original], 100, False)
+    reviewed_jobs = []
+    candidate = "编程工具应根据项目兼容性与维护成本选择"
+    for evidence, records, now in ((first, [original, first], 110), (second, [original, first, second], 120)):
+        old = next(row for row in store.state(now=now)["beliefs"] if row["topic"] == "编程工具")
+        proposal = {"beliefs": [{"topic": old["topic"], "statement": candidate, "confidence": .9,
+            "evidence_ids": [evidence["id"]], "relation": "challenge", "previous_key": old["key"],
+            "previous_revision": old["revision"], "quotes": [{"source_id": evidence["id"], "quote": evidence["text"]}]}]}
+        reviewed_jobs.append(submit(proposal, records, now, True))
+    adopted = next(row for row in store.state(now=121)["beliefs"] if row["topic"] == "编程工具")
+    if adopted["text"] != candidate or adopted["assessment"]["status"] != "considered":
+        raise AssertionError("expected independently supported adoption before rollback")
+    store.rollback(store.state(now=121)["revision"], now=130)
+    order = {"growth_state": "slot", "growth_jobs": "id", "growth_history": "revision", "growth_consumed": "source_id"}
+    return {"rows": {table: [dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order[table])]
+                     for table in backup.LEDGERS["growth.sqlite3"]},
+            "state": store.state(now=131), "records": [original, first, second],
+            "legacy_job": legacy_job, "reviewed_jobs": reviewed_jobs, "candidate": candidate}
+
+
+def assert_belief_revision_restore(case, store, expected):
+    order = {"growth_state": "slot", "growth_jobs": "id", "growth_history": "revision", "growth_consumed": "source_id"}
+    for table, rows in expected["rows"].items():
+        case.assertTrue(rows, table)
+        case.assertEqual([dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order[table])], rows)
+    case.assertEqual(store.state(now=131), expected["state"])
+    original, first, second = expected["records"]
+    beliefs = store.state(now=131)["beliefs"]
+    held = next(row for row in beliefs if row["topic"] == "编程工具")
+    legacy = next(row for row in beliefs if row["topic"] == "旧阅读偏好")
+    case.assertNotIn("assessment", legacy)
+    case.assertEqual(held["text"], "编程工具甲适合目前的项目")
+    case.assertEqual(held["assessment"]["status"], "contested")
+    case.assertEqual(held["assessment"]["candidate_text"], expected["candidate"])
+    case.assertEqual({ref["id"] for ref in held["sources"]}, {original["id"], first["id"]})
+    case.assertEqual([ref["id"] for ref in held["assessment"]["candidate_sources"]], [first["id"]])
+    history = {row["revision"]: row for row in store.history()}
+    adopted = next(row for row in history[3]["after"]["beliefs"] if row["topic"] == "编程工具")
+    case.assertTrue(history[3]["rolled_back"])
+    case.assertEqual(history[4]["kind"], "rollback")
+    case.assertEqual(adopted["text"], expected["candidate"])
+    case.assertEqual({ref["id"] for ref in adopted["sources"]}, {original["id"], first["id"], second["id"]})
+    case.assertEqual(adopted["assessment"]["last_previous_text"], held["text"])
+    from MaiLivingWorld.growth_store import source_fingerprint
+    from MaiLivingWorld.unified_memory import derived_memories
+    resolved = {row["id"]: row for row in expected["records"]}
+    recalled = derived_memories(store.state(now=131), resolved, fingerprint=source_fingerprint)
+    identity = "growth:belief:"+held["key"]
+    view = next(row for row in recalled if row["id"] == identity)
+    case.assertIn("尚未定论", view["text"])
+    case.assertEqual((view["scope"], view["sensitivity"]), ("private:12345678", "personal"))
+    case.assertEqual(view["sources"], held["sources"])
+    resolved.pop(first["id"])
+    case.assertNotIn(identity, {row["id"] for row in derived_memories(store.state(now=131), resolved,
+                                                                   fingerprint=source_fingerprint)})
+    case.assertEqual(store.enqueue([original], mode="active", now=140), expected["legacy_job"])
+    case.assertEqual(store.enqueue([original, first, second], mode="active", now=140), expected["reviewed_jobs"][1])
+    case.assertIsNone(store.claim(now=140))
+    # Another ID for the same observation cannot strengthen the pending view.
+    alias = dict(first, id=first["id"]+"-alias")
+    records = [original, first, alias]
+    job_id = store.enqueue(records, mode="active", now=141)
+    job = store.claim(now=141)
+    case.assertIsNotNone(job)
+    case.assertEqual(job["id"], job_id)
+    proposal = {"beliefs": [{"topic": held["topic"], "statement": expected["candidate"], "confidence": .99,
+        "evidence_ids": [alias["id"]], "relation": "challenge", "previous_key": held["key"],
+        "previous_revision": held["revision"], "quotes": [{"source_id": alias["id"], "quote": alias["text"]}]}]}
+    completed = store.complete(job_id, job["token"], proposal, records, now=142,
+                               expected_revision=expected["state"]["revision"], review_beliefs=True)
+    case.assertFalse(completed["changed"])
+    case.assertEqual(store.state(now=142), expected["state"])
+    case.assertEqual(len(store.history()), 4)
+    case.assertEqual(store.status()["consumed"], 1)
+
+
 def seed_recollection(store):
     from MaiLivingWorld.growth_store import source_fingerprint
     owner = "12345678"
@@ -401,6 +503,10 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.19"].values())), 66)
         self.assertEqual(len(backup.CATALOGS["v0.20"]), 18)
         self.assertEqual(sum(map(len, backup.CATALOGS["v0.20"].values())), 72)
+        self.assertEqual(len(backup.CATALOGS["v0.21"]), 20)
+        self.assertEqual(sum(map(len, backup.CATALOGS["v0.21"].values())), 78)
+        self.assertEqual(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
+        self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -421,6 +527,9 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
+        for version in ("v0.21", "v0.22"):
+            with self.subTest(version=version), self.assertRaises(TypeError):
+                backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
     def test_full_offline_restore_drill_preserves_every_table(self):
         self.seed(all_ledgers=True)
@@ -782,13 +891,22 @@ class SQLiteBackupTests(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(backup.BackupError):
                 backup._validate_manifest(candidate)
 
+    def test_v21_archive_restores_without_new_database_requirements(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.21")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.21", 20, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True,
+                                         confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (20, []))
+        self.assertEqual({path.name for path in self.target.iterdir()}, set(backup.V21_LEDGERS))
+
     def test_new_archive_requires_explicit_known_catalog_and_complete_inventory(self):
         self.seed()
         self.archive_now()
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.21")
+        self.assertEqual(current["catalog"], "v0.22")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -815,7 +933,7 @@ class SQLiteBackupTests(unittest.TestCase):
                     identity = store.configure_owner("12345678", now=100)
                     self.assertTrue(store.reserve_thought(now=101, day_start=0, min_interval_seconds=0, daily_limit=2))
                 elif module == "growth_store":
-                    growth = store.state(now=100)
+                    growth = seed_belief_revision(store)
                 elif module == "companion_store":
                     plan = store.propose_plan(owner_id="12345678", scope="private:12345678", title="一起读书",
                         next_step="第一章", message_id="trusted-real-schema-test", summary_hash="a"*64, now=100)
@@ -900,7 +1018,7 @@ class SQLiteBackupTests(unittest.TestCase):
             self.assertEqual(current["agent_id"], identity["agent_id"])
             self.assertEqual(current["owner_id"], identity["owner_id"])
             self.assertEqual(current["thought_count"], 1)
-            self.assertEqual(stores[1].state(now=100), growth)
+            assert_belief_revision_restore(self, stores[1], growth)
             self.assertEqual(stores[2].plan(plan["id"], owner_id="12345678"), plan)
             self.assertEqual(stores[3].moments("12345678"), [moment])
             self.assertEqual(stores[3].moments("12345678", status="retired"), [retired])
@@ -1226,6 +1344,29 @@ class MySQLBackupTests(unittest.TestCase):
         with self.assertRaisesRegex(backup.BackupError, "^invalid_mysql_configuration$"):
             backup.mysql_config(env)
 
+    def test_v21_mysql_archive_restores_into_current_unchanged_schema(self):
+        rows = {table: [] for tables in backup.V21_LEDGERS.values() for table in tables}
+        rows.update(copy.deepcopy(self.data))
+        source = Path(self.temp.name)/"v21-source.zip"
+        archive = Path(self.temp.name)/"v21-schema.zip"
+        backup.backup_mysql(self.config, source, apply=True, writers_stopped=True,
+                            connect=lambda _: FakeMySQL(rows))
+        with zipfile.ZipFile(source) as origin, zipfile.ZipFile(archive, "w") as destination:
+            for info in origin.infolist():
+                data = origin.read(info)
+                if info.filename == "manifest.json":
+                    manifest = json.loads(data)
+                    manifest["catalog"] = "v0.21"
+                    data = json.dumps(manifest).encode()
+                destination.writestr(info, data)
+        target = FakeMySQL({table: [] for table in backup.TABLES})
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"]), ("v0.21", 78))
+        restored = backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+                                        confirm=backup.CONFIRM, connect=lambda _: target)
+        self.assertEqual(restored["tables"], 78)
+        self.assertEqual(target.rows, rows)
+
 
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1" and os.getenv("MLW_BACKUP_MYSQL_DATABASE", "").startswith("mlw_backup_test"),
                      "Only with an explicitly configured empty dedicated MySQL CI database")
@@ -1234,6 +1375,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
         import pymysql
         from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
         from MaiLivingWorld.self_state import SelfState
+        from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.attention_store import AttentionStore
         from MaiLivingWorld.recollection_store import RecollectionStore
         from MaiLivingWorld.habits_store import HabitsStore
@@ -1263,6 +1405,11 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         state.reserve_thought(now=101, day_start=0, min_interval_seconds=0, daily_limit=2)
                     finally:
                         state.close()
+                    growth = GrowthStore(directory/"unused-growth.sqlite3", mysql_settings=settings)
+                    try:
+                        growth_before = seed_belief_revision(growth)
+                    finally:
+                        growth.close()
                     attention = AttentionStore(directory/"unused-attention.sqlite3", mysql_settings=settings)
                     try:
                         attention_before = seed_attention(attention)
@@ -1320,6 +1467,11 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         self.assertEqual(state.state()["thought_count"], 1)
                     finally:
                         state.close()
+                    growth = GrowthStore(directory/"unused-growth.sqlite3", mysql_settings=settings)
+                    try:
+                        assert_belief_revision_restore(self, growth, growth_before)
+                    finally:
+                        growth.close()
                     attention = AttentionStore(directory/"unused-attention.sqlite3", mysql_settings=settings)
                     try:
                         self.assertEqual(attention.state("12345678", now=103), attention_before)

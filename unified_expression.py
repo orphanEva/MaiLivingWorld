@@ -176,6 +176,8 @@ def build_deliberation_prompt(memories: list[dict], *, query: str,
         "recently_asked=true表示这条同版本近况近期确实问过，仅供理解背景；"
         "没有新进展且本轮未主动谈及时，不主动重复追问。该标记不扩大表达权限。"
         "只有枚举 behavior 可以承载未说出的经历对表达方式的影响，不提供自由文本理由。\n"
+        "有分歧的观点保留两边依据与不确定性，不替智能体把待核对候选当作已采纳立场。"
+        "低把握的记忆不能变成确定回答，历史观点调整不等于现实事件发生变化。\n"
         "UNTRUSTED_INPUT_JSON\n" + json.dumps(data, ensure_ascii=False)
     )
 
@@ -380,7 +382,7 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
                             "perspective": perspective})
             if item.get("recently_asked") is True and item.get("mode") == "say":
                 visible[-1]["usage"] = "这条近况近期已问过，本轮未主动谈及则不再次追问。"
-    # Do not expose memory IDs, sources, withheld counts, reviewer rationale or pending text.
+    # Do not expose memory IDs, sources, withheld counts or unapproved generalizations.
     return (
         "[MaiLivingWorld:unified-expression]\n"
         "你在不同聊天窗口仍是同一个持续存在的自己。"
@@ -391,6 +393,8 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
         "相关时可以用第一人称自然表达，也可以与对方有不同意见，但不为反对而反对。"
         "其他记录不自动成为你的喜好；不要把对方的偏好照搬成自己的，也不编造形成偏好的经历或理由。"
         "观点保留不确定性，不包装成客观定论；不要向对话对象报出标签、偏好分值或内部状态字段。"
+        "若给出的看法仍有分歧，自然说还没想定；候选不等于已采纳。"
+        "如果资料明确记录了观点调整，可以说明原先与现在的不同，不编造额外经历或改变原因。"
         "不要提及筛选过程，不要猜测未提供的私人细节；只在相关时自然使用。\n"
         + json.dumps(visible, ensure_ascii=False)
     )

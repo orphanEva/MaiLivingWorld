@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.21.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.22.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -35,7 +35,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 29)
-        self.assertEqual(total_fields, 186)
+        self.assertEqual(total_fields, 187)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -43,6 +43,17 @@ class ConfigSectionTests(unittest.TestCase):
     def test_manifest_version_consistent(self):
         manifest = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], plugin.Config().plugin.config_version)
+
+    def test_belief_review_requires_explicit_opt_in_and_has_webui_description(self):
+        self.assertFalse(plugin.Config().growth.review_beliefs)
+        config = plugin.Config.model_validate({"growth": {"enabled": True, "mode": "active"}})
+        self.assertFalse(config.growth.review_beliefs)
+        schema = plugin.Config.model_json_schema()
+        ref = schema["properties"]["growth"]["$ref"].rsplit("/", 1)[1]
+        field = schema["$defs"][ref]["properties"]["review_beliefs"]
+        self.assertEqual(field["type"], "boolean")
+        self.assertFalse(field["default"])
+        self.assertTrue(field["description"])
 
     def test_dynamic_webui_config_schema_exposes_recollection_and_reply_reserve(self):
         schema = plugin.Config.model_json_schema()

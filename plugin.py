@@ -60,7 +60,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.21.0",
+        default="0.22.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -215,6 +215,7 @@ class Growth(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用基于统一记忆的成长循环；需开启统一心智并绑定唯一主人")
     mode: Literal["observe", "active"] = Field(default="observe", description="observe=验证并记录任务结果，不改变人格；active=持久更新兴趣、观点、知识、问题、性格与短期情绪")
     interval_seconds: int = Field(default=3600, ge=60, le=86400, description="新学习任务的最短间隔，任务与时间持久化；与统一联想共用每日模型预算")
+    review_beliefs: bool = Field(default=False, description="把旧观点与完整原始依据一起复核；不同依据先保留分歧，变更主张需要独立新来源，不因一句话立即改口")
 
 
 class MCPIntegration(PluginConfigBase):
@@ -503,7 +504,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.21.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.22.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1471,14 +1472,18 @@ class MaiLivingWorld(MaiBotPlugin):
             recent = recollection.overlay(recent)
         state = self._growth_snapshot()
         questions = [item for item in state["questions"] if item.get("status") == "open"]
-        if not questions:
-            return recent
-        # Rotate unfinished questions; external collection continues through the existing explorer.
-        key = self._ensure_tool_store().next_local_question([item["key"] for item in questions])
-        question = next(item for item in questions if item["key"] == key)
-        related = self._collect_roots(question["topic"])
-        candidates = recent[:6] + related + recent[6:]
-        return list({item["id"]: item for item in candidates}.values())[:12]
+        candidates = recent
+        if questions:
+            # Rotate unfinished questions; external collection continues through the existing explorer.
+            key = self._ensure_tool_store().next_local_question([item["key"] for item in questions])
+            question = next(item for item in questions if item["key"] == key)
+            related = self._collect_roots(question["topic"])
+            candidates = recent[:6] + related + recent[6:]
+        candidates = list({item["id"]: item for item in candidates}.values())[:12]
+        if self.config.growth.review_beliefs:
+            from .belief_revision import select_belief_context
+            candidates = select_belief_context(candidates, state, self._resolve_roots, limit=12)
+        return candidates
 
     async def _grow(self):
         runtime = self._ensure_growth()

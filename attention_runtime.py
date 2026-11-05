@@ -6,7 +6,8 @@ from pathlib import Path
 import time
 
 from .attention_store import AttentionStore
-from .dialogue_policy import understand_dialogue, dialogue_hint, literal_mode, should_classify
+from .dialogue_policy import (understand_dialogue, dialogue_hint, literal_mode,
+                             should_classify, current_reaction, current_reaction_hint)
 from .mcp_runtime import digest, day_start
 from .mind import PRIVATE
 from .owner import extract_sender, normalize_qq
@@ -21,6 +22,7 @@ class AttentionRuntime:
         self._pending = {}
         self._current_mode = None
         self._text_key = None
+        self._reaction = None
         self._generation = 0
         self._dialogue_lock = asyncio.Lock()
         self._work_lock = asyncio.Lock()
@@ -31,6 +33,7 @@ class AttentionRuntime:
         self._pending.clear()
         self._current_mode = None
         self._text_key = None
+        self._reaction = None
 
     def close(self):
         self.reset()
@@ -62,6 +65,7 @@ class AttentionRuntime:
             self._pending.clear()
             self._current_mode = None
             self._text_key = None
+            self._reaction = None
             text = message.get("processed_plain_text")
             parts = message.get("raw_message")
             if (isinstance(text, str) and 0 < len(text) <= 600 and not text.lstrip().startswith("/")
@@ -70,6 +74,9 @@ class AttentionRuntime:
                     and not (isinstance(parts, list) and any(not isinstance(p, dict) or p.get("type") != "text" for p in parts))):
                 self._pending[(sender.stream_id, sender.message_id)] = (time.monotonic(), dict(message))
                 self._text_key = (sender.stream_id, sender.message_id)
+                # Keep only the enum from original text. The normalized recall
+                # query may have lost quote boundaries or invalid controls.
+                self._reaction = current_reaction(text)
             self.last_status = "conversation"
         return changed
 
@@ -104,6 +111,10 @@ class AttentionRuntime:
                 return
             message = pending[1]
             text = message.get("processed_plain_text", "")
+            if current_reaction(text):
+                # This finite current-turn reaction does not consume a model
+                # call or overwrite the saved communication preference.
+                return
             if PRIVATE.search(text) or not should_classify(text):
                 return
             owner, signature = self.owner(), self.signature()
@@ -137,10 +148,23 @@ class AttentionRuntime:
             if applied:
                 self._current_mode = (context["sid"], context["mid"], selected, self.signature())
 
+    def current_reaction(self, kwargs):
+        trusted = self.trusted(kwargs)
+        if not trusted or not self.bot.config.attention.dialogue_enabled:
+            return None
+        context = trusted[0]
+        if self._text_key != (context["sid"], context["mid"]):
+            return None
+        return self._reaction
+
     def effective_mode(self, kwargs):
         trusted = self.trusted(kwargs)
         if not trusted or not self.bot.config.attention.dialogue_enabled:
             return None
+        if self.current_reaction(kwargs):
+            # Use the existing per-turn override contract with Habits; keep the
+            # stored listening/advice preference intact for following messages.
+            return "explicit_normal"
         state = self.store.state(self.owner())
         mode = state["conversation"]["mode"] if state["conversation"]["active"] else "normal"
         # Explicit current words outrank temporary inferred preferences.
@@ -170,7 +194,9 @@ class AttentionRuntime:
         mode = self.effective_mode(kwargs)
         if mode is None:
             return ""
-        return "[MaiLivingWorld:conversation-attention]\n"+dialogue_hint("normal" if mode == "explicit_normal" else mode)
+        hint = "[MaiLivingWorld:conversation-attention]\n"+dialogue_hint("normal" if mode == "explicit_normal" else mode)
+        reaction = current_reaction_hint(self.current_reaction(kwargs))
+        return hint+("\n\n"+reaction if reaction else "")
 
     def candidates(self):
         b, owner = self.bot, self.owner()

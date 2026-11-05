@@ -415,10 +415,39 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
                 content += f"（偏好强度 {strength:+.2f}，负值表示不喜欢）"
             if text:
                 content += "；"+_text(text)
+            if kind == "belief":
+                assessment = item.get("assessment")
+                if assessment is not None and (not isinstance(assessment, dict)
+                        or assessment.get("status") not in {"tentative", "contested", "considered"}):
+                    continue
+                status = assessment.get("status") if assessment else "tentative"
+                if status == "contested":
+                    candidate = assessment.get("candidate_text", "")
+                    if (not isinstance(candidate, str) or not candidate.strip() or len(candidate) > 180
+                            or any(ord(char) < 32 for char in candidate)):
+                        continue
+                    content += "；已有不同依据，目前有分歧、尚未定论。待核对的另一种解释："+candidate
+                elif strength < .5:
+                    content += "；目前把握较低，只是暂时倾向，不作为确定结论"
+                elif status == "considered":
+                    content += "；这是综合已有依据的当前看法，仍可修订，不代表已客观证实"
+                else:
+                    content += "；这是依据有限的暂时看法，保留不确定性"
+                previous = assessment.get("last_previous_text", "") if assessment else ""
+                if (not isinstance(previous, str) or len(previous) > 180
+                        or any(ord(char) < 32 for char in previous)):
+                    continue
+                if status == "considered" and previous and previous != text:
+                    content += "；调整前曾倾向："+previous+"。这是看法的调整，不是新发生的事件"
+                # Never truncate the qualification that makes a disputed view safe to use.
+                if len(content) > MAX_TEXT_CHARS:
+                    continue
+            elif kind == "knowledge" and strength < .5:
+                content += "；现有依据较弱，不能据此作确定回答"
             if _CONFIDENTIAL.search(content):
                 sensitivity = "confidential"
             stamp = max((_stamp(source.get("timestamp")) for source in sources), default=0.0)
-            searchable = unicodedata.normalize("NFKC", topic+" "+text).casefold()
+            searchable = unicodedata.normalize("NFKC", topic+" "+content).casefold()
             relevance = sum(token in searchable for token in terms) / len(terms) if terms else 0.0
             ranked[identity] = {
                 "id": identity, "source": "growth", "kind": kind,
