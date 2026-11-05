@@ -477,20 +477,16 @@ def _inventory(cursor, prefix):
     if cursor.fetchone() is not None:
         _fail("mysql_triggers_not_supported")
     cursor.execute("SHOW TABLE STATUS")
-    tables, increments = {}, {}
+    tables = {}
     allowed = {prefix+name: name for name in TABLES}
     for row in cursor.fetchall():
         name = row.get("Name")
         if name not in allowed or row.get("Engine", "").lower() != "innodb":
             _fail("mysql_dedicated_innodb_schema_required")
         tables[allowed[name]] = name
-        value = row.get("Auto_increment")
-        if value is not None and (type(value) is not int or not 1 <= value <= 2**64-1):
-            _fail("invalid_mysql_auto_increment")
-        increments[allowed[name]] = value
     if not tables:
         _fail("mysql_initialized_schema_required")
-    return tables, increments
+    return tables
 
 
 def _schema(cursor, name):
@@ -504,6 +500,24 @@ def _check_increment(schema, value):
     # Fail closed if the engine cannot supply a real counter for such a column.
     if len(auto_columns) > 1 or bool(auto_columns) != (value is not None):
         _fail("mysql_auto_increment_mismatch")
+
+
+def _opened_increment(cursor, name):
+    """Call only after SHOW CREATE has opened/initialized the InnoDB table.
+
+    MySQL 8.4's table-statistics hook can peek an uninitialized zero even with
+    statistics caching disabled. SHOW CREATE invokes info(HA_STATUS_AUTO), which
+    initializes the native counter from persisted metadata before this re-read.
+    Never derive a deleted-row high-water mark from NULL or MAX(id).
+    """
+    cursor.execute("SHOW TABLE STATUS WHERE Name = %s", (name,))
+    row = cursor.fetchone()
+    if not isinstance(row, dict) or row.get("Name") != name or str(row.get("Engine", "")).lower() != "innodb":
+        _fail("mysql_schema_changed")
+    value = row.get("Auto_increment")
+    if value is not None and (type(value) is not int or not 1 <= value <= 2**64-1):
+        _fail("invalid_mysql_auto_increment")
+    return value
 
 
 def _definition(cursor, name, prefix):
@@ -553,7 +567,7 @@ def backup_mysql(config, archive, *, apply=False, writers_stopped=False, connect
         cursor = con.cursor()
         cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
-        tables, increments = _inventory(cursor, config["prefix"])
+        tables = _inventory(cursor, config["prefix"])
         files = []
         with tempfile.TemporaryDirectory(prefix="mlw-backup-") as temp:
             directory = Path(temp)
@@ -562,14 +576,15 @@ def backup_mysql(config, archive, *, apply=False, writers_stopped=False, connect
                 if table not in tables:
                     continue
                 schema = _schema(cursor, tables[table])
-                _check_increment(schema, increments[table])
                 definition = _definition(cursor, tables[table], config["prefix"])
+                increment = _opened_increment(cursor, tables[table])
+                _check_increment(schema, increment)
                 _select(cursor, tables[table], schema)
                 path = directory/"mysql"/(table+".jsonl")
                 with path.open("xb") as target:
                     count, size, digest = _dump_rows(cursor, schema, target if apply else None)
                 files.append({"path": "mysql/"+table+".jsonl", "schema": schema, "rows": count, "size": size, "sha256": digest,
-                              "definition": definition, "auto_increment": increments[table]})
+                              "definition": definition, "auto_increment": increment})
             if sum(item["size"] for item in files) > MAX_TOTAL:
                 _fail("backup_too_large")
             con.rollback()
@@ -596,7 +611,8 @@ def restore_mysql(archive, config, *, apply=False, writers_stopped=False, confir
             cursor = con.cursor()
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             cursor.execute("START TRANSACTION")
-            tables, increments = _inventory(cursor, config["prefix"])
+            tables = _inventory(cursor, config["prefix"])
+            increments = {}
             expected = {Path(item["path"]).stem: item for item in manifest["files"]}
             if set(tables) != set(expected):
                 _fail("mysql_schema_inventory_mismatch")
@@ -608,9 +624,10 @@ def restore_mysql(archive, config, *, apply=False, writers_stopped=False, confir
                 item = expected[table]
                 if _schema(cursor, tables[table]) != item["schema"]:
                     _fail("mysql_schema_mismatch")
-                _check_increment(item["schema"], increments[table])
                 if _definition(cursor, tables[table], config["prefix"]) != item["definition"]:
                     _fail("mysql_definition_mismatch")
+                increments[table] = _opened_increment(cursor, tables[table])
+                _check_increment(item["schema"], increments[table])
                 if (item["auto_increment"] is None) != (increments[table] is None):
                     _fail("mysql_auto_increment_mismatch")
                 _select(cursor, tables[table], item["schema"], lock=apply, probe=True)

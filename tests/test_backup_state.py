@@ -257,6 +257,7 @@ class FakeMySQL:
         self.increments = {table: 900 for table in self.rows}
         self.cached_increments = dict(self.increments)
         self.stats_expiry = 86400
+        self.unopened = set()
         self.operations, self.result = [], []
         self.closed = self.committed = False
         self.before = copy.deepcopy(self.rows)
@@ -273,14 +274,16 @@ class FakeMySQL:
             self.before = copy.deepcopy(self.rows)
         elif sql == "SET SESSION information_schema_stats_expiry = 0":
             self.stats_expiry = 0
-        elif sql == "SHOW TABLE STATUS":
+        elif sql.startswith("SHOW TABLE STATUS"):
             counters = self.increments if self.stats_expiry == 0 else self.cached_increments
-            self.result = [{"Name": self.prefix+table, "Engine": "InnoDB", "Auto_increment": counters[table]} for table in self.rows]
+            self.result = [{"Name": self.prefix+table, "Engine": "InnoDB", "Auto_increment": None if table in self.unopened else counters[table]}
+                           for table in self.rows if params is None or self.prefix+table == params[0]]
         elif sql.startswith("SHOW FULL COLUMNS"):
             table = re.findall(r"`([^`]+)`", sql)[0][len(self.prefix):]
             self.result = copy.deepcopy(self.schemas[table])
         elif sql.startswith("SHOW CREATE TABLE"):
             table = re.findall(r"`([^`]+)`", sql)[0]
+            self.unopened.discard(table[len(self.prefix):])
             self.result = [{"Create Table": "CREATE TABLE `"+table+"` (id BIGINT PRIMARY KEY AUTO_INCREMENT, payload LONGTEXT) ENGINE=InnoDB AUTO_INCREMENT=900 "+self.definition_suffix}]
         elif sql.startswith("SELECT"):
             physical = re.search(r" FROM `([^`]+)`", sql).group(1)
@@ -393,6 +396,29 @@ class MySQLBackupTests(unittest.TestCase):
             backup.backup_mysql(self.config, archive, apply=True, writers_stopped=True, connect=lambda _: source)
         self.assertFalse(archive.exists())
 
+    def test_unopened_tables_are_opened_before_reading_native_counter(self):
+        archive = Path(self.temp.name)/"unopened.zip"
+        source = FakeMySQL(self.data)
+        source.unopened = set(source.rows)
+        source.increments = {key: 1900 for key in source.rows}
+        backup.backup_mysql(self.config, archive, apply=True, writers_stopped=True, connect=lambda _: source)
+        with zipfile.ZipFile(archive) as package:
+            manifest = json.loads(package.read("manifest.json"))
+        self.assertEqual({item["auto_increment"] for item in manifest["files"]}, {1900})
+        target = FakeMySQL()
+        target.unopened = set(target.rows)
+        target.increments = {key: 1 for key in target.rows}
+        backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+            confirm=backup.CONFIRM, connect=lambda _: target)
+        self.assertEqual(target.rows, self.data)
+        self.assertEqual(set(target.increments.values()), {1900})
+        for con in (source, target):
+            for table in con.rows:
+                physical = con.prefix+table
+                opened = next(i for i, (sql, _) in enumerate(con.operations) if sql == "SHOW CREATE TABLE `"+physical+"`")
+                read = next(i for i, (sql, args) in enumerate(con.operations) if sql == "SHOW TABLE STATUS WHERE Name = %s" and args == (physical,))
+                self.assertLess(opened, read)
+
     def test_non_auto_increment_tables_keep_null_counter(self):
         source = FakeMySQL(self.data)
         for name in source.rows:
@@ -490,29 +516,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                         cursor.execute("INSERT INTO backup_attempts(target,created_at,kind) VALUES ('private:test',100,'test')")
                         deleted_id = cursor.lastrowid
                         cursor.execute("DELETE FROM backup_attempts WHERE id=%s", (deleted_id,))
-                    original_check = backup._check_increment
-                    def diagnose_counter(schema, value):
-                        try:
-                            return original_check(schema, value)
-                        except backup.BackupError:
-                            print("BACKUP_COUNTER_DIAGNOSTIC", json.dumps({"counter": value, "columns": schema}, ensure_ascii=False))
-                            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                                cursor.execute("SET SESSION information_schema_stats_expiry = 0")
-                                cursor.execute("SHOW TABLE STATUS")
-                                states = cursor.fetchall()
-                                for item in states:
-                                    cursor.execute("SHOW FULL COLUMNS FROM `"+item["Name"]+"`")
-                                    fields = cursor.fetchall()
-                                    if [row["Field"] for row in fields] == [row["Field"] for row in schema]:
-                                        cursor.execute("SHOW CREATE TABLE `"+item["Name"]+"`")
-                                        print("BACKUP_TABLE_DIAGNOSTIC", json.dumps({"table": item["Name"],
-                                            "counter": item["Auto_increment"], "ddl": cursor.fetchone()}, ensure_ascii=False))
-                            raise
-                    try:
-                        backup._check_increment = diagnose_counter
-                        result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
-                    finally:
-                        backup._check_increment = original_check
+                    result = backup.backup_mysql(config, archive, apply=True, writers_stopped=True)
                     self.assertEqual(result["tables"], 44)
                     self.assertTrue(backup.verify_archive(archive)["verified"])
                     with self.assertRaisesRegex(backup.BackupError, "target_not_empty"):

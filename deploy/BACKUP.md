@@ -68,7 +68,7 @@ python scripts/backup_state.py restore-sqlite --archive /srv/backups/mlw-state.z
 
 ## MySQL 备份与恢复
 
-独立备份脚本要求 MySQL 8.0+，真实集成验证使用 MySQL 8.4。读取计数器时在当前连接设置 `information_schema_stats_expiry=0`，避免表统计缓存返回过期的空值或较低自增值；不执行 `ANALYZE TABLE`，不修改来源数据。脚本根据列结构验证自增计数器，缺少可信计数时拒绝备份，不会把空值当作 1。这项要求只针对备份脚本，没有修改插件运行时的数据库兼容代码。
+独立备份脚本要求 MySQL 8.0+，真实集成验证使用 MySQL 8.4。读取计数器时在当前连接设置 `information_schema_stats_expiry=0`，再通过 `SHOW CREATE TABLE` 让 InnoDB 打开表并初始化原生计数器，随后单表重读 `SHOW TABLE STATUS`。只关闭统计缓存不足以处理尚未打开的新表。此过程不执行 `ANALYZE TABLE`，不修改来源数据。脚本根据列结构验证自增计数器，缺少可信计数时拒绝备份，不会把空值当作 1 或从 `MAX(id)` 推算删除前的高水位。这项要求只针对备份脚本，没有修改插件运行时的数据库兼容代码。
 
 安装项目声明的 PyMySQL 依赖。凭据只从当前维护进程环境读取，不自动搜索 `.env`，不写入归档或错误输出：
 
