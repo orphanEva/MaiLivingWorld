@@ -15,7 +15,8 @@
 - 单次受限短时语境分类，whole literal零调用，普通寒暄不额外分类；仅固定枚举提示进入回复，原话证据不写入注意力库。不确定不猜，旧消息不重放分类；当前请求覆盖旧支持方式，关闭子开关停止模式注入。此阶段修复当前误解，不声称自动改写所有长期事实或取消Host已发回复。
 - 22配置节162字段，十三SQLite库/54张MySQL表；默认关闭。新增关注面板/只读工具、固定v17备份清单及旧v14–v16清单兼容、MySQL并发专项与实际读/查阅中断回归。
 - 初轮完整回归801项：758通过、43真实MySQL按环境跳过。独立审查修复研究valid漏接外层注意力校验、选题list/set类型错误、语气优先级及缺失message ID回退；后续最终专项、打包和CI结果另记。没有修改真实配置/数据库或连接QQ、真实模型、Docker实例。
-- 最终专项134项全部通过，包含自然短句/长句分类、普通寒暄跳过、模式关闭/切换、媒体只作活动信号、真实Companion/MCP在途失效、13库迁移与面板；新增attention持久层30项与5项待CI真实MySQL覆盖并发、重启、去重、预算和租约。Chrome桌面与窄屏合成数据渲染检查通过。64文件ZIP逐文件校验通过，SHA256 `d83bf7585904a2eca2b7f2b5ad38fa95cfee3ac29ee0a4be2f0f7cb3f30d4830`；准备推送并检查Linux与MySQL CI。
+- 最终专项134项全部通过，包含自然短句/长句分类、普通寒暄跳过、模式关闭/切换、媒体只作活动信号、真实Companion/MCP在途失效与面板；13库迁移另在前轮专项通过。新增attention持久层30项与5项真实MySQL覆盖并发、重启、去重、预算和租约。Chrome桌面与窄屏合成数据渲染检查通过。64文件ZIP逐文件校验通过，SHA256 `d83bf7585904a2eca2b7f2b5ad38fa95cfee3ac29ee0a4be2f0f7cb3f30d4830`。
+- 运行提交 `3096f076c73cba0badd394c8ac342ac5026bb450` 已推送并通过 [Linux Python](https://github.com/orphanEva/MaiLivingWorld/actions/runs/41969209344) 全量823项（780通过、43按MySQL环境跳过）和 [MySQL 8.4](https://github.com/orphanEva/MaiLivingWorld/actions/runs/41969209321) 全部专项；新增注意力5项、备份38项含真实54表恢复及SQL结构检查均通过。本条仅记录验证，不改已验证运行代码。outputs提供v0.17 ZIP、校验文件及更新后的伴侣验收/备份说明；实际Docker/QQ/模型仍待用户最后验收。
 
 ## v0.16.0 此前进展
 
