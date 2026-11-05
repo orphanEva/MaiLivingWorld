@@ -41,6 +41,8 @@ from MaiLivingWorld.bond_store import BondStore
 from MaiLivingWorld.continuity_store import ContinuityStore
 from MaiLivingWorld.attention_store import AttentionStore
 from MaiLivingWorld.recollection_store import RecollectionStore
+from MaiLivingWorld.habits_store import HabitsStore
+from MaiLivingWorld.followthrough_store import FollowthroughStore
 
 
 LEDGERS = {
@@ -58,9 +60,11 @@ LEDGERS = {
     "continuity.sqlite3": tuple(t for t in TABLES if t.startswith("continuity_")),
     "attention.sqlite3": tuple(t for t in TABLES if t.startswith("attention_")),
     "recollection.sqlite3": tuple(t for t in TABLES if t.startswith("recollection_")),
+    "habits.sqlite3": tuple(t for t in TABLES if t.startswith("habits_")),
+    "followthrough.sqlite3": tuple(t for t in TABLES if t.startswith("followthrough_")),
 }
 ALL_TABLES = tuple(t for group in LEDGERS.values() for t in group)
-OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3"})
+OPTIONAL_LEDGERS = frozenset({"self_state.sqlite3", "growth.sqlite3", "tool_memory.sqlite3", "companion.sqlite3", "bond.sqlite3", "continuity.sqlite3", "attention.sqlite3", "recollection.sqlite3", "habits.sqlite3", "followthrough.sqlite3"})
 
 
 def snapshot(directory: Path) -> tuple[dict[str,list[dict]], list[str]]:
@@ -108,7 +112,8 @@ def ensure_schema(config: dict, workdir: Path) -> None:
                      ("proactive_feedback",ProactiveFeedback),("self_state",SelfState),
                      ("growth",GrowthStore),("tool_memory",ToolStore),("companion",CompanionStore),("bond",BondStore),
                      ("continuity",ContinuityStore),("attention",AttentionStore),
-                     ("recollection",RecollectionStore)):
+                     ("recollection",RecollectionStore),("habits",HabitsStore),
+                     ("followthrough",FollowthroughStore)):
         db=cls(workdir/(name+".sqlite3"),mysql_settings=config)
         db.close()
 

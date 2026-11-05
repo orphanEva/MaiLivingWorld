@@ -23,8 +23,9 @@ def day_start(timezone: str) -> float:
 
 
 class MCPBridge:
-    def __init__(self, store):
+    def __init__(self, store, *, on_task_bound=None):
         self.store = store
+        self.on_task_bound = on_task_bound
         self.last_status = "idle"
 
     async def catalog(self, provider, *, config, context, owner, client, valid):
@@ -71,7 +72,7 @@ class MCPBridge:
             if args.get("queue", "archive") != expected:
                 raise PolicyError("task_queue_mismatch")
 
-    def _bind_tasks(self, provider, tool, args, result, context):
+    def _bind_tasks(self, provider, tool, args, result, context, source_signature=""):
         if CATALOG[provider][tool][0] == "read":
             return
         operation = tool
@@ -94,6 +95,8 @@ class MCPBridge:
                 ident = row.get("id")
             if isinstance(ident, str) and re.fullmatch(r"[0-9a-f]{32}", ident):
                 self.store.bind_task(provider, ident, context["scope"], context["speaker_id"], operation)
+                if self.on_task_bound and source_signature:
+                    self.on_task_bound(provider, ident, context, operation, source_signature)
 
     def _filter_task_list(self, provider, tool, result, context):
         key = "tasks" if tool == "jm_list_tasks" else "items" if tool == "list_jobs" else None
@@ -111,7 +114,7 @@ class MCPBridge:
         return {key: rows, "scope": "当前会话由本插件发起的任务", "filtered": True}
 
     async def execute(self, provider, tool, arguments, *, config, context, owner, client,
-                      valid, timezone, record_observations=True):
+                      valid, timezone, record_observations=True, task_source_signature=""):
         context = dict(context)
         if not valid() or not permitted(provider, tool, config, context, owner):
             return {"success": False, "code": "tool_not_permitted"}
@@ -139,7 +142,7 @@ class MCPBridge:
             sent = True
             result = await client.call_tool(tool, args)
             # Bind returned jobs to their actual origin even if the waiting audience changed.
-            self._bind_tasks(provider, tool, args, result, context)
+            self._bind_tasks(provider, tool, args, result, context, task_source_signature)
             if not valid():
                 raise PolicyError("context_changed")
             item = observation(provider, tool, args, result) if record_observations else None

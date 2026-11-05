@@ -29,6 +29,8 @@ TABLES = (
     "continuity_control", "continuity_inputs", "continuity_threads", "continuity_audit",
     "attention_control", "attention_receipts", "attention_events",
     "recollection_control", "recollection_inputs", "recollection_revisions", "recollection_deliveries",
+    "habits_control", "habits_inputs", "habits_preferences", "habits_audit",
+    "followthrough_control", "followthrough_items", "followthrough_receipts", "followthrough_sources",
 )
 LONG_TEXT = {
     "text", "summary", "payload", "url", "reason", "basis", "reflection",

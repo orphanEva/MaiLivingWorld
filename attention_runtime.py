@@ -137,10 +137,10 @@ class AttentionRuntime:
             if applied:
                 self._current_mode = (context["sid"], context["mid"], selected, self.signature())
 
-    def hint(self, kwargs):
+    def effective_mode(self, kwargs):
         trusted = self.trusted(kwargs)
         if not trusted or not self.bot.config.attention.dialogue_enabled:
-            return ""
+            return None
         state = self.store.state(self.owner())
         mode = state["conversation"]["mode"] if state["conversation"]["active"] else "normal"
         # Explicit current words outrank temporary inferred preferences.
@@ -163,7 +163,14 @@ class AttentionRuntime:
             selected_at = conversation["until"]-(300 if mode in {"repair", "light"} else 7200)
             if not conversation["active"] or support["until"]-7200 > selected_at:
                 mode = support["effective_mode"]
-        return "[MaiLivingWorld:conversation-attention]\n"+dialogue_hint(mode)
+        # Explicit current normal also overrides an older habitual support style.
+        return "explicit_normal" if mode == "normal" and (explicit or classified) else mode
+
+    def hint(self, kwargs):
+        mode = self.effective_mode(kwargs)
+        if mode is None:
+            return ""
+        return "[MaiLivingWorld:conversation-attention]\n"+dialogue_hint("normal" if mode == "explicit_normal" else mode)
 
     def candidates(self):
         b, owner = self.bot, self.owner()

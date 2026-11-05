@@ -1,5 +1,7 @@
 # Docker MCP 网关
 
+v0.19 的任务回告继续使用这里的两个网关及既有MCP分支，无新增服务或Docker端口。新任务来源登记需先启用 `[followthrough]`；具体开关、独立整句送达确认和验收见 [长期伴侣说明](COMPANION.md)，新增两份状态账本纳入 [备份范围](BACKUP.md)。
+
 这套配置给 Docker 中的 MaiBot 提供两个固定地址：
 
 - `http://cap-mcp:8000/mcp`

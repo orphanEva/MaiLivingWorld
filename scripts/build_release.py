@@ -42,6 +42,8 @@ required = (
     "attention_store.py", "attention_runtime.py", "dialogue_policy.py",
     "continuity_store.py", "continuity_runtime.py", "continuity_model.py",
     "recollection_store.py", "recollection_model.py", "recollection_runtime.py", "recall_query.py",
+    "habits_store.py", "habits_model.py", "habits_runtime.py",
+    "followthrough_store.py", "followthrough_runtime.py", "delivery.py",
     "scripts/evaluate_companion.py", "evaluations/companion_scenarios.json", "deploy/EVALUATION.md",
     "scripts/backup_state.py", "scripts/migrate_all_sqlite_to_mysql.py", "scripts/migrate_sqlite_to_mysql.py",
     "sql/mysql.sql", "sql/mysql_comments_existing.sql", "deploy/BACKUP.md",

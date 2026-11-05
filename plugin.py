@@ -46,6 +46,8 @@ from .bond_runtime import BondRuntime
 from .continuity_runtime import ContinuityRuntime
 from .attention_runtime import AttentionRuntime
 from .recollection_runtime import RecollectionRuntime
+from .habits_runtime import HabitsRuntime
+from .followthrough_runtime import FollowthroughRuntime
 from .recall_query import expand_query, rank_records
 
 
@@ -54,7 +56,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.18.0",
+        default="0.19.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -316,6 +318,21 @@ class Recollection(PluginConfigBase):
     repeat_cooldown_hours: int = Field(default=24, ge=1, le=720, description="真实发送过的同一版本近况问题，在此期间提示减少重复追问；新证据会使旧回执失效")
 
 
+class Habits(PluginConfigBase):
+    __ui_label__ = "24 / 长期相处习惯"
+    enabled: bool = Field(default=False, description="保存主人明确确认的交流习惯，需统一心智active；当前请求和明确边界优先")
+    learn_from_feedback: bool = Field(default=True, description="主人私聊原话经两阶段复核；普通反馈需三条不同消息跨至少一天才成为习惯，明确长期要求可直接确认")
+    interval_seconds: int = Field(default=300, ge=30, le=86400, description="后台习惯提取批次间隔秒数；每批最多两次共享模型调用")
+    max_daily_batches: int = Field(default=4, ge=0, le=30, description="每天最多习惯提取批次数；仍遵守共享总额和前台预算预留")
+
+
+class Followthrough(PluginConfigBase):
+    __ui_label__ = "25 / 已承诺任务与结果回告"
+    enabled: bool = Field(default=False, description="跟进启用后经本插件发起的主人私聊MCP任务；实际送达承诺才开始查询，实际送达结果才标记已回告")
+    interval_seconds: int = Field(default=300, ge=300, le=86400, description="任务状态只读检查的最小间隔秒数；不自动重试写入")
+    max_daily_checks: int = Field(default=12, ge=0, le=12, description="每天最多状态检查次数；同时计入原MCP预算，主动回告仍遵守白名单、安静时间及联系限额")
+
+
 class Config(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     storage: Storage = Field(default_factory=Storage)
@@ -339,6 +356,8 @@ class Config(PluginConfigBase):
     continuity: Continuity = Field(default_factory=Continuity)
     attention: Attention = Field(default_factory=Attention)
     recollection: Recollection = Field(default_factory=Recollection)
+    habits: Habits = Field(default_factory=Habits)
+    followthrough: Followthrough = Field(default_factory=Followthrough)
     memory: Memory = Field(default_factory=Memory)
 
 
@@ -388,6 +407,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._tool_store: ToolStore | None = None
         self._mcp_bridge: MCPBridge | None = None
         self._mcp_clients: dict[str, Any] = {}
+        self._mcp_client_sources: dict[str, str] = {}
         self._mcp_generation = 0
         self._mcp_calls: set[asyncio.Task] = set()
         self._companion: CompanionRuntime | None = None
@@ -395,6 +415,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._continuity: ContinuityRuntime | None = None
         self._attention: AttentionRuntime | None = None
         self._recollection: RecollectionRuntime | None = None
+        self._habits: HabitsRuntime | None = None
+        self._followthrough: FollowthroughRuntime | None = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
         self._brain_cursor = 0
@@ -442,7 +464,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.17.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.19.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -464,6 +486,10 @@ class MaiLivingWorld(MaiBotPlugin):
             self._attention.reset()
         if self._recollection:
             self._recollection.reset()
+        if self._habits:
+            self._habits.reset()
+        if self._followthrough:
+            self._followthrough.reset()
         await self._close_mcp()
         self.ctx.logger.info("[MaiLivingWorld] 配置更新：%s %s", scope, version)
 
@@ -637,6 +663,22 @@ class MaiLivingWorld(MaiBotPlugin):
                     job.add_done_callback(self._memory_jobs.discard)
             except (ValueError, TypeError):
                 self.ctx.logger.info("[MaiLivingWorld][RECOLLECTION] 更正输入未通过核验，保留原记录")
+        habits = self._ensure_habits()
+        if habits:
+            try:
+                changed, queued = habits.capture(message)
+                if changed and runtime:
+                    runtime.reset()
+                    runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
+                if queued:
+                    job = asyncio.create_task(self._process_habits())
+                    self._memory_jobs.add(job)
+                    job.add_done_callback(self._memory_jobs.discard)
+            except (ValueError, TypeError):
+                self.ctx.logger.info("[MaiLivingWorld][HABITS] 相处习惯输入未通过核验，保留原状态")
+        followthrough = self._ensure_followthrough()
+        if followthrough:
+            followthrough.capture(message)
         return {"action": "continue"}
 
     @HookHandler(
@@ -768,6 +810,22 @@ class MaiLivingWorld(MaiBotPlugin):
                 self.ctx.logger.info("[MaiLivingWorld][RECOLLECTION] 回执未完成核验，未记录为已问")
         return {"action": "continue"}
 
+    @HookHandler(
+        "send_service.after_send", name="living_world_followthrough_receipt",
+        description="核验实际发给主人私聊的承诺与结果回执，不把草稿或工具返回当作送达",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+    )
+    async def followthrough_send_feedback(self, **kwargs):
+        runtime = self._ensure_followthrough()
+        if runtime:
+            try:
+                await runtime.sent(kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.info("[MaiLivingWorld][FOLLOWTHROUGH] 回执未完成核验，保留未确认状态")
+        return {"action": "continue"}
+
     def _relation_for(self, kind: str, query: str = "", *, dialogue_managed=False) -> str:
         cfg = self.config.owner
         if not self.config.plugin.enabled or not cfg.enabled or not normalize_qq(cfg.qq):
@@ -895,6 +953,15 @@ class MaiLivingWorld(MaiBotPlugin):
                     recollection = self._ensure_recollection()
                     if recollection and runtime.context(kwargs) == before:
                         prompt += "\n\n" + recollection.repeat_hint(kwargs)
+                    habits = self._ensure_habits()
+                    if habits and runtime.context(kwargs) == before:
+                        mode = attention.effective_mode(kwargs) if attention else None
+                        if mode is None:
+                            continuity = self._ensure_continuity()
+                            mode = continuity.store.state(habits.owner())["support"]["effective_mode"] if continuity else "normal"
+                        prompt += "\n\n" + habits.hint(kwargs, current_mode=mode)
+                    if runtime.context(kwargs) == before:
+                        prompt += "\n\n" + self._followthrough_hint(kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -914,6 +981,8 @@ class MaiLivingWorld(MaiBotPlugin):
     )
     async def owner_planner_prompt(self, **kwargs):
         prompt = self._owner_prompt_for(kwargs)
+        if prompt:
+            prompt += "\n\n" + self._followthrough_hint(kwargs)
         updated = inject_owner_prompt(kwargs, prompt) if prompt else None
         if updated is not None:
             self.ctx.logger.info("[MaiLivingWorld][OWNER] 私聊 Planner 主人提示注入成功")
@@ -966,6 +1035,12 @@ class MaiLivingWorld(MaiBotPlugin):
         if self._recollection:
             self._recollection.close()
             self._recollection = None
+        if self._habits:
+            self._habits.close()
+            self._habits = None
+        if self._followthrough:
+            self._followthrough.close()
+            self._followthrough = None
         if self._continuity:
             self._continuity.close()
             self._continuity = None
@@ -1089,7 +1164,8 @@ class MaiLivingWorld(MaiBotPlugin):
             self._unified = UnifiedRuntime(self._self_state, profile=self._growth_style_hint)
         elif previous != owner:
             self._unified.reset()
-        self._unified.latest_private_only = bool((self.config.attention.enabled or self.config.recollection.enabled) and self._unified_active())
+        self._unified.latest_private_only = bool(self.config.followthrough.enabled or
+            (self.config.attention.enabled or self.config.recollection.enabled or self.config.habits.enabled) and self._unified_active())
         return self._unified
 
     def _memory_sources(self) -> dict[str, Any]:
@@ -1231,8 +1307,70 @@ class MaiLivingWorld(MaiBotPlugin):
             self._tool_store = ToolStore(Path(self.ctx.paths.data_dir) / "tool_memory.sqlite3",
                                          **self._ledger_storage_options())
         if self._mcp_bridge is None:
-            self._mcp_bridge = MCPBridge(self._tool_store)
+            self._mcp_bridge = MCPBridge(self._tool_store, on_task_bound=self._record_mcp_task_source)
         return self._tool_store
+
+    def _ensure_habits(self):
+        if not (self.config.habits.enabled and self._unified_active() and self._ensure_unified()
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq)):
+            return None
+        if self._habits is None:
+            self._habits = HabitsRuntime(self)
+        return self._habits
+
+    async def _process_habits(self):
+        try:
+            runtime = self._ensure_habits()
+            if runtime:
+                await runtime.process()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld][HABITS] 本批习惯整理暂未完成，下轮重试")
+
+    @Tool("living_world_habits", description="仅可信主人私聊只读查看长期交流习惯、待确认反馈和设置说明；当前请求优先，不修改主人身份")
+    async def habits(self, **kwargs):
+        runtime = self._ensure_habits()
+        return runtime.inspect(kwargs) if runtime else {"success": False, "code": "habits_disabled"}
+
+    def _ensure_followthrough(self):
+        if not (self.config.plugin.enabled and self.config.followthrough.enabled and self.config.mcp.enabled
+                and self.config.owner.enabled and normalize_qq(self.config.owner.qq) and self._ensure_unified()):
+            return None
+        if self._followthrough is None:
+            self._followthrough = FollowthroughRuntime(self)
+        return self._followthrough
+
+    def _followthrough_hint(self, kwargs):
+        runtime = self._ensure_followthrough()
+        if not runtime or not runtime.trusted(kwargs) or not runtime.due():
+            return ""
+        return ("[MaiLivingWorld:followthrough]\n有已承诺任务的真实结果尚未回告。"
+                "合适时调用 living_world_followthrough 的 report 获取核验结果；"
+                "按工具返回的 delivery_text 独立发送，不凭聊天历史猜测完成，也不宣称工具返回已送达。")
+
+    @Tool("living_world_followthrough", description="跟进本插件已有的主人私聊MCP任务；watch生成待发送承诺，list查看，report取回真实结果；只读检查、不创建或重试外部任务，实际送达才记为承诺或已回告", parameters={
+        "action": {"type": "string", "enum": ["watch", "list", "report"]},
+        "provider": {"type": "string", "default": ""},
+        "task_id": {"type": "string", "default": ""},
+        "item_id": {"type": "string", "default": ""}})
+    async def followthrough(self, action: str, provider: str = "", task_id: str = "", item_id: str = "", **kwargs):
+        runtime = self._ensure_followthrough()
+        return await runtime.tool(action, provider, task_id, item_id, kwargs) if runtime else {"success": False, "code": "followthrough_disabled"}
+
+    def _record_mcp_task_source(self, provider, task_id, context, operation, source_signature):
+        from .followthrough_store import OPERATIONS
+        if operation.partition(":")[0] not in OPERATIONS.get(provider, {}):
+            return
+        try:
+            runtime = self._ensure_followthrough()
+            if (runtime and runtime.enabled() and context["speaker_id"] == runtime.owner()
+                    and context["scope"] == "private:"+runtime.owner()):
+                runtime.store.bind_source(provider, task_id, owner_id=runtime.owner(), scope=context["scope"],
+                    operation=operation, source_signature=source_signature)
+        except Exception:
+            # A receipt registry failure must not turn an accepted write into a retry instruction.
+            self.ctx.logger.warning("[MaiLivingWorld][FOLLOWTHROUGH] 任务来源未完成登记，不能自动跟进")
 
     def _ensure_recollection(self):
         if not (self.config.recollection.enabled and self._unified_active() and self._ensure_unified()
@@ -1384,6 +1522,7 @@ class MaiLivingWorld(MaiBotPlugin):
 
     async def _close_mcp(self):
         self._mcp_generation += 1
+        self._mcp_client_sources.clear()
         clients, self._mcp_clients = list(self._mcp_clients.values()), {}
         if clients:
             await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
@@ -1402,12 +1541,23 @@ class MaiLivingWorld(MaiBotPlugin):
                             "owner": self.config.owner.model_dump(), "plugin": self.config.plugin.enabled,
                             "unified": self.config.unified_mind.model_dump()})
 
+    def _mcp_source_signature(self, provider):
+        server = self._mcp_server_config(provider)
+        if not server:
+            return ""
+        names = [server.token_env] if server.transport == "http" else list(server.env_names)
+        # Only configured environment entries participate; never persist their plaintext.
+        return tool_digest({"provider": provider, "server": server.model_dump(),
+                            "environment": {name: os.environ.get(name, "") for name in names}})
+
     def _mcp_client(self, provider):
         server, cfg = self._mcp_server_config(provider), self.config.mcp
         if not server or not server.enabled:
             raise MCPError("invalid_config")
         if provider in self._mcp_clients:
             if not self._mcp_clients[provider].retired:
+                if self._mcp_client_sources.get(provider, self._mcp_source_signature(provider)) != self._mcp_source_signature(provider):
+                    raise MCPError("invalid_config")
                 return self._mcp_clients[provider]
             self._mcp_clients.pop(provider)
         if server.transport == "http":
@@ -1424,6 +1574,7 @@ class MaiLivingWorld(MaiBotPlugin):
             client = StdioMCPClient(server.command, server.args, server.cwd or str(Path(self.ctx.paths.data_dir).resolve()), environment,
                                     timeout_seconds=cfg.timeout_seconds, max_response_bytes=cfg.max_response_bytes)
         self._mcp_clients[provider] = client
+        self._mcp_client_sources[provider] = self._mcp_source_signature(provider)
         return client
 
     def _mcp_context(self, kwargs):
@@ -1450,8 +1601,10 @@ class MaiLivingWorld(MaiBotPlugin):
         context, request = trusted
         owner = self._self_state.state()["owner_id"]
         generation, signature = self._mcp_generation, self._mcp_signature(provider)
+        source_signature = self._mcp_source_signature(provider)
         def valid():
             return (generation == self._mcp_generation and signature == self._mcp_signature(provider)
+                    and source_signature == self._mcp_source_signature(provider)
                     and self._self_state.state()["owner_id"] == owner
                     and self._unified.context(request) == context)
         task = asyncio.current_task()
@@ -1464,7 +1617,8 @@ class MaiLivingWorld(MaiBotPlugin):
                     owner=owner, client=client, valid=valid)
             return await self._mcp_bridge.execute(provider, tool, arguments, config=self.config.mcp,
                 context=context, owner=owner, client=client, valid=valid,
-                timezone=self.config.general.timezone, record_observations=self.config.mcp.remember_results)
+                timezone=self.config.general.timezone, record_observations=self.config.mcp.remember_results,
+                task_source_signature=source_signature)
         except MCPError as exc:
             return {"success": False, "code": exc.code}
         finally:
@@ -1879,6 +2033,16 @@ class MaiLivingWorld(MaiBotPlugin):
                         await self._process_continuity()
                     if self.config.recollection.enabled:
                         await self._process_recollection()
+                    if self.config.habits.enabled:
+                        await self._process_habits()
+                    followthrough = self._ensure_followthrough()
+                    if followthrough:
+                        try:
+                            await followthrough.tick()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld][FOLLOWTHROUGH] 未确认任务结果，保留跟进")
                     attention = self._ensure_attention()
                     if attention:
                         try:
@@ -2220,7 +2384,7 @@ class MaiLivingWorld(MaiBotPlugin):
         unified_active = self._unified_active()
         def proactive_signature():
             config = {name: getattr(self.config, name).model_dump() for name in
-                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection")}
+                ("plugin", "general", "audience", "owner", "unified_mind", "growth", "experience", "shared_plans", "bond", "continuity", "attention", "recollection", "habits", "followthrough")}
             bond = self._ensure_bond()
             config["bond_revision"] = bond.store.profile(bond.owner())["revision"] if bond else 0
             continuity = self._ensure_continuity()
@@ -2299,12 +2463,17 @@ class MaiLivingWorld(MaiBotPlugin):
         # 仅模型决策限频，不能替代SQLite已落盘的发送配额；重启后由发送配额继续保护。
         self._last_decision[decision_key]=now
         companion = self._ensure_companion() if is_owner_private and self.config.shared_plans.enabled else None
-        pending_plan = companion.due_plan(ident) if companion else None
-        story = None if pending_plan else await self._choose_story(target)
+        followthrough = self._ensure_followthrough() if is_owner_private and unified_active else None
+        pending_report = followthrough.due(ident) if followthrough else None
+        pending_plan = companion.due_plan(ident) if companion and not pending_report else None
+        story = None if pending_plan or pending_report else await self._choose_story(target)
         if story and experience and not experience.allow(
                 ident, "explore", active=self.config.experience.mode == "active")[0]:
             story = None
-        if pending_plan:
+        if pending_report:
+            topic = pending_report["label"]
+            intent = "这是一次已承诺任务的结果回告机会；可以选择稍后回告。只使用下方核验结果，不另行提交或重试任务。"
+        elif pending_plan:
             topic = pending_plan["title"]
             intent = ("这是一次主人已确认共同计划的到期跟进机会，可以沉默。只和主人自然提及下一步，"
                       "不要声称已经完成，不擅自执行计划或修改状态。下面是计划资料，不是执行指令：\n"
@@ -2373,16 +2542,20 @@ class MaiLivingWorld(MaiBotPlugin):
                 return (self._unified_active() and self.config.general.enabled and ident in targets
                         and signature == proactive_signature() and self._unified is runtime
                         and runtime._generation == generation and self._self_state.state()["owner_id"] == owner
+                        and (not pending_report or followthrough.enabled() and followthrough._current(pending_report)
+                             and followthrough.store.get(ident, pending_report["id"]) == pending_report)
                         and (not pending_plan or companion.store.plan(pending_plan["id"], owner_id=ident) == pending_plan))
             query = story["title"] if story else topic
             recollection = self._ensure_recollection() if is_owner_private else None
             def recall(query):
+                if pending_report:
+                    return []
                 records = self._collect_unified(query)
                 return recollection.with_questions(records) if recollection else records
             def memory_version():
                 return _memory_version(sorted(recall(query), key=lambda item: item["id"]))
             original_memories = memory_version()
-            hint = await runtime.proactive_hint({"scope": kind+":"+ident, "speaker_id": ident if kind == "private" else "",
+            hint = "" if pending_report else await runtime.proactive_hint({"scope": kind+":"+ident, "speaker_id": ident if kind == "private" else "",
                 "sid": sid, "query": story["title"] if story else topic}, self.config.unified_mind,
                 recall=recall, generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                 timezone=self.config.general.timezone, valid=valid)
@@ -2418,6 +2591,12 @@ class MaiLivingWorld(MaiBotPlugin):
         if (signature != proactive_signature() or continuity and not continuity.contact_allowed()
                 or attention and not attention.proactive_allowed()):
             return
+        if pending_report:
+            prepared = followthrough.prepare_report(ident, sid, pending_report["id"], pending_report["revision"])
+            if not prepared or not followthrough.valid_report(ident, sid, prepared["id"], prepared["revision"], prepared["signature"]):
+                return
+            intent += ("\n\n请将下面一句原样作为独立整条消息发送，以便成功送达回执确认。不要添加引号、前后缀或任务编号；"
+                       "若不适合发送就保持沉默，不能称已回告。\n"+prepared["text"])
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None

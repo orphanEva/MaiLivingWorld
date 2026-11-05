@@ -645,3 +645,93 @@ ALTER TABLE `mlw_recollection_deliveries`
   MODIFY COLUMN `text_digest` VARCHAR(191) NOT NULL COMMENT '已发送文本SHA256摘要',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界回执信息与使用来源引用JSON',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '确认成功发送的时间，Unix秒';
+
+ALTER TABLE `mlw_habits_control`
+  COMMENT = '主人相处习惯学习的持久租约与学习预算，不覆盖原始事实',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '相处习惯学习控制状态的乐观锁版本',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '学习预算所属日期起点，Unix秒',
+  MODIFY COLUMN `cycle_count` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的相处习惯学习学习批次',
+  MODIFY COLUMN `last_cycle` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留学习批次的时间，Unix秒',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前学习批次的独占租约令牌',
+  MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '学习租约失效时间，Unix秒',
+  MODIFY COLUMN `lease_id` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前学习批次的输入标识',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次控制状态建立时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒';
+
+ALTER TABLE `mlw_habits_inputs`
+  COMMENT = '主人反馈与明确习惯命令相关的有界相处习惯学习输入队列',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信场合消息与输入类型的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '输入所属可信主人标识',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '输入类型：input反馈、command命令、evidence正文摘要去重收据',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重复和变更核验',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '输入处理状态；receipt表示仅用于去重的摘要收据',
+  MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前处理租约令牌',
+  MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许处理时间，Unix秒',
+  MODIFY COLUMN `expires` DOUBLE NOT NULL COMMENT '未处理输入的到期时间，Unix秒',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界输入及可信引用JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_habits_preferences`
+  COMMENT = '主人明确确认或经反馈复核的有限交流习惯，不构建关系分数',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '交流习惯槽位的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '偏好所属的可信主人标识，不随主人配置变更迁移',
+  MODIFY COLUMN `situation` VARCHAR(191) NOT NULL COMMENT '固定交流场景枚举',
+  MODIFY COLUMN `dimension` VARCHAR(191) NOT NULL COMMENT '固定交流偏好维度枚举',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'active已生效pending待确认或cleared已清除状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '偏好记录变更版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界偏好枚举与可信来源引用JSON，不保存隐藏推理',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次建立偏好记录时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近偏好状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_habits_audit`
+  COMMENT = '主人相处习惯的幂等审计，仅保存受限枚举与摘要',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '习惯操作审计的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际操作所属的可信主人标识',
+  MODIFY COLUMN `preference_id` VARCHAR(191) NOT NULL COMMENT '关联交流习惯槽位标识',
+  MODIFY COLUMN `input_id` VARCHAR(191) NOT NULL COMMENT '关联可信输入或命令标识',
+  MODIFY COLUMN `action` VARCHAR(191) NOT NULL COMMENT '实际执行的有限习惯操作类型',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '操作完成时的偏好版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '有界枚举及来源摘要JSON，不保存原始聊天正文',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒';
+
+ALTER TABLE `mlw_followthrough_control`
+  COMMENT = '主人承诺回告的持久复查预算，不增加原任务权限',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '可信主人标识，原主人状态不转移给新主人',
+  MODIFY COLUMN `revision` BIGINT NOT NULL DEFAULT 0 COMMENT '回告控制状态的乐观锁版本',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '复查预算所属日期起点，Unix秒',
+  MODIFY COLUMN `daily_checks` BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的任务状态复查次数',
+  MODIFY COLUMN `last_check` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留状态复查时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近控制状态更新时间，Unix秒';
+
+ALTER TABLE `mlw_followthrough_items`
+  COMMENT = '绑定真实既有任务的主人承诺回告，尝试和生成不等于完成',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '跟进任务的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '承诺事项所属的可信主人标识',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT '跟进事项当前执行与回告状态',
+  MODIFY COLUMN `revision` BIGINT NOT NULL COMMENT '事项状态变化版本',
+  MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '既有任务引用与核验状态JSON，不存任意操作指令',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '首次绑定跟进事项时间，Unix秒',
+  MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '最近事项状态变化时间，Unix秒';
+
+ALTER TABLE `mlw_followthrough_receipts`
+  COMMENT = '真实任务绑定与回告回执的幂等记录，不存私聊正文',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '可信操作或真实回执的稳定标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '实际回执所属的可信主人标识',
+  MODIFY COLUMN `item_id` VARCHAR(191) NOT NULL COMMENT '关联承诺回告事项标识',
+  MODIFY COLUMN `kind` VARCHAR(191) NOT NULL COMMENT '可信操作或回执类型',
+  MODIFY COLUMN `body_digest` VARCHAR(191) NOT NULL COMMENT '实际操作或消息内容摘要，用于幂等与冲突校验',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '回执确认时间，Unix秒';
+
+ALTER TABLE `mlw_followthrough_sources`
+  COMMENT = '真实任务创建时的主人与MCP服务绑定，防止服务切换复用旧任务标识',
+  MODIFY COLUMN `id` VARCHAR(191) NOT NULL COMMENT '真实创建任务的可信来源绑定标识',
+  MODIFY COLUMN `provider` VARCHAR(191) NOT NULL COMMENT '创建任务的固定MCP服务类型',
+  MODIFY COLUMN `task_id` VARCHAR(191) NOT NULL COMMENT '由真实任务创建结果返回的标识',
+  MODIFY COLUMN `owner_id` VARCHAR(191) NOT NULL COMMENT '创建任务时经核验的可信主人标识',
+  MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '创建任务时经核验的主人私聊场合',
+  MODIFY COLUMN `operation` VARCHAR(191) NOT NULL COMMENT '实际已执行的许可任务创建操作',
+  MODIFY COLUMN `source_signature` VARCHAR(191) NOT NULL COMMENT '任务创建时MCP服务配置签名，服务变更使旧任务不可复用',
+  MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '可信创建绑定确认时间，Unix秒';

@@ -1,4 +1,4 @@
--- MaiLivingWorld MySQL 8.4 十四套数据共 58 表（含持续自我、成长、工具、陪伴、聊天连续性、注意安排与回忆修正）
+-- MaiLivingWorld MySQL 8.4 十六套数据共 66 表（含持续自我、成长、工具、陪伴、聊天连续性、注意安排、回忆修正、相处习惯与承诺回告）
 -- 全部表及字段附中文COMMENT；新库直接执行本文件。
 -- 已建表不会因 IF NOT EXISTS 更新注释，请使用 sql/mysql_comments_existing.sql。
 -- 建议为插件单独创建数据库与低权限账户；不要使用 root，也不要把密码提交到 GitHub。
@@ -610,3 +610,98 @@ CREATE TABLE IF NOT EXISTS `mlw_recollection_deliveries` (
     created DOUBLE NOT NULL COMMENT '确认成功发送的时间，Unix秒',
     KEY `idx_recollection_deliveries_owner` (owner_id,created)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='真实发送成功回执与来源引用，尝试和生成不等于已经说过';
+
+CREATE TABLE IF NOT EXISTS `mlw_habits_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '可信主人标识，原主人状态不随配置变更迁移',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '相处习惯学习控制状态的乐观锁版本',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '学习预算所属日期起点，Unix秒',
+    cycle_count BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的相处习惯学习学习批次',
+    last_cycle DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留学习批次的时间，Unix秒',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前学习批次的独占租约令牌',
+    lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '学习租约失效时间，Unix秒',
+    lease_id VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前学习批次的输入标识',
+    created DOUBLE NOT NULL COMMENT '首次控制状态建立时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态修改时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人相处习惯学习的持久租约与学习预算，不覆盖原始事实';
+
+CREATE TABLE IF NOT EXISTS `mlw_habits_inputs` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信场合消息与输入类型的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '输入所属可信主人标识',
+    kind VARCHAR(191) NOT NULL COMMENT '输入类型：input反馈、command命令、evidence正文摘要去重收据',
+    body_digest VARCHAR(191) NOT NULL COMMENT '原始正文SHA256摘要，用于重复和变更核验',
+    status VARCHAR(191) NOT NULL COMMENT '输入处理状态；receipt表示仅用于去重的摘要收据',
+    attempts BIGINT NOT NULL DEFAULT 0 COMMENT '有界重试次数',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '当前处理租约令牌',
+    next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '下次允许处理时间，Unix秒',
+    expires DOUBLE NOT NULL COMMENT '未处理输入的到期时间，Unix秒',
+    payload LONGTEXT NOT NULL COMMENT '有界输入及可信引用JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次采集时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近输入状态变化时间，Unix秒',
+    KEY `idx_habits_inputs_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人反馈与明确习惯命令相关的有界相处习惯学习输入队列';
+
+CREATE TABLE IF NOT EXISTS `mlw_habits_preferences` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '交流习惯槽位的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '偏好所属的可信主人标识，不随主人配置变更迁移',
+    situation VARCHAR(191) NOT NULL COMMENT '固定交流场景枚举',
+    dimension VARCHAR(191) NOT NULL COMMENT '固定交流偏好维度枚举',
+    status VARCHAR(191) NOT NULL COMMENT 'active已生效pending待确认或cleared已清除状态',
+    revision BIGINT NOT NULL COMMENT '偏好记录变更版本',
+    payload LONGTEXT NOT NULL COMMENT '有界偏好枚举与可信来源引用JSON，不保存隐藏推理',
+    created DOUBLE NOT NULL COMMENT '首次建立偏好记录时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近偏好状态变化时间，Unix秒',
+    UNIQUE KEY `idx_habits_preferences_slot` (owner_id,situation,dimension)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人明确确认或经反馈复核的有限交流习惯，不构建关系分数';
+
+CREATE TABLE IF NOT EXISTS `mlw_habits_audit` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '习惯操作审计的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际操作所属的可信主人标识',
+    preference_id VARCHAR(191) NOT NULL COMMENT '关联交流习惯槽位标识',
+    input_id VARCHAR(191) NOT NULL COMMENT '关联可信输入或命令标识',
+    action VARCHAR(191) NOT NULL COMMENT '实际执行的有限习惯操作类型',
+    revision BIGINT NOT NULL COMMENT '操作完成时的偏好版本',
+    payload LONGTEXT NOT NULL COMMENT '有界枚举及来源摘要JSON，不保存原始聊天正文',
+    created DOUBLE NOT NULL COMMENT '审计提交时间，Unix秒',
+    KEY `idx_habits_audit_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人相处习惯的幂等审计，仅保存受限枚举与摘要';
+
+CREATE TABLE IF NOT EXISTS `mlw_followthrough_control` (
+    owner_id VARCHAR(191) PRIMARY KEY COMMENT '可信主人标识，原主人状态不转移给新主人',
+    revision BIGINT NOT NULL DEFAULT 0 COMMENT '回告控制状态的乐观锁版本',
+    budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '复查预算所属日期起点，Unix秒',
+    daily_checks BIGINT NOT NULL DEFAULT 0 COMMENT '当日已预留的任务状态复查次数',
+    last_check DOUBLE NOT NULL DEFAULT 0 COMMENT '最近预留状态复查时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近控制状态更新时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='主人承诺回告的持久复查预算，不增加原任务权限';
+
+CREATE TABLE IF NOT EXISTS `mlw_followthrough_items` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '跟进任务的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '承诺事项所属的可信主人标识',
+    status VARCHAR(191) NOT NULL COMMENT '跟进事项当前执行与回告状态',
+    revision BIGINT NOT NULL COMMENT '事项状态变化版本',
+    payload LONGTEXT NOT NULL COMMENT '既有任务引用与核验状态JSON，不存任意操作指令',
+    created DOUBLE NOT NULL COMMENT '首次绑定跟进事项时间，Unix秒',
+    updated DOUBLE NOT NULL COMMENT '最近事项状态变化时间，Unix秒',
+    KEY `idx_followthrough_items_owner` (owner_id,status,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='绑定真实既有任务的主人承诺回告，尝试和生成不等于完成';
+
+CREATE TABLE IF NOT EXISTS `mlw_followthrough_receipts` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '可信操作或真实回执的稳定标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '实际回执所属的可信主人标识',
+    item_id VARCHAR(191) NOT NULL COMMENT '关联承诺回告事项标识',
+    kind VARCHAR(191) NOT NULL COMMENT '可信操作或回执类型',
+    body_digest VARCHAR(191) NOT NULL COMMENT '实际操作或消息内容摘要，用于幂等与冲突校验',
+    created DOUBLE NOT NULL COMMENT '回执确认时间，Unix秒',
+    KEY `idx_followthrough_receipts_owner` (owner_id,created)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='真实任务绑定与回告回执的幂等记录，不存私聊正文';
+
+CREATE TABLE IF NOT EXISTS `mlw_followthrough_sources` (
+    id VARCHAR(191) PRIMARY KEY COMMENT '真实创建任务的可信来源绑定标识',
+    provider VARCHAR(191) NOT NULL COMMENT '创建任务的固定MCP服务类型',
+    task_id VARCHAR(191) NOT NULL COMMENT '由真实任务创建结果返回的标识',
+    owner_id VARCHAR(191) NOT NULL COMMENT '创建任务时经核验的可信主人标识',
+    scope VARCHAR(191) NOT NULL COMMENT '创建任务时经核验的主人私聊场合',
+    operation VARCHAR(191) NOT NULL COMMENT '实际已执行的许可任务创建操作',
+    source_signature VARCHAR(191) NOT NULL COMMENT '任务创建时MCP服务配置签名，服务变更使旧任务不可复用',
+    created DOUBLE NOT NULL COMMENT '可信创建绑定确认时间，Unix秒'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='真实任务创建时的主人与MCP服务绑定，防止服务切换复用旧任务标识';
