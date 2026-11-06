@@ -1,4 +1,4 @@
-"""Bounded current topic references, without retaining conversation text."""
+"""Bounded topic references and owner-private mention history without chat text."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,43 @@ import sqlite3
 from .mysql_compat import MySQLCompatConnection
 from .projects_store import _hex, _int, _now, _owner, references
 from .sql_logging import connect_sqlite
+
+
+MAX_PRIOR_MENTIONS = 32
+MENTION_TTL = 30 * 86400
+
+
+def _payload(raw, now):
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        data = {}
+    if isinstance(data, list):  # Legacy focus-only format.
+        data = {"refs": data}
+    if not isinstance(data, dict):
+        data = {}
+    history = data.get("prior_mentions", {})
+    live = {}
+    if isinstance(history, dict) and len(history) <= MAX_PRIOR_MENTIONS:
+        for fingerprint, timestamp in history.items():
+            if type(timestamp) not in (float, int):
+                continue
+            try:
+                fingerprint, timestamp = _hex(fingerprint), _now(timestamp)
+            except ValueError:
+                continue
+            if 0 < timestamp <= now < timestamp + MENTION_TTL:
+                live[fingerprint] = timestamp
+    mentioned_at = data.get("mentioned_at")
+    try:
+        mentioned_at = _now(mentioned_at) if mentioned_at is not None else 0
+    except ValueError:
+        mentioned_at = 0
+    try:
+        focus = references(data.get("refs", []), empty=True)
+    except ValueError:
+        focus = []
+    return {"refs": focus, "mentioned_at": mentioned_at, "prior_mentions": live}
 
 
 class ReferenceStore:
@@ -54,10 +91,11 @@ class ReferenceStore:
         owner, now = _owner(owner), _now(now)
         rows = self._read("SELECT * FROM reference_control WHERE owner_id=?", (owner,))
         row = rows[0] if rows else {"owner_id": owner, "revision": 0, "last_input": "", "payload": "[]", "expires": 0, "updated": 0}
-        payload = json.loads(row.pop("payload"))
-        row["focus_refs"] = references(payload.get("refs", []) if isinstance(payload, dict) else payload, empty=True)
-        row["mentioned_at"] = _now(payload.get("mentioned_at", 0)) if isinstance(payload, dict) else 0
-        row["active"] = bool(row["focus_refs"] and row["expires"] > now)
+        payload = _payload(row.pop("payload"), now)
+        row["focus_refs"] = payload["refs"]
+        row["mentioned_at"] = payload["mentioned_at"]
+        row["prior_mentions"] = payload["prior_mentions"]
+        row["active"] = bool(row["focus_refs"] and 0 < row["mentioned_at"] <= now < row["expires"])
         return row
 
     def _receipt(self, owner, receipt, kind, body, now):
@@ -68,19 +106,26 @@ class ReferenceStore:
                          (receipt, owner, kind, body, now))
         return True
 
-    def capture(self, owner, receipt_id, text_digest, *, keep_focus=False, invalidate_focus=False, now=None):
+    def capture(self, owner, receipt_id, text_digest, *, keep_focus=False, invalidate_focus=False,
+                clear_mentions=False, now=None):
         owner, receipt_id, text_digest, now = _owner(owner), _hex(receipt_id), _hex(text_digest), _now(now)
-        if type(keep_focus) is not bool or type(invalidate_focus) is not bool:
+        if any(type(flag) is not bool for flag in (keep_focus, invalidate_focus, clear_mentions)):
             raise ValueError("invalid_focus_policy")
         with self.con:
             row = self._lock(owner)
             if not self._receipt(owner, receipt_id, "input", text_digest, now):
                 return False
+            payload = _payload(row["payload"], now)
+            if not keep_focus:
+                payload.update(refs=[], mentioned_at=0)
+            if clear_mentions:
+                payload["prior_mentions"].clear()
             self.con.execute("UPDATE reference_control SET revision=revision+1,last_input=?,payload=?,expires=?,updated=? WHERE owner_id=?",
-                (receipt_id, row["payload"] if keep_focus else "[]", row["expires"] if keep_focus and not invalidate_focus else 0, now, owner))
+                (receipt_id, json.dumps(payload), row["expires"] if keep_focus and not invalidate_focus else 0, now, owner))
             return True
 
-    def delivered(self, owner, receipt_id, text_digest, refs, *, expected_revision, input_receipt, ttl_seconds, now=None):
+    def delivered(self, owner, receipt_id, text_digest, refs, *, expected_revision, input_receipt,
+                  ttl_seconds, confirmed_refs=None, now=None):
         owner, receipt_id, text_digest = _owner(owner), _hex(receipt_id), _hex(text_digest)
         input_receipt, now = _hex(input_receipt), _now(now)
         _int(expected_revision, 1, 10**12)
@@ -88,12 +133,24 @@ class ReferenceStore:
         if not isinstance(refs, list) or len(refs) > 3:
             raise ValueError("too_many_focus_sources")
         refs = references(refs)
+        if confirmed_refs is None:
+            confirmed_refs = []
+        if not isinstance(confirmed_refs, list) or len(confirmed_refs) > 12:
+            raise ValueError("invalid_confirmed_sources")
+        confirmed_refs = references(confirmed_refs, empty=True)
         with self.con:
             row = self._lock(owner)
             if row["revision"] != expected_revision or row["last_input"] != input_receipt:
                 return False
             if not self._receipt(owner, receipt_id, "send", text_digest, now):
                 return False
+            # Only this chunk's complete anchors can add or refresh history. A
+            # previous chunk's focus or an old backup is never promoted to proof.
+            history = _payload(row["payload"], now)["prior_mentions"]
+            confirmed = {ref["digest"]: now for ref in confirmed_refs}
+            combined = {**confirmed, **{k: v for k, v in history.items() if k not in confirmed}}
+            newest = sorted(combined, key=combined.get, reverse=True)[:MAX_PRIOR_MENTIONS]
+            payload = {"refs": refs, "mentioned_at": now, "prior_mentions": {k: combined[k] for k in newest}}
             self.con.execute("UPDATE reference_control SET revision=revision+1,payload=?,expires=?,updated=? WHERE owner_id=?",
-                (json.dumps({"refs": refs, "mentioned_at": now}, ensure_ascii=False, sort_keys=True), now+ttl_seconds, now, owner))
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True), now+ttl_seconds, now, owner))
             return True

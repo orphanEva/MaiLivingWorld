@@ -13,6 +13,7 @@ from .mcp_runtime import digest
 from .owner import extract_sender, normalize_qq
 from .reference_store import ReferenceStore
 from .unified_expression import _can_say, _records
+from .unified_memory import _source_id
 
 
 _FOLLOWUPS = {"那件事", "那件事呢", "那件事后来呢", "那件事后来怎么样了", "那件事怎么样了", "那个呢", "这个呢",
@@ -25,6 +26,7 @@ _NEUTRAL = {"你好", "嗨", "在吗", "早上好", "晚上好", "早安", "晚�
 _CLARIFY = "[MaiLivingWorld:reference]\n这句短指代暂不能唯一对应仍有效的话题。先简短问清指的是哪件事，不猜对象或编造后续。"
 _CONTINUE = "[MaiLivingWorld:reference]\n这句短指代可承接最近实际提及且来源仍有效的同一话题。只依据本轮允许表达的记忆，不补猜新的进展。"
 _BOILERPLATE = re.compile(r"MaiLivingWorld|主人(?:原话|更正|自述)|未经?独立(?:核实|验证)|作品元数据|未阅读或观看正文|记录于|收到于", re.I)
+_END_PUNCTUATION = " \t\n\r。！？.!?"
 
 
 def _short(text):
@@ -36,6 +38,9 @@ def is_followup(text):
 
 
 def _ref(row):
+    source, _ = _source_id(row["id"])
+    if source != row["source"]:
+        raise ValueError("invalid_reference_source")
     return {"id": row["id"], "digest": source_fingerprint(row), "scope": row["scope"], "sensitivity": row["sensitivity"]}
 
 
@@ -49,6 +54,18 @@ def _anchor(source, spoken):
                 and len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", quote)) >= 8 and not _BOILERPLATE.search(quote)):
             return True
     return False
+
+
+def _confirmed_mentions(records, matched, spoken):
+    """A long-lived mention needs the whole source, unique among eligible candidates."""
+    result = []
+    for row in matched:
+        quote = row["text"].strip().rstrip(_END_PUNCTUATION)
+        if (len(quote) <= 600 and len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", quote)) >= 8
+                and not _BOILERPLATE.search(quote) and spoken.count(quote) == 1
+                and all(quote not in other["text"] for other in records if other["id"] != row["id"])):
+            result.append(_ref(row))
+    return result
 
 
 class ReferenceRuntime:
@@ -110,11 +127,54 @@ class ReferenceRuntime:
         control = bool(message.get("is_command") or isinstance(text, str) and text.startswith("/"))
         keep = bool(_short(text) not in _CLEAR and (not pure or control or is_followup(text) or _short(text) in _NEUTRAL))
         receipt = digest(["input", self.owner(), sender.stream_id, sender.message_id])
-        changed = self.store.capture(self.owner(), receipt, digest(text), keep_focus=keep, invalidate_focus=not pure)
+        changed = self.store.capture(self.owner(), receipt, digest(text), keep_focus=keep, invalidate_focus=not pure,
+                                     clear_mentions=pure and isinstance(text, str) and text.strip() == "/话题 清除")
         if changed:
             self._staged.clear()
             self._stageable = receipt if pure and not control and isinstance(text, str) else ""
         return changed
+
+    def mark_prior_mentions(self, records, context):
+        """Annotate pre-filtered foreground candidates only within the verified current input."""
+        cleaned = []
+        for row in records:
+            if isinstance(row, dict):
+                row = dict(row)
+                row.pop("previously_mentioned", None)
+            cleaned.append(row)
+        if not cleaned or not isinstance(context, dict) or not context.get("sid") or not context.get("mid"):
+            return cleaned
+        if self.trusted({"session_id": context["sid"], "reply_message_id": context["mid"]}) != context:
+            return cleaned
+        owner = self.owner()
+        input_id = digest(["input", owner, context["sid"], context["mid"]])
+        if self._stageable != input_id:
+            return cleaned
+        state = self.store.state(owner)
+        if state["last_input"] != input_id or not state["prior_mentions"]:
+            return cleaned
+        normalized = _records(cleaned)
+        candidates = {}
+        for row in cleaned:
+            if not isinstance(row, dict) or row.get("id") not in normalized or row.get("derived"):
+                continue
+            if not _can_say(normalized[row["id"]], context["scope"], owner):
+                continue
+            try:
+                fingerprint = source_fingerprint(row)
+            except ValueError:
+                continue
+            if fingerprint in state["prior_mentions"]:
+                candidates[row["id"]] = (row, fingerprint)
+        if candidates:
+            current = self.bot._resolve_roots(list(candidates))
+            for ident, (row, fingerprint) in candidates.items():
+                try:
+                    if ident in current and source_fingerprint(current[ident]) == fingerprint:
+                        row["previously_mentioned"] = True
+                except ValueError:
+                    continue
+        return cleaned
 
     def _allowed(self, records, context):
         normalized = _records(records)
@@ -122,14 +182,21 @@ class ReferenceRuntime:
                    and _can_say(normalized[r["id"]], context["scope"], self.owner()) and not r.get("derived")]
         return self.bot._expression_records(allowed, context=context)
 
-    def _resolve(self, refs, context):
+    def _resolve(self, refs, context, *, require_all=True):
+        if not refs:
+            return []
         try:
             found = self.bot._resolve_roots([row["id"] for row in refs])
-            if any(row["id"] not in found or _ref(found[row["id"]]) != row for row in refs):
-                return []
-            records = [found[row["id"]] for row in refs]
+            records = []
+            for ref in refs:
+                try:
+                    record = found[ref["id"]]
+                    if _ref(record) == ref:
+                        records.append(record)
+                except (ValueError, KeyError, TypeError):
+                    continue
             allowed = self._allowed(records, context)
-            return allowed if len(allowed) == len(records) else []
+            return allowed if not require_all or len(allowed) == len(refs) else []
         except (ValueError, KeyError, TypeError):
             return []
 
@@ -162,45 +229,48 @@ class ReferenceRuntime:
         context = self.trusted(kwargs)
         if not context or not isinstance(records, list):
             return
+        previous = self._staged.get(context["sid"])
+        if not records and not previous:
+            return
         state = self.store.state(self.owner())
         receipt = digest(["input", self.owner(), context["sid"], context["mid"]])
         if state["last_input"] != receipt or self._stageable != receipt or _short(context["query"]) in _CLEAR:
             return
-        refs = []
+        candidates = []
         for row in self._allowed(records[:12], context):
             try:
-                ref = _ref(row)
-                if self._resolve([ref], context):
-                    refs.append(ref)
+                candidates.append(_ref(row))
             except (ValueError, KeyError, TypeError):
                 continue
-        if refs:
-            previous = self._staged.get(context["sid"])
-            signature, now = self.signature(), time.monotonic()
-            if (previous and previous["context"] == context and previous["signature"] == signature
-                    and previous["revision"] == state["revision"] and previous["until"] > now):
-                # A Host may run the reply hook again before its next chunk.
-                # This must not erase mentions already confirmed for this reply.
-                merged = {row["id"]: row for row in previous["mentioned"]+refs+previous["refs"]}
-                previous["refs"] = list(merged.values())[:12]
-            else:
-                self._staged[context["sid"]] = {"context": dict(context), "signature": signature, "refs": refs,
-                    "revision": state["revision"], "input_receipt": receipt, "mentioned": [], "until": now+90}
-            while len(self._staged) > 16:
-                self._staged.pop(next(iter(self._staged)))
+        refs = [_ref(row) for row in self._resolve(candidates, context, require_all=False)]
+        if not refs and not previous:
+            return
+        signature, now = self.signature(), time.monotonic()
+        if (previous and previous["context"] == context and previous["signature"] == signature
+                and previous["revision"] == state["revision"] and previous["until"] > now):
+            # A repeated hook replaces unsent candidates while retaining topics
+            # actually delivered in prior chunks of the same reply.
+            self._staged[context["sid"]] = {**previous, "refs": refs}
+        elif refs:
+            self._staged[context["sid"]] = {"context": dict(context), "signature": signature, "refs": refs,
+                "revision": state["revision"], "input_receipt": receipt, "mentioned": [], "until": now+90}
+        else:
+            self._staged.pop(context["sid"], None)
+        while len(self._staged) > 16:
+            self._staged.pop(next(iter(self._staged)))
 
     async def sent(self, kwargs):
         message = kwargs.get("message") if isinstance(kwargs, dict) else None
         sid = message.get("session_id") if isinstance(message, dict) else None
         expected = self._staged.get(sid) if isinstance(sid, str) else None
-        if expected is None:
+        if not expected or not expected["refs"]:
             return False
         async with self._send_lock:
             if self._staged.get(sid) is not expected:
                 return False
-            return await self._sent(kwargs)
+            return await self._sent(kwargs, expected)
 
-    async def _sent(self, kwargs):
+    async def _sent(self, kwargs, expected):
         if not self.enabled():
             return False
         signature, owner = self.signature(), self.owner()
@@ -208,7 +278,7 @@ class ReferenceRuntime:
         if not receipt or not self.enabled() or signature != self.signature():
             return False
         staged = self._staged.get(receipt["sid"])
-        if not staged or staged["signature"] != signature or staged["until"] <= time.monotonic():
+        if staged is not expected or staged["signature"] != signature or staged["until"] <= time.monotonic():
             return False
         context = self.trusted({"session_id": receipt["sid"], "reply_message_id": staged["context"]["mid"]})
         if context != staged["context"]:
@@ -225,7 +295,8 @@ class ReferenceRuntime:
         refs = list(mentioned.values())[:3]
         applied = self.store.delivered(owner, digest(["send", owner, receipt["receipt_id"]]), receipt["text_digest"],
             refs, expected_revision=staged["revision"], input_receipt=staged["input_receipt"],
-            ttl_seconds=self.bot.config.reference.ttl_hours*3600)
+            ttl_seconds=self.bot.config.reference.ttl_hours*3600,
+            confirmed_refs=_confirmed_mentions(records, matched, receipt["text"]))
         if applied:
             state = self.store.state(owner)
             if (self._staged.get(receipt["sid"]) is staged and state["revision"] == staged["revision"]+1
@@ -243,4 +314,4 @@ class ReferenceRuntime:
         records = self._resolve(state["focus_refs"], context) if self._live(state) else []
         return {"success": True, "data": {"active": bool(records), "source_count": len(records),
             "status": resolved["status"], "expires": state["expires"] if records else 0},
-            "instructions": "仅记录可验证实际提及的话题引用，不代表双方认同或有了新进展。主人可完整私聊 /话题 清除；此命令只清当前承接，不删除原记忆。"}
+            "instructions": "投递记录只支持曾在私聊提过相关内容。主人可完整私聊 /话题 清除，同时清空当前承接和历史提及标记，保留原记忆。"}

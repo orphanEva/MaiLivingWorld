@@ -191,13 +191,17 @@ def reply(request):
         self.assertEqual(result["cases"][0]["turns"][2]["checks"], [{"id": "call_limit", "passed": False}])
 
     async def test_timeout_and_adapter_error_are_bounded_redacted_and_never_retried(self):
-        for body, expected in (("import time\ndef reply(request): time.sleep(30)\n", "adapter_timeout"),
-                               ("def reply(request): raise RuntimeError('secret-token-and-message')\n", "adapter_failed")):
+        # The error case must get past a cold interpreter start to exercise error redaction.
+        cases = (
+            ("import time\ndef reply(request): time.sleep(30)\n", "adapter_timeout", .3),
+            ("def reply(request): raise RuntimeError('secret-token-and-message')\n", "adapter_failed", 5),
+        )
+        for body, expected, timeout in cases:
             with tempfile.TemporaryDirectory() as directory:
                 runner, environment = self.adapter(directory, body)
                 with environment:
                     started = time.monotonic()
-                    result = await evaluation.evaluate(payload(), runner=runner, timeout=.3)
+                    result = await evaluation.evaluate(payload(), runner=runner, timeout=timeout)
                     self.assertLess(time.monotonic()-started, 5)
             self.assertFalse(result["passed"])
             self.assertEqual(result["calls"], 1)

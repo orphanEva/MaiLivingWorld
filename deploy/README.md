@@ -1,5 +1,7 @@
 # Docker MCP 网关
 
+v0.26 可随 WebUI ZIP 升级。保留现有插件数据卷以及 SQLite 或 MySQL 连接配置，在已绑定主人的环境开启统一心智，设为 `active` 模式，再开启 `reference.enabled`，即可跨 Docker 重启保留她亲自向主人提过的资料版本。此功能使用插件自己的话题账本。开启步骤与测试例子见[长期伴侣说明](COMPANION.md)和[连续对话验收](EVALUATION.md)。
+
 v0.25 的回复协调、事件感受和建议/修复归档继续使用原插件及两个网关，无新增服务、端口或DDL。四个新开关默认关闭，配置30节197字段、95文件包，仍为二十一SQLite库/82张MySQL表；保留原持久卷即可升级。情绪与归档元数据随已有账本备份，恢复后继续核验时间、来源和遗忘边界。合并配置与真实宿主验收见 [长期伴侣说明](COMPANION.md)、[连续对话验收](EVALUATION.md) 和 [状态备份](BACKUP.md)。
 
 v0.24 增加默认关闭的 `[repair]` 自身表达修复，继续使用原插件及两个网关，不增加服务或端口。需保留插件状态持久卷；SQLite新增 `repair.sqlite3`，MySQL新增 `repair_control/items/inputs/receipts` 四表，合计二十一库/82表。配置30节193字段、92文件发布包。核验实际发送和主人纠正后，经两阶段复核保存有限的表达修复，沿用共享模型预算；不用MCP查询代替主人证据。开启和宿主验收见 [长期伴侣说明](COMPANION.md)、[连续对话验收](EVALUATION.md)、[状态备份](BACKUP.md)。

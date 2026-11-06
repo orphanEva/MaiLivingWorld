@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from MaiLivingWorld.growth_store import source_fingerprint
 from MaiLivingWorld.reference_runtime import ReferenceRuntime, is_followup
 from MaiLivingWorld.self_state import SelfState
 from MaiLivingWorld.tool_store import ToolStore
@@ -268,6 +269,105 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.sent(self.first["text"], group="22222222"))
         self.assertTrue(await self.sent(self.first["text"]))
         self.assertFalse(await self.sent(self.first["text"]))
+
+    def marked(self, request, rows):
+        event = request["message"]
+        context = self.bot._unified.context({"session_id": event["session_id"], "reply_message_id": event["message_id"]})
+        return [row["id"] for row in self.runtime.mark_prior_mentions(rows, context) if row.get("previously_mentioned")]
+
+    async def test_only_actual_owner_delivery_confers_a_mention_across_session_and_restart(self):
+        rows = [{**self.first, "previously_mentioned": True}, self.second]
+        first = self.capture()
+        self.runtime.stage(first, rows)
+        self.assertEqual(self.marked(first, rows), [])
+        self.assertFalse(await self.sent(self.first["text"], success=False))
+        self.assertEqual(self.marked(first, rows), [])
+        self.assertTrue(await self.sent(self.first["text"]))
+        self.runtime.close()
+        self.runtime = ReferenceRuntime(self.bot)
+        new = self.capture(sid="new-private", mid="new", text="换个话题吧")
+        self.assertEqual(self.runtime.store.state(OWNER)["focus_refs"], [])
+        self.assertEqual(self.marked(new, rows), [self.first["id"]])
+        self.assertEqual(self.marked(first, rows), [])
+        self.assertEqual(self.marked(self.capture(mid="group", group="22222222"), rows), [])
+        self.assertEqual(self.marked(self.capture(sid="other", mid="third", uid=OTHER), rows), [])
+        self.bot.config.reference.enabled = False
+        self.assertEqual(self.marked(new, rows), [])
+        self.assertTrue(rows[0]["previously_mentioned"])
+
+    async def test_mention_expiration_source_replacement_and_explicit_clear(self):
+        await self.focus()
+        later = self.capture(mid="later", text="聊聊编程")
+        self.assertEqual(self.marked(later, [self.first]), [self.first["id"]])
+        with patch("time.time", return_value=time.time()+31*86400):
+            self.assertEqual(self.marked(later, [self.first]), [])
+        revised = self.source("first", "我已经取消原来的安排，周末准备在家看书。")
+        self.assertEqual(self.marked(later, [self.first]), [])
+        self.assertEqual(self.marked(later, [revised]), [])
+        self.runtime.stage(later, [revised])
+        self.assertTrue(await self.sent(revised["text"], mid="new-send"))
+        self.assertIn(source_fingerprint(revised), self.runtime.store.state(OWNER)["prior_mentions"])
+        self.capture(mid="clear", text="/话题 清除")
+        self.assertEqual(self.runtime.store.state(OWNER)["prior_mentions"], {})
+        self.assertEqual(self.marked(self.capture(mid="again", text="编程"), [revised]), [])
+
+    async def test_shared_or_partial_anchor_cannot_establish_durable_mentions(self):
+        shared = "明天下午我准备参加一个编程岗位面试"
+        extra = self.source("other-interview", shared+"，第二天再确认地点。")
+        context = self.capture()
+        self.runtime.stage(context, [self.first, extra])
+        self.assertTrue(await self.sent(shared))
+        self.assertEqual(self.runtime.store.state(OWNER)["prior_mentions"], {})
+        self.assertEqual(len(self.runtime.store.state(OWNER)["focus_refs"]), 2)
+        self.assertTrue(await self.sent(extra["text"], mid="specific"))
+        self.assertEqual(self.marked(context, [self.first, extra]), [extra["id"]])
+
+    async def test_repeat_hook_replaces_unsent_approvals_and_keeps_only_previous_deliveries(self):
+        context = self.capture()
+        self.runtime.stage(context, [self.first, self.second])
+        self.runtime.stage(context, [self.first])
+        self.assertFalse(await self.sent(self.second["text"], mid="dropped"))
+        self.assertTrue(await self.sent(self.first["text"], mid="part-one"))
+        self.runtime.stage(context, [])
+        self.assertFalse(await self.sent(self.second["text"], mid="empty"))
+        self.runtime.stage(context, [self.second])
+        self.assertFalse(await self.sent(self.first["text"], mid="old-approval"))
+        self.assertTrue(await self.sent(self.second["text"], mid="part-two"))
+        self.assertEqual(len(self.runtime.store.state(OWNER)["focus_refs"]), 2)
+
+    async def test_staging_reads_roots_once_and_retains_only_current_allowed_candidates(self):
+        hidden = self.source("private-book", "我们准备在登山露营结束之后讨论一本探险小说。")
+        stale = self.source("old-topic", "这次冬季徒步行程预计十二月出发。")
+        self.source("old-topic", "这次冬季徒步行程已经取消。")
+        context = self.capture()
+        # This new restriction is only exposed during source revalidation.
+        calls = 0
+        def protected(rows, context=None):
+            nonlocal calls
+            calls += 1
+            return rows if calls == 1 else [row for row in rows if row["id"] != hidden["id"]]
+        self.bot._expression_records = protected
+        with patch.object(self.bot, "_resolve_roots", wraps=self.bot._resolve_roots) as lookup:
+            legacy = {**self.first, "id": "story:unsupported/legacy-key", "source": "story"}
+            self.runtime.stage(context, [self.first, legacy, stale, hidden])
+            lookup.assert_called_once_with([self.first["id"], stale["id"], hidden["id"]])
+        self.assertEqual(calls, 2)
+        self.assertFalse(await self.sent(stale["text"], mid="stale"))
+        self.assertFalse(await self.sent(hidden["text"], mid="protected"))
+        self.assertTrue(await self.sent(self.first["text"], mid="valid"))
+        self.assertEqual(self.marked(context, [self.first]), [self.first["id"]])
+
+    async def test_repeat_hook_during_verification_rejects_pending_chunk_even_with_same_anchor(self):
+        context = self.capture()
+        self.runtime.stage(context, [self.first])
+        async def replace_during_verification(*args, **kwargs):
+            self.runtime.stage(context, [self.first, self.second])
+            return {"stream_id": "private-one"}
+        self.bot.ctx.chat.get_stream_by_user_id.side_effect = replace_during_verification
+        self.assertFalse(await self.sent(self.first["text"], mid="in-flight"))
+        self.assertEqual(self.runtime.store.state(OWNER)["prior_mentions"], {})
+        self.bot.ctx.chat.get_stream_by_user_id.side_effect = None
+        self.assertTrue(await self.sent(self.first["text"], mid="new-approval"))
 
     def test_only_self_contained_short_followups_match(self):
         for text in ("那件事", "后来呢？", "继续说。", "上次那件事"):

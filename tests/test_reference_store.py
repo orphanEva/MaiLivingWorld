@@ -1,10 +1,11 @@
 """Source-only current topic persistence and receipt compare-and-swap."""
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from MaiLivingWorld.mcp_runtime import digest
-from MaiLivingWorld.reference_store import ReferenceStore
+from MaiLivingWorld.reference_store import MAX_PRIOR_MENTIONS, MENTION_TTL, ReferenceStore
 
 OWNER, OTHER = "12345678", "87654321"
 
@@ -78,6 +79,69 @@ class ReferenceChecks:
         self.assertFalse(state["active"])
         db.capture(OWNER, digest("followup"), digest("later"), keep_focus=True, now=105)
         self.assertFalse(db.state(OWNER, now=106)["active"])
+
+    def test_long_term_mentions_survive_new_topic_but_clear_does_not_revive_on_replay(self):
+        db = self.store()
+        db.capture(OWNER, digest("input"), digest("question"), now=100)
+        first = reference()
+        self.assertTrue(db.delivered(OWNER, digest("sent"), digest("text"), [first], confirmed_refs=[first],
+            expected_revision=1, input_receipt=digest("input"), ttl_seconds=3600, now=101))
+        db.capture(OWNER, digest("next"), digest("topic change"), now=103)
+        reader = self.store()
+        state = reader.state(OWNER, now=104)
+        self.assertEqual(state["focus_refs"], [])
+        self.assertEqual(state["prior_mentions"], {first["digest"]: 101})
+        self.assertEqual(reader.state(OTHER, now=104)["prior_mentions"], {})
+        db.capture(OWNER, digest("clear"), digest("clear command"), clear_mentions=True, now=105)
+        self.assertFalse(db.delivered(OWNER, digest("sent"), digest("text"), [first], confirmed_refs=[first],
+            expected_revision=4, input_receipt=digest("clear"), ttl_seconds=3600, now=106))
+        self.assertEqual(reader.state(OWNER, now=107)["prior_mentions"], {})
+
+    def test_legacy_list_and_dict_support_focus_without_long_term_proof(self):
+        db = self.store()
+        self.assertTrue(self.focus(db))
+        for i, payload in enumerate(([reference()], {"refs": [reference()], "mentioned_at": 101})):
+            with db.con:
+                db.con.execute("UPDATE reference_control SET payload=? WHERE owner_id=?", (json.dumps(payload), OWNER))
+            self.assertTrue(db.capture(OWNER, digest(["neutral", i]), digest("neutral"), keep_focus=True, now=102+i))
+            state = db.state(OWNER, now=104)
+            self.assertEqual(state["focus_refs"], [reference()])
+            self.assertEqual(state["prior_mentions"], {})
+        for raw in ("null", "not JSON", json.dumps({"refs": [reference()], "mentioned_at": None,
+                                                     "prior_mentions": {"a"*64: None, "b"*64: "101"}})):
+            with db.con:
+                db.con.execute("UPDATE reference_control SET payload=? WHERE owner_id=?", (raw, OWNER))
+            state = db.state(OWNER, now=104)
+            self.assertEqual(state["mentioned_at"], 0)
+            self.assertFalse(state["active"])
+            self.assertEqual(state["prior_mentions"], {})
+
+    def test_long_term_mentions_limit_expiry_and_clock_rollback(self):
+        db = self.store()
+        db.capture(OWNER, digest("input"), digest("question"), now=100)
+        refs = []
+        for i in range(MAX_PRIOR_MENTIONS+1):
+            ref = {**reference(), "id": "tool:observation:"+digest(["id", i]), "digest": digest(["version", i])}
+            self.assertTrue(db.delivered(OWNER, digest(["send", i]), digest(["text", i]), [ref], confirmed_refs=[ref],
+                expected_revision=i+1, input_receipt=digest("input"), ttl_seconds=3600, now=101+i))
+            refs.append(ref)
+        last_send = 101 + MAX_PRIOR_MENTIONS
+        state = db.state(OWNER, now=last_send)
+        self.assertEqual(set(state["prior_mentions"]), {r["digest"] for r in refs[1:]})
+        self.assertEqual(db.state(OWNER, now=last_send+MENTION_TTL-1)["prior_mentions"], {refs[-1]["digest"]: last_send})
+        self.assertEqual(db.state(OWNER, now=last_send+MENTION_TTL)["prior_mentions"], {})
+        self.assertEqual(db.state(OWNER, now=100)["prior_mentions"], {})
+        self.assertEqual(db.state(OWNER, now=last_send)["revision"], state["revision"])
+
+    def test_later_chunk_cannot_refresh_unrepeated_history(self):
+        db = self.store()
+        db.capture(OWNER, digest("input"), digest("question"), now=100)
+        first, second = reference(), {**reference("c"), "digest": "d"*64}
+        self.assertTrue(db.delivered(OWNER, digest("one"), digest("text one"), [first], confirmed_refs=[first],
+            expected_revision=1, input_receipt=digest("input"), ttl_seconds=3600, now=101))
+        self.assertTrue(db.delivered(OWNER, digest("two"), digest("text two"), [first, second], confirmed_refs=[second],
+            expected_revision=2, input_receipt=digest("input"), ttl_seconds=3600, now=110))
+        self.assertEqual(db.state(OWNER, now=111)["prior_mentions"], {first["digest"]: 101, second["digest"]: 110})
 
 
 class ReferenceStoreTests(ReferenceChecks, unittest.TestCase):

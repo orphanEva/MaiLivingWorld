@@ -382,11 +382,11 @@ def seed_advice(store):
 
 def seed_reference(store):
     owner, other = "12345678", "87654321"
-    refs = [{"id": "brain:fact:F"+str(i), "digest": "a"*64, "scope": "private:"+owner, "sensitivity": "personal"}
-            for i in range(3)]
+    refs = [{"id": "brain:fact:F"+str(i), "digest": letter*64, "scope": "private:"+owner, "sensitivity": "personal"}
+            for i, letter in enumerate("abc")]
     store.capture(owner, "a"*64, "b"*64, now=100)
     if not store.delivered(owner, "c"*64, "d"*64, refs, expected_revision=1,
-                           input_receipt="a"*64, ttl_seconds=3600, now=101):
+                           input_receipt="a"*64, ttl_seconds=3600, now=101, confirmed_refs=[refs[1]]):
         raise AssertionError("expected real referenced discussion")
     if not store.capture(owner, "e"*64, "f"*64, keep_focus=False, now=102):
         raise AssertionError("expected clear of the old topic")
@@ -394,7 +394,7 @@ def seed_reference(store):
     refs = [{**ref, "scope": "private:"+other} for ref in refs]
     store.capture(other, "1"*64, "2"*64, now=103)
     if not store.delivered(other, "3"*64, "4"*64, refs, expected_revision=1,
-                           input_receipt="1"*64, ttl_seconds=3600, now=104):
+                           input_receipt="1"*64, ttl_seconds=3600, now=104, confirmed_refs=[refs[2]]):
         raise AssertionError("expected another owner discussion binding")
     store.capture(other, "5"*64, "6"*64, keep_focus=True, now=105)
     paused = "11223344"
@@ -436,6 +436,7 @@ def assert_v21_restore(case, store, expected):
     else:
         state = store.state(owner, now=130)
         case.assertEqual(state["focus_refs"], [])
+        case.assertEqual(state["prior_mentions"], {"b"*64: 101})
         case.assertFalse(state["active"])
         case.assertFalse(store.capture(owner, "a"*64, "b"*64, keep_focus=True, now=131))
         refs = [{"id": "brain:fact:F0", "digest": "a"*64, "scope": "private:"+owner, "sensitivity": "personal"}]
@@ -448,7 +449,9 @@ def assert_v21_restore(case, store, expected):
         case.assertEqual(store.state("87654321", now=133)["updated"], 105)
         case.assertEqual(store.state("87654321", now=133)["expires"], 3704)
         case.assertFalse(store.state("87654321", now=3705)["active"])
+        case.assertEqual(store.state("87654321", now=3705)["prior_mentions"], {"c"*64: 104})
         paused = store.state("11223344", now=133)
+        case.assertEqual(paused["prior_mentions"], {})
         case.assertEqual(len(paused["focus_refs"]), 3)
         case.assertEqual(paused["mentioned_at"], 107)
         case.assertEqual(paused["expires"], 0)
@@ -737,11 +740,13 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.25")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.26")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
         self.assertIsNot(backup.V25_LEDGERS, backup.V24_LEDGERS)
+        self.assertEqual(backup.V26_LEDGERS, backup.V25_LEDGERS)
+        self.assertIsNot(backup.V26_LEDGERS, backup.V25_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -762,7 +767,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1163,6 +1168,40 @@ class SQLiteBackupTests(unittest.TestCase):
             for store in stores:
                 store.close()
 
+    def test_v25_reference_payload_restores_focus_without_inventing_prior_mentions(self):
+        from MaiLivingWorld.reference_store import ReferenceStore
+        owners = ("12345678", "87654321")
+        store = ReferenceStore(self.source/"reference.sqlite3")
+        ref = {"id": "brain:fact:F1", "digest": "b"*64, "scope": "public", "sensitivity": "public"}
+        try:
+            # Both the historical list and the later focus object lack per-source delivery proof.
+            with store.con:
+                for owner, old_payload in zip(owners, ([ref], {"refs": [ref], "mentioned_at": 101})):
+                    store.con.execute("INSERT INTO reference_control(owner_id,revision,last_input,payload,expires,updated) "
+                        "VALUES (?,?,?,?,?,?)", (owner, 2, "a"*64, json.dumps(old_payload), 3701, 101))
+        finally:
+            store.close()
+        self.archive_now()
+        def old_catalog(members):
+            manifest = json.loads(members["manifest.json"])
+            manifest["catalog"] = "v0.25"
+            members["manifest.json"] = json.dumps(manifest).encode()
+        old = self.tamper(old_catalog)
+        self.assertEqual(backup.verify_archive(old)["catalog"], "v0.25")
+        backup.restore_sqlite(old, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        restored = ReferenceStore(self.target/"reference.sqlite3")
+        try:
+            for owner, mentioned_at, receipt in zip(owners, (0, 101), ("c"*64, "d"*64)):
+                with self.subTest(owner=owner):
+                    state = restored.state(owner, now=102)
+                    self.assertEqual(state["focus_refs"], [ref])
+                    self.assertEqual(state["mentioned_at"], mentioned_at)
+                    self.assertEqual(state["prior_mentions"], {})
+                    self.assertTrue(restored.capture(owner, receipt, "f"*64, now=103))
+                    self.assertEqual(restored.state(owner, now=104)["prior_mentions"], {})
+        finally:
+            restored.close()
+
     def test_v22_real_attention_payload_restores_without_invented_workload(self):
         from MaiLivingWorld.attention_store import AttentionStore
         owner = "12345678"
@@ -1220,7 +1259,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.25")
+        self.assertEqual(current["catalog"], "v0.26")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1671,23 +1710,25 @@ class MySQLBackupTests(unittest.TestCase):
     def test_v23_mysql_archive_requires_matching_old_schema(self):
         self.check_same_schema_archive("v0.23")
 
-    def test_v24_mysql_catalog_restores_to_same_current_schema(self):
+    def test_v24_and_v25_mysql_catalogs_restore_to_same_current_schema(self):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
-        current = Path(self.temp.name)/"v25-complete.zip"
+        current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        renamed = Path(self.temp.name)/"v24.zip"
-        with zipfile.ZipFile(current) as source, zipfile.ZipFile(renamed, "w") as destination:
-            for info in source.infolist():
-                data = source.read(info)
-                if info.filename == "manifest.json":
-                    manifest = json.loads(data)
-                    manifest["catalog"] = "v0.24"
-                    data = json.dumps(manifest).encode()
-                destination.writestr(info, data)
-        target = FakeMySQL({table: [] for table in backup.TABLES})
-        restored = backup.restore_mysql(renamed, self.config, apply=True, writers_stopped=True,
-                                         confirm=backup.CONFIRM, connect=lambda _: target)
-        self.assertEqual(restored["tables"], 82)
+        for catalog in ("v0.24", "v0.25"):
+            with self.subTest(catalog=catalog):
+                archive = Path(self.temp.name)/(catalog+".zip")
+                with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
+                    for info in source.infolist():
+                        data = source.read(info)
+                        if info.filename == "manifest.json":
+                            manifest = json.loads(data)
+                            manifest["catalog"] = catalog
+                            data = json.dumps(manifest).encode()
+                        destination.writestr(info, data)
+                target = FakeMySQL({table: [] for table in backup.TABLES})
+                restored = backup.restore_mysql(archive, self.config, apply=True, writers_stopped=True,
+                                                confirm=backup.CONFIRM, connect=lambda _: target)
+                self.assertEqual(restored["tables"], 82)
 
     def check_same_schema_archive(self, catalog):
         rows = {table: [] for tables in backup.CATALOGS[catalog].values() for table in tables}
@@ -1751,7 +1792,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.25")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.26")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

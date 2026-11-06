@@ -117,6 +117,34 @@ class UnifiedRevisionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(identity.calls,2)
                 self.assertEqual(runtime.last_status,"ready")
 
+    async def test_removing_mention_evidence_invalidates_owner_reply_during_generation_and_after_cache(self):
+        runtime, config, identity = self.setup_runtime()
+        runtime.capture({"platform": "qq", "session_id": "owner-stream", "message_id": "owner-msg",
+            "account_id": "99999999", "processed_plain_text": "展演在哪里",
+            "message_info": {"user_info": {"user_id": OWNER}}}, private_users=[OWNER], group_ids=[])
+        root = {"id": "story:exhibition", "source": "story", "kind": "story", "scope": "public",
+                "text": "湖滨的露天展演这个周末开场", "subject_id": "", "sensitivity": "public",
+                "evidence_status": "source_metadata", "previously_mentioned": True}
+        result = {"content": json.dumps({"behavior": "warm", "decisions": [{"id": root["id"], "mode": "say"}]})}
+        async def invoke(generate):
+            return await runtime.reply_hint({"session_id": "owner-stream"}, config,
+                recall=lambda query: [dict(root)], generate=generate, task_name="utils", timezone="Asia/Shanghai")
+        async def clear_history(*args, **kwargs):
+            root.pop("previously_mentioned")
+            return result
+        self.assertEqual(await invoke(clear_history), "")
+        self.assertEqual(runtime.last_status, "context_changed")
+        root["previously_mentioned"] = True
+        generate = AsyncMock(return_value=result)
+        self.assertIn("mention_history", await invoke(generate))
+        self.assertIn("mention_history", await invoke(generate))
+        self.assertEqual(generate.await_count, 1)
+        root.pop("previously_mentioned")
+        refreshed = await invoke(generate)
+        self.assertIn(root["text"], refreshed)
+        self.assertNotIn("mention_history", refreshed)
+        self.assertEqual(generate.await_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

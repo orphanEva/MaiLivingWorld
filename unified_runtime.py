@@ -29,7 +29,8 @@ def _memory_version(items):
     return hashlib.sha256(json.dumps(
         [{key: memory.get(key) for key in (
             "id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
-            "timestamp", "source", "kind", "sources", "revision", "recently_asked")}
+            "timestamp", "source", "kind", "sources", "revision", "correction_id",
+            "recently_asked", "previously_mentioned", "derived")}
          for memory in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -40,7 +41,7 @@ class UnifiedRuntime:
         self.latest_private_only = False
         self._contexts: dict[tuple[str, str], dict] = {}
         self._private: dict[str, str] = {}
-        self._cache: dict[tuple, tuple[float, str]] = {}
+        self._cache: dict[tuple, tuple[float, str, tuple[str, ...]]] = {}
         self._lock = asyncio.Lock()
         self._generation = 0
         self.last_status = "idle"
@@ -131,7 +132,7 @@ class UnifiedRuntime:
         return hint + ("\n\n" + style if style else "")
 
     async def reply_hint(self, kwargs: dict, config, *, recall, generate,
-                         task_name: str, timezone: str) -> str:
+                         task_name: str, timezone: str, direct_ids: set[str] | None = None) -> str:
         context = self.context(kwargs)
         if context is None:
             self.last_status = "unverified_context"
@@ -160,6 +161,8 @@ class UnifiedRuntime:
             cached = self._cache.get(key)
             if cached and now_mono - cached[0] <= 90:
                 self.last_status = "cached"
+                if direct_ids is not None:
+                    direct_ids.update(cached[2])
                 return base + ("\n\n" + cached[1] if cached[1] else "")
             audience = {"audience_scope": context["scope"], "speaker_id": context["speaker_id"],
                         "is_owner": context["speaker_id"] == owner_id}
@@ -189,6 +192,7 @@ class UnifiedRuntime:
                 )
 
             approved = ""
+            direct = ()
             try:
                 response = await request(build_deliberation_prompt(memories, query=context["query"], **audience),
                                          interval=config.min_interval_seconds)
@@ -214,6 +218,7 @@ class UnifiedRuntime:
                     self.last_status = "observed" if config.mode == "observe" else "ready"
                     if config.mode == "active":
                         approved = expression_hint(plan)
+                        direct = tuple(item["id"] for item in plan["memories"] if item["mode"] == "say")
             except _ContextChanged:
                 self.last_status = "context_changed"
                 return ""
@@ -229,7 +234,9 @@ class UnifiedRuntime:
             self._cache = {k: v for k, v in self._cache.items() if now_mono - v[0] <= 90}
             if len(self._cache) >= 200:
                 self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = (now_mono, approved)
+            self._cache[key] = (now_mono, approved, direct)
+            if direct_ids is not None:
+                direct_ids.update(direct)
             return base + ("\n\n" + approved if approved else "")
 
     async def proactive_hint(self, context: dict, config, *, recall, generate,

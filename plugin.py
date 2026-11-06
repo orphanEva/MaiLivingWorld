@@ -60,7 +60,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.25.0",
+        default="0.26.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -366,7 +366,7 @@ class Advice(PluginConfigBase):
 
 class Reference(PluginConfigBase):
     __ui_label__ = "29 / 话题承接"
-    enabled: bool = Field(default=False, description="依据实际送达内容的来源引用接续简短指代；需统一心智active，多义时先澄清，不猜事件结果")
+    enabled: bool = Field(default=False, description="启用统一心智 active 后，在主人私聊接续近期话题，并记住最近30天亲自提过的至多32份来源版本")
     ttl_hours: int = Field(default=24, ge=1, le=72, description="已确认话题焦点的最长有效小时数；新话题、遗忘、来源变化和时效到期均停止沿用")
 
 
@@ -520,7 +520,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.25.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.26.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1104,6 +1104,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.unified_mind.enabled:
             runtime = self._ensure_unified()
             if runtime:
+                reference = None
+                reference_signature = None
                 try:
                     attention = self._ensure_attention()
                     before = runtime.context(kwargs)
@@ -1111,8 +1113,11 @@ class MaiLivingWorld(MaiBotPlugin):
                         await attention.prepare_dialogue(kwargs)
                     recollection = self._ensure_recollection()
                     reference = self._ensure_reference()
+                    if reference and not reference.trusted(kwargs):
+                        reference = None
                     reference_signature = reference.signature() if reference else None
                     recalled = []
+                    direct_ids = set()
                     def recall(query):
                         nonlocal recalled
                         resolved = reference.resolve(kwargs) if reference else None
@@ -1127,13 +1132,16 @@ class MaiLivingWorld(MaiBotPlugin):
                             records = (focus + related)[:self.config.unified_mind.recall_limit]
                         else:
                             records = self._collect_unified(query)
-                        records = self._expression_records(records, runtime.context(kwargs))
+                        context = runtime.context(kwargs)
+                        records = self._expression_records(records, context)
                         recalled = records
+                        if reference:
+                            records = reference.mark_prior_mentions(records, context)
                         return recollection.with_questions(records) if recollection and recollection.trusted(kwargs) else records
                     prompt = await runtime.reply_hint(
                         kwargs, self.config.unified_mind, recall=recall,
                         generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
-                        timezone=self.config.general.timezone,
+                        timezone=self.config.general.timezone, direct_ids=direct_ids,
                     )
                     hints = {}
                     if attention and self._unified_active():
@@ -1177,8 +1185,6 @@ class MaiLivingWorld(MaiBotPlugin):
                                 extra = reference.resolve(kwargs)["hint"]
                                 if extra:
                                     hints["reference"] = extra
-                                if prompt or hints:
-                                    reference.stage(kwargs, recalled)
                         repair = self._ensure_repair()
                         extra = repair.hint(kwargs) if repair else ""
                         if extra:
@@ -1191,6 +1197,14 @@ class MaiLivingWorld(MaiBotPlugin):
                     runtime.last_status = "storage_or_context_failed"
                 if self._unified_active():
                     updated = inject_brain_prompt(kwargs, BRAIN_MARKER + "\n" + prompt) if prompt else None
+                    if reference:
+                        try:
+                            if reference.signature() == reference_signature:
+                                # Only sources actually offered to the reply model may acquire a delivery receipt.
+                                sources = [row for row in recalled if row["id"] in direct_ids] if updated else []
+                                reference.stage(kwargs, sources)
+                        except Exception:
+                            self.ctx.logger.warning("[MaiLivingWorld] 本轮话题来源未能登记")
                     return {"action": "continue", "modified_kwargs": updated} if updated else {"action": "continue"}
         prompt = self._brain_hint_for(kwargs)
         updated = inject_brain_prompt(kwargs,prompt) if prompt else None

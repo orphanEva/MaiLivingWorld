@@ -125,6 +125,71 @@ class AdviceReferencePluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("MaiLivingWorld:reference", str(result))
         self.assertEqual(self.bot._reference.resolve(request)["status"], "untrusted")
 
+    def expression_rows(self, result):
+        content = result["modified_kwargs"]["messages"][0]["content"]
+        data = content.split("[MaiLivingWorld:unified-expression]", 1)[1].split("\n[", 1)[1]
+        return json.JSONDecoder().raw_decode("[" + data)[0]
+
+    async def test_group_topic_needs_private_delivery_before_becoming_a_prior_mention(self):
+        topic = "周日的摄影展会展示三种不同的冲印工艺。"
+        store = self.bot._tool_store
+        store.put_observation("cap", "exhibit", topic, "group:"+GROUP, subject_id=OWNER)
+
+        async def row(request):
+            rows = self.expression_rows(await self.reply(request))
+            return next(r for r in rows if r["content"] == topic)
+
+        group = await self.capture("exhibit-group", "聊聊摄影展", sid="group", group=GROUP)
+        self.assertNotIn("mention_history", await row(group))
+        await self.send_reference(topic, mid="group-send", sid="group", group=GROUP)
+
+        private = await self.capture("exhibit-private", "这次摄影展有什么值得看的？")
+        self.assertNotIn("mention_history", await row(private))
+        await self.bot.reference_send_feedback(sent=False, message=message(mid="failed", uid="99999999", text=topic))
+        self.assertNotIn("mention_history", await row(private))
+        await self.send_reference(topic, mid="private-send")
+        await self.capture("change", "换个话题吧")
+        self.assertFalse(self.bot._reference.store.state(OWNER)["active"])
+
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.set_model()
+        private = await self.capture("back", "摄影展的事我没看到，能从头讲吗？", sid="new-session")
+        self.assertIn("从头讲", (await row(private))["mention_history"])
+        group = await self.capture("back-in-group", "聊聊摄影展", sid="group", group=GROUP)
+        self.assertNotIn("mention_history", await row(group))
+        store = self.bot._ensure_tool_store()
+        topic = "周日的摄影展已经改为展示手工制作的相机。"
+        store.put_observation("cap", "exhibit", topic, "group:"+GROUP, subject_id=OWNER)
+        self.assertNotIn("mention_history", await row(await self.capture("edited", "聊聊摄影展")))
+
+    async def test_only_injected_direct_sources_can_establish_a_new_mention(self):
+        # A retry with an injectable prompt may use a cached plan from an earlier host preview.
+        request = await self.capture()
+        preview = await self.bot.brain_reply_hint(**request, messages=[{"role": "user", "content": "预览"}])
+        self.assertNotIn("modified_kwargs", preview)
+        await self.send_reference(TOPIC, mid="preview-send")
+        self.assertFalse(self.bot._reference.store.state(OWNER)["active"])
+        await self.reply(request)
+        self.assertEqual(self.bot._unified.last_status, "cached")
+        await self.bot.brain_reply_hint(**request, messages=[])
+        await self.send_reference(TOPIC, mid="cancelled-preview")
+        self.assertFalse(self.bot._reference.store.state(OWNER)["active"])
+        await self.reply(request)
+        await self.send_reference(TOPIC, mid="retry-send")
+        self.assertTrue(self.bot._reference.store.state(OWNER)["active"])
+
+        await self.capture("clear-all", "/话题 清除")
+        self.bot.ctx.llm.generate = AsyncMock(return_value={"response": json.dumps(
+            {"behavior": "neutral", "decisions": [{"id": self.source["id"], "mode": "internal"}]})})
+        result = await self.reply(await self.capture("omit", "聊聊星空摄影"))
+        self.assertNotIn(TOPIC, str(result))
+        await self.send_reference(TOPIC, mid="omitted-send")
+        self.set_model()
+        rows = self.expression_rows(await self.reply(await self.capture("check", "聊聊星空摄影")))
+        self.assertTrue(any(r["content"] == TOPIC for r in rows))
+        self.assertFalse(any("mention_history" in r for r in rows))
+
     async def test_late_send_after_clear_never_marks_current_topic(self):
         await self.reply(await self.capture())
         async def while_awaiting(*args, **kwargs):

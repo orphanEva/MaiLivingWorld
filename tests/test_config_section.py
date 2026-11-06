@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.25.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.26.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 

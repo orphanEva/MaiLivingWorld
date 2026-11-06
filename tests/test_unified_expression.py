@@ -35,6 +35,76 @@ def parse(raw, records, scope=GROUP, speaker=OWNER, owner=True):
 
 
 class UnifiedExpressionTests(unittest.TestCase):
+    def test_verified_delivery_is_distinct_from_speaker_and_from_the_public_source(self):
+        record = memory("story:demo", source="story", kind="story", evidence_status="source_metadata",
+                        scope="public", sensitivity="public", subject_id="", previously_mentioned=True)
+        raw = response([{"id": record["id"], "mode": "say"}])
+        def visible(**changes):
+            plan = parse(raw, [{**record, **changes}], scope="private:"+OWNER)
+            return json.loads(expression_hint(plan).splitlines()[-1])[0]
+        row = visible()
+        self.assertIn("公开资料", row["attribution"])
+        self.assertIn("提过", row["mention_history"])
+        for flag in (None, 1, False, "true"):
+            self.assertNotIn("mention_history", visible(previously_mentioned=flag))
+        self.assertNotIn("mention_history", visible(derived=True))
+        self.assertNotIn("mention_history", visible(source="growth"))
+        self.assertEqual(visible(previously_mentioned=False)["attribution"], row["attribution"])
+        self.assertNotIn(record["id"], json.dumps(row, ensure_ascii=False))
+
+    def test_mention_receipt_is_hidden_from_models_until_direct_owner_reply_is_approved(self):
+        record = memory("brain:event:demo", scope=GROUP, previously_mentioned=True)
+        public = memory("tool:observation:"+"a"*64, source="tool", kind="observation", evidence_status="tool_observation",
+                        scope="public:listing", sensitivity="public", subject_id="", previously_mentioned=True)
+        for scope, speaker, owner, proactive in ((GROUP, OWNER, True, False), (GROUP, "", False, True),
+                    ("private:"+OWNER, OWNER, True, True), ("private:"+OTHER, OTHER, False, False)):
+            audience = dict(audience_scope=scope, speaker_id=speaker, is_owner=owner, proactive=proactive)
+            plan = parse_expression(response([{"id": public["id"], "mode": "say"}]), [public], **audience)
+            visible = json.loads(expression_hint(plan).splitlines()[-1])
+            self.assertIn("公开资料", visible[0]["attribution"])
+            self.assertNotIn("mention_history", visible[0])
+            self.assertNotIn("previously_mentioned", build_deliberation_prompt([public], query="介绍一下", **audience))
+        audience = dict(audience_scope="private:"+OWNER, speaker_id=OWNER, is_owner=True)
+        plan = parse_expression(response([{"id": record["id"], "mode": "generalize",
+                    "text": "字典的 get 方法支持设置默认返回值"}]), [record], **audience)
+        self.assertNotIn("previously_mentioned", build_generalization_review_prompt(plan, [record], **audience))
+        reviewed = apply_generalization_review(json.dumps({"approved_ids": [record["id"]]}), plan)
+        row = json.loads(expression_hint(reviewed).splitlines()[-1])[0]
+        self.assertNotIn("mention_history", row)
+        self.assertNotIn("attribution", row)
+        self.assertIsNone(parse_expression(response([{"id": public["id"], "mode": "say",
+                                       "previously_mentioned": True}]), [public], **audience))
+
+    def test_actor_and_subject_are_not_evidence_of_authorship_or_shared_history(self):
+        raw = response([{"id": "brain:event:demo", "mode": "say"}])
+        record = memory("brain:event:demo", text="社团这周末会举办音乐会", scope=GROUP)
+        for scope in (GROUP, "private:"+OWNER):
+            outward = expression_hint(parse(raw, [record], scope=scope))
+            visible = json.loads(outward.splitlines()[-1])[0]
+            self.assertEqual(visible["content"], record["text"])
+            self.assertNotIn("attribution", visible)
+            self.assertNotIn("mention_history", visible)
+            self.assertIn("只有明确的发言依据", outward)
+            for internal in (record["id"], OWNER, GROUP):
+                self.assertNotIn(internal, outward)
+        record["previously_mentioned"] = True
+        record["sensitivity"] = "confidential"
+        self.assertEqual(parse(raw, [record], scope="private:"+OWNER)["memories"], [])
+
+    def test_only_verified_owner_correction_identifies_the_speaker_of_that_excerpt(self):
+        record = memory("brain:fact:demo", text="原笔记；【主人更正原话：活动改在周日】",
+                        source="brain_fact", kind="fact", evidence_status="owner_reported")
+        raw = response([{"id": record["id"], "mode": "say"}])
+        for marker, owner, attributed in ((None, True, False), ("self-declared", True, False),
+                        ("recollection:revision:"+"b"*64, True, True),
+                        ("recollection:revision:"+"b"*64, False, False)):
+            plan = parse(raw, [{**record, "correction_id": marker}], scope="private:"+OWNER, owner=owner)
+            visible = json.loads(expression_hint(plan).splitlines()[-1])[0]
+            self.assertEqual("attribution" in visible, attributed)
+            self.assertNotIn("mention_history", visible)
+            if attributed:
+                self.assertIn("标明的引文", visible["attribution"])
+
     def test_recently_asked_private_owner_marker_does_not_change_source_fingerprint(self):
         from MaiLivingWorld.growth_store import source_fingerprint
         from MaiLivingWorld.unified_runtime import _memory_version
