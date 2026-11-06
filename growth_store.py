@@ -120,7 +120,7 @@ def _view(row: dict, now: float) -> dict:
 
 def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
                     records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False,
-                    emotional_episodes=False, skip_interest_overflow=False):
+                    emotional_episodes=False, skip_interest_overflow=False, renew_interests=None):
     fields = {*COLLECTIONS, "traits", "mood"} | ({"emotions"} if emotional_episodes else set())
     if not isinstance(proposal, dict) or set(proposal) - fields:
         raise ValueError("invalid_proposal")
@@ -188,6 +188,9 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
 
     seen_interests = set()
     skipped_interest_overflow = 0
+    skipped_interest_renewal = 0
+    renewed_interests = 0
+    renewals = renew_interests or {}
     for item in proposal.get("interests", []):
         item_fields(item, {"topic", "delta", "evidence_ids"})
         topic = _text(item["topic"], 60, "invalid_topic")
@@ -198,11 +201,20 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
         if key in seen_interests:
             raise ValueError("duplicate_topic")
         seen_interests.add(key)
-        previous = current["weight"] if current else 0.0
+        renewing = key in renewals
+        if renewing:
+            old_ids = {ref["id"] for ref in current["sources"]}
+            # The model sees the whole job, including evidence it did not cite.
+            if len(fresh) != len(refs) or not old_ids.isdisjoint(allowed):
+                skipped_interest_renewal += 1
+                continue
+        previous = current["weight"] if current and not renewing else 0.0
         weight = round(max(-1.0, min(1.0, previous + delta)), 8)
         if not fresh or weight == previous:
+            if renewing:
+                skipped_interest_renewal += 1
             continue
-        merged = merge_sources(current["sources"] if current else [], refs,
+        merged = merge_sources(current["sources"] if current and not renewing else [], refs,
                                limit=MAX_INTEREST_SOURCES, skip_overflow=skip_interest_overflow)
         if not merged:
             skipped_interest_overflow += 1
@@ -211,6 +223,8 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
                    "sources": merged,
                    "revision": current["revision"] + 1 if current else 1}
         put("interests", current, changed)
+        if renewing:
+            renewed_interests += 1
         scalar_sources.update(ref["id"] for ref in fresh)
 
     for category in ("beliefs", "knowledge", "questions"):
@@ -312,7 +326,7 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             stats["emotions"] = count
             used.update(emotion_used)
             scalar_sources.update(receipts)
-    return after, stats, used, scalar_sources, skipped_interest_overflow
+    return after, stats, used, scalar_sources, skipped_interest_overflow, renewed_interests, skipped_interest_renewal
 
 
 class GrowthStore:
@@ -474,7 +488,14 @@ class GrowthStore:
 
     def complete(self, job_id: str, token: str, proposal: dict, records: list[dict],
                  now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False,
-                 emotional_episodes: bool = False, skip_interest_overflow: bool = False) -> dict:
+                 emotional_episodes: bool = False, skip_interest_overflow: bool = False,
+                 renew_interests: dict[str, int] | None = None) -> dict:
+        """Commit reviewed changes; renewal eligibility comes from a trusted root check.
+
+        The caller must revalidate the old references as unavailable immediately
+        before submitting renew_interests. This store checks the locked revisions
+        and fresh evidence, and keeps the replaced item in the same audit entry.
+        """
         timestamp = _now(now)
         if type(review_beliefs) is not bool:
             raise ValueError("invalid_belief_review_mode")
@@ -484,6 +505,14 @@ class GrowthStore:
             raise ValueError("invalid_interest_overflow_mode")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("invalid_revision")
+        if renew_interests is not None and (not isinstance(renew_interests, dict)
+                or len(renew_interests) > MAX_ITEMS
+                or any(not isinstance(key, str) or not re.fullmatch(r"i:[0-9a-f]{24}", key)
+                       or type(value) is not int or value < 1 for key, value in renew_interests.items())):
+            raise ValueError("invalid_interest_renewal")
+        renewals = dict(renew_interests or {})
+        if renewals and expected_revision is None:
+            raise ValueError("invalid_interest_renewal")
         refs, lookup = _records(records)
         ref_map = {ref["id"]: ref for ref in refs}
         self._ensure(timestamp)
@@ -499,6 +528,9 @@ class GrowthStore:
             if expected_revision is not None and old["revision"] != expected_revision:
                 raise ValueError("revision_conflict")
             before = json.loads(old["payload"])
+            current_interests = {item["key"]: item["revision"] for item in before["interests"]}
+            if any(current_interests.get(key) != revision for key, revision in renewals.items()):
+                raise ValueError("interest_renewal_conflict")
             receipt_ids = set(allowed)
             if emotional_episodes:
                 for sid in allowed:
@@ -506,9 +538,10 @@ class GrowthStore:
             consumed = {row[0] for row in self.con.execute(
                 "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in receipt_ids) + ")",
                 tuple(sorted(receipt_ids))).fetchall()}
-            after, stats, used, scalar_sources, skipped = _apply_proposal(
+            after, stats, used, scalar_sources, skipped, renewed, renewal_skipped = _apply_proposal(
                 before, proposal, allowed, lookup, consumed, timestamp, review_beliefs=review_beliefs,
-                emotional_episodes=emotional_episodes, skip_interest_overflow=skip_interest_overflow)
+                emotional_episodes=emotional_episodes, skip_interest_overflow=skip_interest_overflow,
+                renew_interests=renewals)
             changed = any(stats.values()) and job["mode"] == "active"
             revision = int(old["revision"])
             if changed:
@@ -526,6 +559,10 @@ class GrowthStore:
                              "updated=?,error_code='' WHERE id=?", (timestamp, job_id))
             if skipped:
                 stats["skipped_interest_overflow"] = skipped
+            if renewal_skipped:
+                stats["skipped_interest_renewal"] = renewal_skipped
+            if changed and renewed:
+                stats["renewed_interests"] = renewed
             return {**stats, "revision": revision, "changed": bool(changed), "observed": job["mode"] == "observe"}
 
     def rollback(self, expected_revision: int, now: float | None = None) -> dict:

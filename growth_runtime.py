@@ -31,7 +31,7 @@ class GrowthRuntime:
         self._generation += 1
 
     async def tick(self, config, budget, *, collect, resolve, snapshot, generate,
-                   allowed, task_name: str, timezone: str):
+                   allowed, task_name: str, timezone: str, renewal_candidates=None):
         """At most one leased task per tick; restarted processes reclaim expired leases."""
         if not config.enabled or not allowed() or self._lock.locked():
             return
@@ -100,8 +100,13 @@ class GrowthRuntime:
                     return [resolved[ident] for ident in source_ids]
 
                 records = sources()
+                stored = self.store.state()
                 state = snapshot()
                 revision = state["revision"]
+                if stored["revision"] != revision:
+                    raise _Changed()
+                renewals = renewal_candidates(stored, state) if renewal_candidates else {}
+                valid_interests = {item["key"] for item in state["interests"]}
                 # Textual prior conclusions may enter this request only together with
                 # all their root evidence. This prevents unseen private state from
                 # being re-attributed to the new batch's public sources.
@@ -127,13 +132,20 @@ class GrowthRuntime:
                 # A rollback, retraction or concurrent writer invalidates the planned update.
                 if not current() or self.store.state()["revision"] != revision:
                     raise _Changed()
+                verified = snapshot()
+                if (verified["revision"] != revision
+                        or {item["key"] for item in verified["interests"]} != valid_interests
+                        or (renewal_candidates and renewal_candidates(stored, verified) != renewals)):
+                    raise _Changed()
                 records = sources()
                 self.last_counts = self.store.complete(job_id, token, proposal, records,
                     expected_revision=revision, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes,
-                    skip_interest_overflow=True)
+                    skip_interest_overflow=True, renew_interests=renewals)
                 self.last_status = "observed" if mode == "observe" else "learned"
                 if mode == "active" and self.last_counts.get("skipped_interest_overflow") and not self.last_counts["changed"]:
                     self.last_status = "interest_source_capacity"
+                if mode == "active" and self.last_counts.get("skipped_interest_renewal") and not self.last_counts["changed"]:
+                    self.last_status = "interest_renewal_waiting"
             except _Budget:
                 release("budget_or_cooldown", max(60, budget.min_interval_seconds))
                 self.last_status = "budget_or_cooldown"

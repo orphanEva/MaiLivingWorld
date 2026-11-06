@@ -176,7 +176,23 @@ def seed_long_interest(growth, tools):
         proposal = {"interests": [{"topic": "摄影", "delta": -.02 if offset+24 >= len(roots) else .01,
                                    "evidence_ids": [row["id"] for row in batch]}]}
         growth.complete(job_id, job["token"], proposal, batch, now=stamp+1)
-    return {"state": growth.state(now=500), "history": growth.history(limit=20), "roots": roots}
+    private = tools.put_observation("cap", "renewal-private", "另一位用户私下分享了绘画笔记。",
+        "private:87654321", subject_id="87654321", sensitivity="personal", now=450)
+    proposal = {"interests": [{"topic": "绘画", "delta": .08, "evidence_ids": [private["id"]]}]}
+    job_id = growth.enqueue([private], now=451)
+    job = growth.claim(now=451)
+    growth.complete(job_id, job["token"], proposal, [private], now=452)
+    old = growth.state(now=452)["interests"][-1]
+    tools.retract_observation("cap", "renewal-private", now=453)
+    fresh = tools.put_observation("news", "renewal-public", "绘画展览介绍了新的水彩表现方法。",
+        "public", sensitivity="public", now=454)
+    proposal = {"interests": [{"topic": "绘画", "delta": -.03, "evidence_ids": [fresh["id"]]}]}
+    job_id = growth.enqueue([fresh], now=455)
+    job = growth.claim(now=455)
+    growth.complete(job_id, job["token"], proposal, [fresh], now=456,
+                    expected_revision=growth.state(now=455)["revision"], renew_interests={old["key"]: old["revision"]})
+    return {"state": growth.state(now=500), "history": growth.history(limit=20), "roots": roots,
+            "renewal": {"old": old, "private": private, "fresh": fresh, "proposal": proposal}}
 
 
 def assert_long_interest_restore(case, growth, tools, expected):
@@ -193,15 +209,45 @@ def assert_long_interest_restore(case, growth, tools, expected):
     for offset in range(0, len(ids), 128):
         resolved.update((row["id"], row) for row in tools.resolve(ids[offset:offset+128], now=500))
     case.assertEqual(resolved, {row["id"]: row for row in expected["roots"]})
+    renewal = expected["renewal"]
+    fresh = renewal["fresh"]
+    case.assertEqual(tools.resolve([renewal["private"]["id"]], now=500), [])
+    case.assertEqual(tools.resolve([fresh["id"]], now=500), [fresh])
+    resolved[fresh["id"]] = fresh
     visible = derived_memories(growth.state(now=500), resolved, fingerprint=source_fingerprint)
-    case.assertEqual(len(visible), 1)
-    case.assertEqual(visible[0]["sources"], item["sources"])
+    case.assertEqual(len(visible), 2)
+    photo = next(row for row in visible if row["topic"] == "摄影")
+    renewed = next(row for row in visible if row["topic"] == "绘画")
+    case.assertEqual(photo["sources"], item["sources"])
+    case.assertEqual((renewed["weight"], renewed["revision"], renewed["sensitivity"]), (-.03, 2, "public"))
+    case.assertEqual([ref["id"] for ref in renewed["sources"]], [fresh["id"]])
     changed = annotate_interest_changes(visible, growth.history(limit=20))
-    case.assertIn("兴趣有所减弱", changed[0]["text"])
+    case.assertIn("兴趣有所减弱", next(row["text"] for row in changed if row["topic"] == "摄影"))
+    case.assertNotIn("此前", next(row["text"] for row in changed if row["topic"] == "绘画"))
+    previous = growth.history()[0]["before"]["interests"][-1]
+    case.assertEqual(previous, renewal["old"])
+    case.assertEqual(previous["sources"][0]["sensitivity"], "personal")
+    case.assertEqual(previous["sources"][0]["id"], renewal["private"]["id"])
     case.assertTrue(tools.retract_observation("news", "interest-backup-000", now=501))
     case.assertEqual(tools.resolve([ids[0]], now=502), [])
     resolved.pop(ids[0])
-    case.assertEqual(derived_memories(growth.state(now=502), resolved, fingerprint=source_fingerprint), [])
+    remaining = derived_memories(growth.state(now=502), resolved, fingerprint=source_fingerprint)
+    case.assertEqual(remaining, [renewed])
+    consumed = growth.status()["consumed"]
+    case.assertEqual(consumed, len(expected["roots"])+2)
+    restored = growth.rollback(expected["state"]["revision"], now=503)
+    case.assertEqual(restored["interests"][-1], renewal["old"])
+    case.assertEqual(derived_memories(restored, resolved, fingerprint=source_fingerprint), [])
+    extra = tools.put_observation("news", "renewal-extra", "新展览还介绍了版画工艺。",
+        "public", sensitivity="public", now=504)
+    batch = [fresh, extra]
+    job_id = growth.enqueue(batch, now=505)
+    job = growth.claim(now=505)
+    result = growth.complete(job_id, job["token"], renewal["proposal"], batch, now=506,
+        expected_revision=restored["revision"], renew_interests={renewal["old"]["key"]: renewal["old"]["revision"]})
+    case.assertFalse(result["changed"])
+    case.assertEqual(growth.state(now=506)["interests"], restored["interests"])
+    case.assertEqual(growth.status()["consumed"], consumed)
 
 
 def seed_recollection(store):
@@ -781,7 +827,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.35")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.36")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -806,6 +852,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V34_LEDGERS, backup.V33_LEDGERS)
         self.assertEqual(backup.V35_LEDGERS, backup.V34_LEDGERS)
         self.assertIsNot(backup.V35_LEDGERS, backup.V34_LEDGERS)
+        self.assertEqual(backup.V36_LEDGERS, backup.V35_LEDGERS)
+        self.assertIsNot(backup.V36_LEDGERS, backup.V35_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -826,7 +874,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1214,6 +1262,13 @@ class SQLiteBackupTests(unittest.TestCase):
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (21, []))
 
+    def test_v35_archive_restores_with_the_current_schema(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.35")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.35", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
     def test_long_interest_and_original_tool_material_survive_restore_and_retraction(self):
         from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.tool_store import ToolStore
@@ -1344,7 +1399,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.35")
+        self.assertEqual(current["catalog"], "v0.36")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1795,11 +1850,11 @@ class MySQLBackupTests(unittest.TestCase):
     def test_v23_mysql_archive_requires_matching_old_schema(self):
         self.check_same_schema_archive("v0.23")
 
-    def test_v24_through_v34_mysql_catalogs_restore_to_same_current_schema(self):
+    def test_v24_through_v35_mysql_catalogs_restore_to_same_current_schema(self):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
         current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34"):
+        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35"):
             with self.subTest(catalog=catalog):
                 archive = Path(self.temp.name)/(catalog+".zip")
                 with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
@@ -1874,7 +1929,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.35")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.36")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v35_backup_"+table+"`")
@@ -1924,7 +1979,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.35")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.36")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

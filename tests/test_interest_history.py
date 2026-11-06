@@ -130,6 +130,66 @@ class InterestHistoryPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("兴趣有所回升", reverted)
         self.assertIn("自己的兴趣倾向：摄影", reverted)
 
+    async def test_renewed_interest_uses_new_evidence_without_claiming_a_change_from_private_history(self):
+        await self.reply("你喜欢什么", "old-photo")
+        await self.bot.reference_send_feedback(sent=True,
+            message=message("old-photo-sent", uid="99999999", text=fixtures.PHOTO))
+        secret = self.source("private-photo-reason", "另一位用户私下讲述了蓝信封中珍藏照片的缘由。", private=True)
+        await self.learn(interests=[("摄影", .08, secret)])
+        old = next(row for row in self.bot._growth.state()["interests"] if row["topic"] == "摄影")
+        self.bot._tool_store.retract_observation("cap", "private-photo-reason")
+        self.assertFalse(any(row["topic"] == "摄影" for row in self.bot._interest_memories()))
+
+        fresh = self.source("fresh-photo", "新公开摄影教程讨论了侧光下阴影和轮廓的关系。")
+        await self.learn(interests=[("摄影", .02, fresh)])
+        renewed = next(row for row in self.bot._growth.state()["interests"] if row["topic"] == "摄影")
+        self.assertEqual((renewed["key"], renewed["revision"], renewed["weight"]),
+                         (old["key"], old["revision"]+1, .02))
+        self.assertEqual([ref["id"] for ref in renewed["sources"]], [fresh["id"]])
+        audit = self.bot._growth.history()[0]
+        self.assertIn(old, audit["before"]["interests"])
+
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        old_focus = await self.reply("你现在还喜欢这个吗", "after-renewal", sid="new-private")
+        self.assertIn("目前无法确认对这部分内容的喜好", old_focus)
+        self.assertNotIn("自己的兴趣倾向：摄影", old_focus)
+        current = await self.reply("你喜欢什么", "new-preference", sid="new-private")
+        self.assertIn("自己的兴趣倾向：摄影", current)
+        for private_or_old in (secret["text"], "蓝信封", "兴趣有所减弱", "兴趣有所回升", "此前更愿意"):
+            self.assertNotIn(private_or_old, current)
+        self.bot.ctx.chat.get_stream_by_user_id.return_value = {"stream_id": "new-private"}
+        await self.bot.reference_send_feedback(sent=True,
+            message=message("fresh-photo-sent", sid="new-private", uid="99999999", text=fresh["text"]))
+        self.assertEqual([ref["id"] for ref in self.bot._reference.store.state(OWNER)["focus_refs"]], [fresh["id"]])
+        followup = await self.reply("你以前不是喜欢这个吗", "new-followup", sid="new-private")
+        self.assertIn("自己的兴趣倾向：摄影", followup)
+        self.assertNotIn("兴趣有所减弱", followup)
+        self.assertIn("历史不足时可以说明以前的倾向还无法确认", followup)
+
+        later = self.source("fresh-photo-later", "后续公开教程解释了如何把侧光用于拍摄风景。")
+        await self.learn(interests=[("摄影", .03, later)])
+        changed = await self.reply("你的喜好怎么变了", "new-generation-change", sid="new-private")
+        self.assertIn("兴趣有所回升", changed)
+        self.assertNotIn(secret["text"], changed)
+        self.assertNotIn("蓝信封", changed)
+
+    async def test_private_renewal_stays_private_and_rollback_restores_an_unavailable_old_interest(self):
+        old = next(row for row in self.bot._growth.state()["interests"] if row["topic"] == "摄影")
+        self.bot._tool_store.retract_observation("news", "photo")
+        private = self.source("new-private-photo", "另一位用户私下分享了摄影与蓝信封故事的新联想。", private=True)
+        await self.learn(interests=[("摄影", -.04, private)])
+        renewed = next(row for row in self.bot._interest_memories() if row["topic"] == "摄影")
+        self.assertEqual((renewed["weight"], renewed["sensitivity"]), (-.04, "personal"))
+        visible = await self.reply("你有什么喜好", "private-renewal")
+        self.assertNotIn("自己的兴趣倾向：摄影", visible)
+        self.assertNotIn("蓝信封", visible)
+        self.bot._growth.rollback(self.bot._growth.state()["revision"])
+        self.assertIn(old, self.bot._growth.state()["interests"])
+        self.assertFalse(any(row["topic"] == "摄影" for row in self.bot._interest_memories()))
+        rolled_back = await self.reply("你喜欢什么", "rolled-back-renewal")
+        self.assertNotIn("自己的兴趣倾向：摄影", rolled_back)
+
     async def test_retraction_and_inflight_rollback_invalidate_change_expression(self):
         await self.grow_photo()
         event = {**message("change-question", text="你喜欢什么"),

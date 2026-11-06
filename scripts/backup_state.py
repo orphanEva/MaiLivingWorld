@@ -92,6 +92,8 @@ V33_LEDGERS = MappingProxyType(dict(V32_LEDGERS))
 V34_LEDGERS = MappingProxyType(dict(V33_LEDGERS))
 # v0.35 keeps longer interest provenance in the existing growth payloads.
 V35_LEDGERS = MappingProxyType(dict(V34_LEDGERS))
+# v0.36 keeps renewed interests and their prior basis in existing growth history.
+V36_LEDGERS = MappingProxyType(dict(V35_LEDGERS))
 CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS, "v0.16": V16_LEDGERS,
                            "v0.17": V17_LEDGERS, "v0.18": V18_LEDGERS, "v0.19": V19_LEDGERS,
                            "v0.20": V20_LEDGERS, "v0.21": V21_LEDGERS, "v0.22": V22_LEDGERS,
@@ -99,8 +101,8 @@ CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS, "v0.16"
                            "v0.26": V26_LEDGERS, "v0.27": V27_LEDGERS, "v0.28": V28_LEDGERS,
                            "v0.29": V29_LEDGERS, "v0.30": V30_LEDGERS,
                            "v0.31": V31_LEDGERS, "v0.32": V32_LEDGERS, "v0.33": V33_LEDGERS,
-                           "v0.34": V34_LEDGERS, "v0.35": V35_LEDGERS})
-CURRENT_CATALOG = "v0.35"
+                           "v0.34": V34_LEDGERS, "v0.35": V35_LEDGERS, "v0.36": V36_LEDGERS})
+CURRENT_CATALOG = "v0.36"
 LEDGERS = CATALOGS[CURRENT_CATALOG]
 TABLES = tuple(table for tables in LEDGERS.values() for table in tables)
 MAX_MANIFEST = 1024 * 1024

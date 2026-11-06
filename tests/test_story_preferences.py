@@ -85,6 +85,28 @@ class StoryPreferenceTests(unittest.IsolatedAsyncioTestCase):
         self.bot._store.record_attempt(TARGET, time.time(), "explore", "neutral")
         self.assertIsNone(await self.bot._choose_story(TARGET))
 
+    async def test_independent_renewal_changes_public_selection_across_restart_and_new_retraction(self):
+        old = self.source("old-photo", "公开摄影教程介绍了常见构图方式。")
+        await self.learn(old, interests=[("摄影", .07)])
+        self.story("photo", "摄影光线实验", age=10)
+        self.story("neutral", "社区读书会")
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "photo")
+        revised = self.source("old-photo", "发布者更正了教程，旧版对构图方法的描述已被替换。")
+        self.assertEqual(revised["id"], old["id"])
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "neutral")
+        fresh = self.source("new-photo", "新摄影观察记录讨论了重复构图带来的局限。")
+        await self.learn(fresh, interests=[("摄影", -.02)])
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "neutral")
+        self.assertEqual(next(row["weight"] for row in self.bot._interest_memories() if row["topic"] == "摄影"), -.02)
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "neutral")
+        later = self.source("later-photo", "新的公开教程展示了摄影时尝试不同视角的乐趣。")
+        await self.learn(later, interests=[("摄影", .05)])
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "photo")
+        self.bot._tool_store.retract_observation("news", "new-photo")
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "neutral")
+
     async def test_initial_keywords_still_guide_selection_without_learned_preferences(self):
         self.bot.config.explorer.interests = ["音乐"]
         self.story("music", "音乐活动", age=3)

@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.35.0",
+        default="0.36.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.35.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.36.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1667,6 +1667,22 @@ class MaiLivingWorld(MaiBotPlugin):
         self._growth_history_cache = (self._growth, revision, history)
         return history
 
+    def _growth_renewal_candidates(self, stored: dict, verified: dict) -> dict[str, int]:
+        """Unavailable evidence permits a fresh review only when its reader is enabled."""
+        readers = {
+            "brain": self.config.brain_memory.enabled,
+            "mind": self.config.mind.enabled,
+            "cognition": self.config.cognition.enabled,
+            "story": self._store is not None,
+            "tool": True,
+            "bond": self._ensure_bond() is not None,
+            "continuity": self._ensure_continuity() is not None,
+        }
+        valid = {item["key"] for item in verified["interests"]}
+        return {item["key"]: item["revision"] for item in stored["interests"]
+                if item["key"] not in valid and item["sources"]
+                and all(readers.get(ref["id"].split(":", 1)[0], False) for ref in item["sources"])}
+
     def _interest_memories(self) -> list[dict]:
         if not (self.config.growth.enabled and self.config.growth.mode == "active" and self._ensure_growth()):
             return []
@@ -1757,6 +1773,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if runtime:
             await runtime.tick(self.config.growth, self.config.unified_mind,
                 collect=self._growth_candidates, resolve=self._resolve_roots, snapshot=self._growth_snapshot,
+                renewal_candidates=self._growth_renewal_candidates,
                 generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                 timezone=self.config.general.timezone,
                 allowed=lambda: bool(self.config.plugin.enabled and self.config.unified_mind.enabled

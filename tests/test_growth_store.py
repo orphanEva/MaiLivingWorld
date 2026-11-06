@@ -60,12 +60,12 @@ class GrowthStoreTests(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
-    def submit(self, proposal, rows=None, now=100.0, mode="active"):
+    def submit(self, proposal, rows=None, now=100.0, mode="active", **options):
         rows = records() if rows is None else rows
         job_id = self.db.enqueue(rows, mode=mode, now=now)
         job = self.db.claim(now=now, mode=mode)
         self.assertEqual(job["id"], job_id)
-        result = self.db.complete(job_id, job["token"], proposal, rows, now=now+1)
+        result = self.db.complete(job_id, job["token"], proposal, rows, now=now+1, **options)
         return result
 
     def test_lazy_schema_and_reference_only_idempotent_queue_survive_restart(self):
@@ -440,6 +440,177 @@ class GrowthStoreTests(unittest.TestCase):
         self.assertEqual(self.db.history()[0]["before"]["interests"], [current])
         self.assertEqual(self.db.history()[0]["kind"], "retire")
         self.assertEqual(self.db.status()["consumed"], 26)
+
+    def test_renewal_keeps_full_old_basis_in_audit_and_only_new_basis_after_restart(self):
+        old = fill_interest_sources(self.db, records("old-private-", MAX_INTEREST_SOURCES))
+        before = self.db.state(now=130)["revision"]
+        fresh = [{**row, "scope": "public:news", "subject_id": "", "sensitivity": "public"}
+                 for row in records("fresh-public-", 1)]
+        result = self.submit(interest(fresh, -.3), fresh, now=140,
+                             expected_revision=before, renew_interests={old["key"]: old["revision"]})
+        self.assertEqual((result["interests"], result["renewed_interests"]), (1, 1))
+        current = self.db.state(now=142)["interests"][0]
+        self.assertEqual((current["key"], current["revision"]), (old["key"], old["revision"]+1))
+        self.assertEqual(current["weight"], -.1)
+        self.assertEqual(current["sources"], [{"id": fresh[0]["id"], "digest": source_fingerprint(fresh[0]),
+                                               "scope": "public:news", "sensitivity": "public"}])
+        history = self.db.history()[0]
+        self.assertEqual(history["before"]["interests"], [old])
+        self.assertEqual(history["after"]["interests"], [current])
+        self.assertEqual(history["sources"], current["sources"])
+        self.db.close()
+        self.db = GrowthStore(self.path)
+        self.assertEqual(self.db.state(now=143)["interests"], [current])
+        self.assertEqual(self.db.rollback(result["revision"], now=144)["interests"], [old])
+        replay = self.submit(interest(fresh), [*fresh, *records("unused-", 1)], now=150,
+                             expected_revision=result["revision"]+1,
+                             renew_interests={old["key"]: old["revision"]})
+        self.assertFalse(replay["changed"])
+        self.assertEqual(replay["skipped_interest_renewal"], 1)
+        self.assertNotIn("renewed_interests", replay)
+        self.assertEqual(self.db.state(now=152)["interests"], [old])
+        self.assertEqual(self.db.status()["consumed"], MAX_INTEREST_SOURCES+1)
+
+    def test_renewal_authorization_requires_exact_item_and_global_revisions(self):
+        old = fill_interest_sources(self.db, records("old-", 1))
+        fresh = records("new-", 1)
+        before = self.db.state(now=130)["revision"]
+        jid = self.db.enqueue(fresh, now=140)
+        job = self.db.claim(now=140)
+        invalid = [[], True, "yes", {"bad": 1}, {old["key"]: True}, {old["key"]: 0},
+                   {old["key"]: 1.0}, {"b:"+"a"*24: 1}]
+        for authorization in invalid:
+            with self.subTest(authorization=authorization), self.assertRaisesRegex(ValueError, "invalid_interest_renewal"):
+                self.db.complete(jid, job["token"], interest(fresh), fresh, now=141,
+                                 expected_revision=before, renew_interests=authorization)
+        with self.assertRaisesRegex(ValueError, "invalid_interest_renewal"):
+            self.db.complete(jid, job["token"], interest(fresh), fresh, now=141,
+                             renew_interests={old["key"]: old["revision"]})
+        for authorization in ({old["key"]: old["revision"]+1}, {"i:"+"a"*24: 1}):
+            with self.subTest(authorization=authorization), self.assertRaisesRegex(ValueError, "interest_renewal_conflict"):
+                self.db.complete(jid, job["token"], interest(fresh), fresh, now=141,
+                                 expected_revision=before, renew_interests=authorization)
+        with self.assertRaisesRegex(ValueError, "revision_conflict"):
+            self.db.complete(jid, job["token"], interest(fresh), fresh, now=141,
+                             expected_revision=before-1, renew_interests={old["key"]: old["revision"]})
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
+        self.assertEqual(self.db.status()["jobs"]["running"], 1)
+        self.assertEqual(self.db.status()["consumed"], 1)
+
+    def test_renewal_rejects_mixed_or_revised_old_evidence_without_blocking_siblings(self):
+        previous = records("private-old-", 1)
+        old = fill_interest_sources(self.db, previous)
+        for index, prior in enumerate((previous[0], {**previous[0], "text": "同一个来源的新版本"})):
+            fresh, sibling = records("new-"+str(index)+"-", 2)
+            rows = [prior, fresh, sibling]
+            data = interest([prior, fresh], -.1)
+            data["knowledge"] = [{"topic": "独立观察"+str(index), "statement": "新材料记载了另一个观察。",
+                                  "confidence": .8, "evidence_ids": [sibling["id"]]}]
+            result = self.submit(data, rows, now=140+index*5, expected_revision=self.db.state()["revision"],
+                                 renew_interests={old["key"]: old["revision"]})
+            self.assertTrue(result["changed"])
+            self.assertEqual((result["interests"], result["knowledge"]), (0, 1))
+            self.assertEqual(result["skipped_interest_renewal"], 1)
+            self.assertNotIn("renewed_interests", result)
+            self.assertEqual(self.db.state(now=155)["interests"], [old])
+            self.assertEqual([ref["id"] for ref in self.db.history()[0]["sources"]], [sibling["id"]])
+            self.assertEqual(self.db.status()["consumed"], 1)
+        already_used, fresh = records("other-experience-", 2)
+        self.submit(interest([already_used], topic="园艺"), [already_used], now=155)
+        before = self.db.state(now=157)
+        result = self.submit(interest([already_used, fresh]), [already_used, fresh], now=160,
+                             expected_revision=before["revision"], renew_interests={old["key"]: old["revision"]})
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["skipped_interest_renewal"], 1)
+        self.assertEqual(self.db.state(now=162)["interests"], before["interests"])
+        self.assertEqual(self.db.status()["consumed"], 2)
+
+    def test_renewal_zero_and_observe_leave_state_and_evidence_available(self):
+        old = fill_interest_sources(self.db, records("before-", 1))
+        revision = self.db.state(now=130)["revision"]
+        fresh = records("later-", 1)
+        options = {"expected_revision": revision, "renew_interests": {old["key"]: old["revision"]}}
+        zero = self.submit(interest(fresh, 0), fresh, now=140, **options)
+        self.assertFalse(zero["changed"])
+        self.assertEqual(zero["skipped_interest_renewal"], 1)
+        self.assertNotIn("renewed_interests", zero)
+        observed = self.submit(interest(fresh, -.02), fresh, now=145, mode="observe", **options)
+        self.assertEqual(observed["interests"], 1)
+        self.assertTrue(observed["observed"])
+        self.assertFalse(observed["changed"])
+        self.assertNotIn("renewed_interests", observed)
+        self.assertEqual(self.db.state(now=150)["interests"], [old])
+        self.assertEqual(self.db.status()["consumed"], 1)
+        result = self.submit(interest(fresh, -.02), [*fresh, *records("other-", 1)], now=150, **options)
+        self.assertEqual(result["renewed_interests"], 1)
+        self.assertEqual(self.db.state(now=152)["interests"][0]["weight"], -.02)
+
+    def test_renewal_skips_uncited_old_material_seen_elsewhere_in_the_same_job(self):
+        previous = records("private-old-", 1)
+        old = fill_interest_sources(self.db, previous)
+        fresh, sibling = records("public-new-", 2, "public:news")
+        for row in (fresh, sibling):
+            row.update(subject_id="", sensitivity="public")
+        data = interest([fresh], -.03)
+        data["knowledge"] = [{"topic": "独立观察", "statement": "新资料记录了独立观察。",
+                              "confidence": .8, "evidence_ids": [sibling["id"]]}]
+        result = self.submit(data, [*previous, fresh, sibling], now=140,
+                             expected_revision=self.db.state(now=130)["revision"],
+                             renew_interests={old["key"]: old["revision"]})
+        self.assertEqual((result["interests"], result["knowledge"], result["skipped_interest_renewal"]),
+                         (0, 1, 1))
+        self.assertNotIn("renewed_interests", result)
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
+        self.assertEqual(self.db.status()["consumed"], 1)
+        self.assertEqual([ref["id"] for ref in self.db.history()[0]["sources"]], [sibling["id"]])
+        renewed = self.submit(interest([fresh], -.03), [fresh], now=145,
+                              expected_revision=result["revision"],
+                              renew_interests={old["key"]: old["revision"]})
+        self.assertEqual(renewed["renewed_interests"], 1)
+        self.assertEqual(self.db.state(now=147)["interests"][0]["weight"], -.03)
+
+    def test_renewal_and_sibling_roll_back_together_when_audit_write_fails(self):
+        old = fill_interest_sources(self.db, records("old-", 1))
+        fresh = records("new-", 1)
+        jid = self.db.enqueue(fresh, now=140)
+        job = self.db.claim(now=140)
+        before = self.db.state(now=140)["revision"]
+        options = {"expected_revision": before, "renew_interests": {old["key"]: old["revision"]}}
+        data = interest(fresh, -.03)
+        data["knowledge"] = [{"topic": "天气", "statement": "记录提到昨天下过雨。",
+                              "confidence": .7, "evidence_ids": [fresh[0]["id"]]}]
+        with self.db.con:
+            self.db.con.execute("CREATE TRIGGER reject_renewal BEFORE INSERT ON growth_history "
+                                "BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.complete(jid, job["token"], data, fresh, now=141, **options)
+        self.assertEqual(self.db.state(now=142)["revision"], before)
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
+        self.assertEqual(self.db.state(now=142)["knowledge"], [])
+        self.assertEqual(self.db.status()["consumed"], 1)
+        self.assertEqual(self.db.status()["jobs"]["running"], 1)
+        with self.db.con:
+            self.db.con.execute("DROP TRIGGER reject_renewal")
+        result = self.db.complete(jid, job["token"], data, fresh, now=143, **options)
+        self.assertEqual((result["interests"], result["knowledge"], result["renewed_interests"]), (1, 1, 1))
+        with self.assertRaisesRegex(ValueError, "lease_lost"):
+            self.db.complete(jid, job["token"], data, fresh, now=144, **options)
+
+    def test_renewal_authorization_does_not_relax_candidate_validation(self):
+        old = fill_interest_sources(self.db, records("old-", 1))
+        fresh = records("new-", 1)
+        jid = self.db.enqueue(fresh, now=140)
+        job = self.db.claim(now=140)
+        options = {"expected_revision": self.db.state(now=140)["revision"],
+                   "renew_interests": {old["key"]: old["revision"]}}
+        for fields, code in (({"extra": True}, "invalid_item"), ({"delta": float("nan")}, "invalid_number"),
+                             ({"evidence_ids": ["missing"]}, "invalid_evidence")):
+            data = interest(fresh)
+            data["interests"][0].update(fields)
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, code):
+                self.db.complete(jid, job["token"], data, fresh, now=141, **options)
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
+        self.assertEqual(self.db.status()["jobs"]["running"], 1)
 
     def test_rollback_does_not_replenish_daily_trait_budget(self):
         for i in range(3):

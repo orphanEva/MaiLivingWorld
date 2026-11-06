@@ -360,6 +360,120 @@ class GrowthRuntimeTests(unittest.IsolatedAsyncioTestCase):
         prompts = [call.args[0] for call in self.bot.ctx.llm.generate.await_args_list]
         self.assertNotIn('"source": "growth', prompts[0])
 
+    async def test_invalid_interest_is_relearned_without_old_private_context(self):
+        await self.learn()
+        old = self.bot._growth.state()["interests"][0]
+        with self.bot._brain.con:
+            self.bot._brain.con.execute("DELETE FROM brain_events WHERE id=?", ("growth-event-one",))
+        source = self.bot._ensure_tool_store().put_observation(
+            "news", "new-listening", "一次新的采访展示了先听清问题再回应的效果。",
+            "public:news", sensitivity="public")
+        self.bot._growth.enqueue([source])
+        data = empty_growth()
+        data["interests"] = [{"topic": "交流方式", "delta": -.03, "evidence_ids": [source["id"]]}]
+        self.model_for(data)
+        await self.bot._grow()
+        current = self.bot._growth.state()["interests"][0]
+        self.assertEqual((current["key"], current["revision"]), (old["key"], old["revision"]+1))
+        self.assertEqual(current["weight"], -.03)
+        self.assertEqual([ref["id"] for ref in current["sources"]], [source["id"]])
+        self.assertEqual(self.bot._growth_runtime.last_counts["renewed_interests"], 1)
+        self.assertEqual(self.bot._growth.history()[0]["before"]["interests"], [old])
+        for call in self.bot.ctx.llm.generate.await_args_list[-2:]:
+            self.assertNotIn(PRIVATE_TEXT, call.args[0])
+            self.assertIn(source["text"], call.args[0])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot._ensure_growth()
+        self.assertEqual(self.bot._growth.state()["interests"], [current])
+        self.assertEqual(self.bot._growth_snapshot()["interests"], [current])
+
+    async def test_disabled_source_reader_does_not_reset_the_interest(self):
+        await self.learn()
+        old = self.bot._growth.state()["interests"][0]
+        self.bot.config.brain_memory.enabled = False
+        source = self.bot._ensure_tool_store().put_observation(
+            "news", "reader-disabled", "采访中一段耐心听取意见的交流记录。",
+            "public:news", sensitivity="public")
+        self.bot._growth.enqueue([source])
+        data = empty_growth()
+        data["interests"] = [{"topic": "交流方式", "delta": .02, "evidence_ids": [source["id"]]}]
+        self.model_for(data)
+        await self.bot._grow()
+        current = self.bot._growth.state()["interests"][0]
+        self.assertAlmostEqual(current["weight"], old["weight"]+.02)
+        self.assertTrue(all(ref in current["sources"] for ref in old["sources"]))
+        self.assertNotIn("renewed_interests", self.bot._growth_runtime.last_counts)
+        self.assertEqual(self.bot._growth_snapshot()["interests"], [])
+        self.bot.config.brain_memory.enabled = True
+        self.assertEqual(self.bot._growth_snapshot()["interests"], [current])
+
+    async def test_prior_source_validity_change_during_review_cancels_the_update(self):
+        await self.learn()
+        old = self.bot._growth.state()["interests"][0]
+        source = self.bot._ensure_tool_store().put_observation(
+            "news", "changing-prior", "新的交流资料讨论了怎样给对方留出思考时间。",
+            "public:news", sensitivity="public")
+        data = empty_growth()
+        data["interests"] = [{"topic": "交流方式", "delta": .02, "evidence_ids": [source["id"]]}]
+        stamp = time.time()
+        for index, change in enumerate(("restored", "invalidated", "reader_disabled")):
+            with self.subTest(change=change):
+                with self.bot._brain.con:
+                    self.bot._brain.con.execute("UPDATE brain_events SET summary=? WHERE id=?",
+                        (PRIVATE_TEXT if change == "invalidated" else "已修正的旧材料", "growth-event-one"))
+                self.bot._growth.enqueue([source])
+                calls = 0
+                async def reply(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return model_response(data)
+                    if change == "reader_disabled":
+                        self.bot.config.brain_memory.enabled = False
+                    else:
+                        with self.bot._brain.con:
+                            self.bot._brain.con.execute("UPDATE brain_events SET summary=? WHERE id=?",
+                                (PRIVATE_TEXT if change == "restored" else "已修正的旧材料", "growth-event-one"))
+                    return model_response(review(data))
+                self.bot.ctx.llm.generate.side_effect = reply
+                with patch("MaiLivingWorld.growth_runtime.time.time", return_value=stamp+index*70):
+                    await self.bot._grow()
+                self.assertEqual(calls, 2)
+                self.assertEqual(self.bot._growth_runtime.last_status, "context_changed")
+                self.assertEqual(self.bot._growth.state()["interests"], [old])
+                self.assertEqual(self.bot._growth.status()["consumed"], 1)
+
+    async def test_renewal_waits_for_fresh_evidence_without_consuming_or_creating_a_revision(self):
+        ident = self.event()
+        await self.learn(ident)
+        before = self.bot._growth.state()
+        with self.bot._brain.con:
+            self.bot._brain.con.execute("UPDATE brain_events SET summary=? WHERE id=?",
+                                       ("同一记录的更正版本", "growth-event-one"))
+        self.bot._growth.enqueue(list(self.bot._resolve_roots([ident]).values()))
+        data = empty_growth()
+        data["interests"] = [{"topic": "交流方式", "delta": .02, "evidence_ids": [ident]}]
+        self.model_for(data)
+        await self.bot._grow()
+        self.assertEqual(self.bot._growth_runtime.last_status, "interest_renewal_waiting")
+        self.assertEqual(self.bot._growth_runtime.last_counts["skipped_interest_renewal"], 1)
+        self.assertFalse(self.bot._growth_runtime.last_counts["changed"])
+        self.assertEqual(self.bot._growth.state()["revision"], before["revision"])
+        self.assertEqual(self.bot._growth.state()["interests"], before["interests"])
+        self.assertEqual(self.bot._growth.status()["consumed"], 1)
+
+    async def test_revision_change_between_raw_and_validated_snapshot_never_calls_model(self):
+        self.bot._ensure_growth()
+        source = self.event()
+        self.bot._growth.enqueue(list(self.bot._resolve_roots([source]).values()))
+        state = self.bot._growth_snapshot()
+        with patch.object(self.bot, "_growth_snapshot", return_value={**state, "revision": state["revision"]+1}):
+            await self.bot._grow()
+        self.assertEqual(self.bot._growth_runtime.last_status, "context_changed")
+        self.bot.ctx.llm.generate.assert_not_awaited()
+        self.assertEqual(self.bot._growth.status()["consumed"], 0)
+
     async def test_private_derived_knowledge_not_disclosed_to_group(self):
         await self.learn()
         derived = self.bot._derived_memories("交流")

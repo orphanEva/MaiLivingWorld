@@ -142,6 +142,46 @@ class GrowthMySQLLiveTests(unittest.TestCase):
         self.assertEqual([ref["id"] for ref in peer.history()[0]["sources"]], [new[1]["id"]])
         self.assertEqual(peer.rollback(result["revision"], now=145)["interests"], [original])
 
+    def test_renewed_interest_is_atomic_and_rejects_stale_authorization_across_connections(self):
+        from unittest.mock import patch
+        from MaiLivingWorld.tests.test_growth_store import fill_interest_sources, interest, records
+        db, peer = self.store(), self.store()
+        original = fill_interest_sources(db, records("prior-private-", 3))
+        before = peer.state(now=130)["revision"]
+        first, second = [{**row, "scope": "public:news", "subject_id": "", "sensitivity": "public"}
+                         for row in records("new-public-", 2)]
+        first_id = db.enqueue([first], now=140)
+        first_job = db.claim(now=140)
+        second_id = peer.enqueue([second], now=141)
+        second_job = peer.claim(now=141)
+        options = {"expected_revision": before, "renew_interests": {original["key"]: original["revision"]}}
+        execute = db.con.execute
+        def fail_history(sql, parameters=()):
+            if sql.startswith("INSERT INTO growth_history"):
+                raise RuntimeError("synthetic-renewal-failure")
+            return execute(sql, parameters)
+        with patch.object(db.con, "execute", side_effect=fail_history):
+            with self.assertRaisesRegex(RuntimeError, "synthetic-renewal-failure"):
+                db.complete(first_id, first_job["token"], interest([first], -.04), [first], now=142, **options)
+        self.assertEqual(peer.state(now=143)["interests"], [original])
+        self.assertEqual(peer.status()["consumed"], 3)
+        result = db.complete(first_id, first_job["token"], interest([first], -.04), [first], now=144, **options)
+        self.assertEqual(result["renewed_interests"], 1)
+        current = peer.state(now=145)["interests"][0]
+        self.assertEqual((current["key"], current["weight"], current["revision"]),
+                         (original["key"], -.04, original["revision"]+1))
+        self.assertEqual([ref["id"] for ref in current["sources"]], [first["id"]])
+        self.assertEqual(peer.history()[0]["before"]["interests"], [original])
+        with self.assertRaisesRegex(ValueError, "revision_conflict"):
+            peer.complete(second_id, second_job["token"], interest([second]), [second], now=146, **options)
+        with self.assertRaisesRegex(ValueError, "interest_renewal_conflict"):
+            peer.complete(second_id, second_job["token"], interest([second]), [second], now=147,
+                          expected_revision=result["revision"], renew_interests=options["renew_interests"])
+        restored = peer.rollback(result["revision"], now=148)
+        self.assertEqual(restored["interests"], [original])
+        self.assertEqual(db.status()["consumed"], 4)
+        self.assertEqual(db.status()["jobs"]["pending"], 1)
+
     def test_extended_interest_preserves_all_sources_across_revision_race_and_reconnect(self):
         from MaiLivingWorld.tests.test_growth_store import fill_interest_sources, interest, records
         db, peer = self.store(), self.store()
