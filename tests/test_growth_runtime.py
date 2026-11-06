@@ -134,6 +134,38 @@ class GrowthRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(LEARNED_TEXT, prompt)
         self.assertEqual(self.bot._growth.state()["knowledge"][0]["text"], LEARNED_TEXT)
 
+    async def test_full_interest_finishes_each_review_without_starving_unrelated_knowledge(self):
+        from MaiLivingWorld.tests.test_growth_store import fill_interest_sources
+        self.bot._ensure_growth()
+        ids = [self.event("seed-"+str(i), "第"+str(i)+"次交流的观察") for i in range(24)]
+        old = fill_interest_sources(self.bot._growth, list(self.bot._resolve_roots(ids).values()), "交流方式")
+        before = self.bot._growth.state()["revision"]
+        for index, with_knowledge in enumerate((False, True)):
+            repeat = self.event("repeat-"+str(index), "一次新的交流观察")
+            sibling = self.event("sibling-"+str(index), "新的倾听材料")
+            rows = list(self.bot._resolve_roots([repeat, sibling]).values())
+            self.bot._growth.enqueue(rows)
+            data = empty_growth()
+            data["interests"] = [{"topic": "交流方式", "delta": .01, "evidence_ids": [repeat]}]
+            if with_knowledge:
+                data["knowledge"] = [{"topic": "交谈的节奏", "statement": LEARNED_TEXT,
+                                      "confidence": .7, "evidence_ids": [sibling]}]
+            self.model_for(data)
+            await self.bot._grow()
+            store = self.bot._growth
+            runtime = self.bot._growth_runtime
+            self.assertEqual(runtime.last_status, "learned" if with_knowledge else "interest_source_capacity")
+            self.assertEqual(runtime.last_counts["skipped_interest_overflow"], 1)
+            self.assertEqual(runtime.last_counts["changed"], with_knowledge)
+            self.assertEqual(store.state()["revision"], before+int(with_knowledge))
+            self.assertEqual(len(store.history()), before+int(with_knowledge))
+            self.assertEqual(store.state()["interests"], [old])
+            self.assertEqual(store.status()["consumed"], 24)
+            self.assertEqual(store.status()["jobs"], {"pending": 0, "running": 0, "done": 9+index, "failed": 0})
+        self.assertEqual(self.bot.ctx.llm.generate.await_count, 4)
+        self.assertEqual(self.bot._growth.state()["knowledge"][0]["text"], LEARNED_TEXT)
+        self.assertEqual([ref["id"] for ref in self.bot._growth.history()[0]["sources"]], [sibling])
+
     async def test_observe_does_not_change_profile_or_consume_active_evidence(self):
         ident = self.event()
         self.bot.config.growth.mode = "observe"

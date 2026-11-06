@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.34.0",
+        default="0.34.1",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.34.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.34.1；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1221,9 +1221,10 @@ class MaiLivingWorld(MaiBotPlugin):
                             from .social_discovery import reading_reaction_question
                             focus = resolved["records"]
                             ids = {row["id"] for row in focus}
-                            focused_growth = resolved.get("question_progress") or resolved.get("opinion_followup")
+                            focused_growth = (resolved.get("question_progress") or resolved.get("opinion_followup")
+                                              or resolved.get("interest_followup"))
                             candidates = [] if focused_growth else self._collect_unified(resolved["query"])
-                            if reading_reaction_question(query):
+                            if not focused_growth and reading_reaction_question(query):
                                 candidates = self._interest_memories() + candidates
                             related = [row for row in candidates
                                        if row["id"] not in ids and any(

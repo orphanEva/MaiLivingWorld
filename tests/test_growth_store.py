@@ -39,6 +39,16 @@ def belief(rows, statement="工具需要根据任务选择", topic="编程工具
                          "evidence_ids": [r["id"] for r in rows]}]}
 
 
+def fill_interest_sources(db, rows, topic="编程"):
+    for offset in range(0, len(rows), 3):
+        batch = rows[offset:offset+3]
+        stamp = 100 + offset
+        jid = db.enqueue(batch, now=stamp)
+        job = db.claim(now=stamp)
+        db.complete(jid, job["token"], interest(batch, .01, topic), batch, now=stamp+1)
+    return db.state(now=130)["interests"][0]
+
+
 class GrowthStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -329,10 +339,47 @@ class GrowthStoreTests(unittest.TestCase):
         rows[0]["sensitivity"] = "public"
         jid = self.db.enqueue(rows, now=151)
         job = self.db.claim(now=151)
-        with self.assertRaisesRegex(ValueError, "source_capacity"):
-            self.db.complete(jid, job["token"], belief(rows), rows, now=152)
+        for options in ({}, {"skip_interest_overflow": True}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "source_capacity"):
+                self.db.complete(jid, job["token"], belief(rows), rows, now=152, **options)
         self.assertEqual(self.db.state(now=152), previous)
         self.assertEqual(len(previous["beliefs"][0]["sources"]), 24)
+
+    def test_interest_capacity_skip_preserves_private_state_and_commits_only_valid_sibling(self):
+        old = fill_interest_sources(self.db, records("private-", 24))
+        rows = [{**row, "subject_id": "", "sensitivity": "public"} for row in records("public-", 2, "public")]
+        jid = self.db.enqueue(rows, now=140)
+        job = self.db.claim(now=140)
+        data = {"interests": [*interest(rows[:1])["interests"], *interest(rows[1:], topic="天文")["interests"]]}
+        with self.assertRaisesRegex(ValueError, "source_capacity"):
+            self.db.complete(jid, job["token"], data, rows, now=141)
+        result = self.db.complete(jid, job["token"], data, rows, now=141, skip_interest_overflow=True)
+        self.assertEqual((result["interests"], result["skipped_interest_overflow"]), (1, 1))
+        self.assertEqual(self.db.state(now=142)["interests"][0], old)
+        self.assertEqual(self.db.state(now=142)["interests"][1]["topic"], "天文")
+        history = self.db.history()[0]
+        self.assertEqual([ref["id"] for ref in history["sources"]], [rows[1]["id"]])
+        consumed = {r[0] for r in self.db.con.execute("SELECT source_id FROM growth_consumed").fetchall()}
+        self.assertNotIn(rows[0]["id"], consumed)
+        self.assertIn(rows[1]["id"], consumed)
+        self.assertEqual(self.db.rollback(result["revision"], now=143)["interests"], [old])
+
+    def test_capacity_skip_keeps_revision_conflicts_and_other_validation_fatal(self):
+        previous = records("prior-", 24)
+        old = fill_interest_sources(self.db, previous)
+        rows = [{**previous[0], "text": "已更正的版本"}, *records("independent-", 1)]
+        jid = self.db.enqueue(rows, now=140)
+        job = self.db.claim(now=140)
+        data = interest(rows)
+        with self.assertRaisesRegex(ValueError, "source_revision_conflict"):
+            self.db.complete(jid, job["token"], data, rows, now=141, skip_interest_overflow=True)
+        data = interest(rows[1:])
+        data["mood"] = {"bad_payload": True}
+        with self.assertRaisesRegex(ValueError, "invalid_item"):
+            self.db.complete(jid, job["token"], data, rows, now=141, skip_interest_overflow=True)
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
+        self.assertEqual(self.db.status()["jobs"]["running"], 1)
+        self.assertEqual(self.db.status()["consumed"], 24)
 
     def test_rollback_does_not_replenish_daily_trait_budget(self):
         for i in range(3):

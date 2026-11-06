@@ -12,7 +12,7 @@ from .growth_store import source_fingerprint
 from .mcp_runtime import digest
 from .owner import direct_message_text, extract_sender, normalize_qq
 from .reference_store import ReferenceStore
-from .social_discovery import reading_reaction_question
+from .social_discovery import interest_followup_question, reading_reaction_question
 from .unified_expression import _can_say, _records
 from .unified_memory import _source_id, derived_memories
 
@@ -49,6 +49,10 @@ _OPINION = ("主人在问你对刚才材料的当前看法或看法变化。只�
             "曾提过材料不证明曾向主人说过这条观点，也不证明主人认同。")
 _NO_OPINION = "[MaiLivingWorld:reference]\n这份材料目前缺少可核验的自身观点记录。可以说明还没有明确的看法，先问清具体想讨论哪一点。"
 _MANY_OPINIONS = "[MaiLivingWorld:reference]\n这份材料关联多个仍有效的自身观点。先问清指的是哪一条看法，再谈是否改变。"
+_INTEREST = ("主人在问刚才材料相关的自身兴趣。按本轮获准表达的兴趣回答当前倾向。只有记录明确包含前后变化时，"
+             "才谈以前的喜好和变化方向。历史不足时可以说明以前的倾向还无法确认。形成原因另需原始材料支持。")
+_NO_INTEREST = "[MaiLivingWorld:reference]\n目前无法确认对这部分内容的喜好，可以直接说明。不要按问句的预设补写以前的态度。"
+_WHICH_INTEREST = "[MaiLivingWorld:reference]\n先简短问清对方指刚才材料里的哪一部分，等明确后再聊喜好。"
 _BOILERPLATE = re.compile(r"MaiLivingWorld|主人(?:原话|更正|自述)|未经?独立(?:核实|验证)|作品元数据|未阅读或观看正文|记录于|收到于", re.I)
 _END_PUNCTUATION = " \t\n\r。！？.!?"
 
@@ -258,7 +262,31 @@ class ReferenceRuntime:
                 return self._question_progress(result, records[0])
             if opinion_followup(query):
                 return self._opinion_followup(result, records[0])
+            if interest_followup_question(query):
+                return self._interest_followup(result, records[0])
         return result
+
+    def _interest_followup(self, result, focus):
+        b = self.bot
+        result = {**result, "interest_followup": True, "records": [], "hint": _NO_INTEREST, "status": "unavailable"}
+        focus_ref = _ref(focus)
+        interests = [item for item in b._interest_memories() if focus_ref in item["sources"]]
+        if len(interests) > 1:
+            # A hidden interest can make the referent ambiguous. Ask without listing alternatives.
+            return {**result, "hint": _WHICH_INTEREST, "status": "ambiguous"}
+        if not interests:
+            return result
+        refs = interests[0]["sources"]
+        roots = b._resolve_roots([ref["id"] for ref in refs])
+        if any(ref["id"] not in roots or _ref(roots[ref["id"]]) != ref for ref in refs):
+            return result
+        others = sorted((row for row in roots.values() if row["id"] != focus["id"]),
+                        key=lambda row: (-row["timestamp"], row["id"]))
+        selected = ([focus]+others)[:b.config.unified_mind.recall_limit-1]
+        hint = _CONTINUE+"\n"+_INTEREST
+        if not selected:
+            hint += "本轮未提供原文，具体原因需要保留不确定。"
+        return {**result, "records": selected+interests, "hint": hint, "status": "resolved"}
 
     def _opinion_followup(self, result, focus):
         b = self.bot

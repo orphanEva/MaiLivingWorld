@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 
 from MaiLivingWorld.growth_model import empty_growth
-from MaiLivingWorld.social_discovery import interest_question, reading_reaction_question
+from MaiLivingWorld.social_discovery import interest_followup_question, interest_question, reading_reaction_question
 from MaiLivingWorld.tests.test_growth_runtime import model_response, review
 from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
@@ -172,6 +172,95 @@ class InterestExpressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("自己的兴趣倾向：摄影", unavailable)
         self.assertIn("先简短问清", unavailable)
 
+    async def test_interest_history_followup_checks_all_topics_sharing_one_source_before_limiting(self):
+        detail = "现场资料比较了聚光灯、拍摄角度与舞台边的声压。"
+        source = self.source("stage", detail)
+        await self.learn(interests=[("舞台拍摄", .04, source), ("现场音量", -.09, source)])
+        private = self.source("sound-note", "另一个人私下分享了自己的音量笔记。", private=True)
+        await self.learn(interests=[("现场音量", -.01, private)])
+        await self.reply("聊聊聚光灯、拍摄角度与舞台边的声压", "before-stage")
+        await self.bot.reference_send_feedback(sent=True,
+            message=message("stage-sent", uid="99999999", text=detail))
+        refs = self.bot._reference.store.state(OWNER)["focus_refs"]
+        self.assertEqual([ref["id"] for ref in refs], [source["id"]])
+        for limit in (1, 2, 12):
+            self.bot.config.unified_mind.recall_limit = limit
+            visible = await self.reply("你以前不是喜欢这个吗？", "ambiguous-stage-"+str(limit))
+            self.assertIn("指刚才材料里的哪一部分", visible)
+            self.assertEqual(self.memories, [])
+            for withheld in ("舞台拍摄", "现场音量", private["text"]):
+                self.assertNotIn(withheld, visible)
+        open_ended = await self.reply("你觉得它怎么样？", "open-stage")
+        self.assertIn(detail, open_ended)
+        self.assertIn("自己的兴趣倾向：舞台拍摄", open_ended)
+
+    async def test_unique_interest_followup_reserves_the_interest_and_reports_only_verified_change(self):
+        await self.reply("你最近喜欢什么", "before-photo")
+        await self.bot.reference_send_feedback(sent=True, message=message("photo-sent", uid="99999999", text=PHOTO))
+        self.bot.config.unified_mind.recall_limit = 1
+        first = await self.reply("你以前不是喜欢这个吗", "before-change")
+        self.assertEqual([row["kind"] for row in self.memories], ["interest"])
+        self.assertIn("自己的兴趣倾向：摄影", first)
+        self.assertIn("历史不足时可以说明以前的倾向还无法确认", first)
+        self.assertNotIn("最近一次有记录的调整", first)
+        self.assertIn("本轮未提供原文", first)
+        second = self.source("composition", "后来的构图资料还展示了夜色如何影响画面。")
+        await self.learn(interests=[("摄影", .01, second)])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.unified_mind.recall_limit = 2
+        visible = await self.reply("你的喜好怎么变了", "after-change", sid="new-private")
+        self.assertEqual([row["kind"] for row in self.memories], ["observation", "interest"])
+        self.assertIn(PHOTO, visible)
+        self.assertIn("兴趣有所回升", visible)
+        self.assertNotIn(second["text"], visible)
+        outdated = await self.reply("你现在还喜欢这个吗", "revoked", sid="new-private", on_expression=lambda:
+            self.bot._tool_store.retract_observation("news", "composition"))
+        self.assertNotIn("自己的兴趣倾向：摄影", outdated)
+        self.assertNotIn("兴趣有所回升", outdated)
+        missing = await self.reply("你现在还喜欢这个吗", "no-interest", sid="new-private")
+        self.assertIn("目前无法确认对这部分内容的喜好", missing)
+        self.assertNotIn("高音量音乐节", missing)
+
+    async def test_only_owner_authored_private_interest_followup_resolves_a_specific_preference(self):
+        text = "你现在还喜欢这个吗"
+        for kind in ("forward", "mismatch", "reply", "other", "group"):
+            await self.reply("你最近喜欢什么", "before-"+kind)
+            await self.bot.reference_send_feedback(sent=True, message=message("sent-"+kind, uid="99999999", text=PHOTO))
+            event = {**message("bad-"+kind, text=text), "raw_message": [{"type": "text", "data": text}]}
+            if kind == "forward":
+                event["raw_message"] = [{"type": "forward", "data": text}]
+            elif kind == "mismatch":
+                event["raw_message"][0]["data"] = "转述朋友的问题"
+            elif kind == "reply":
+                event["reply_to"] = "other-message"
+            elif kind == "other":
+                event["message_info"]["user_info"]["user_id"] = OTHER
+            else:
+                event["message_info"]["group_info"] = {"group_id": GROUP}
+            visible = await self.reply(text, event=event)
+            self.assertNotIn("主人在问刚才材料相关的自身兴趣", visible, kind)
+
+    async def test_single_private_interest_and_its_direction_remain_withheld(self):
+        source = self.source("shared-focus", "这份公开材料讨论了摄影师如何记录舞台现场。")
+        await self.learn(interests=[("蓝色手稿", -.08, source)])
+        private = self.source("secret-note", "另一个人私下讲过蓝色手稿的来历。", private=True)
+        await self.learn(interests=[("蓝色手稿", -.01, private)])
+        await self.reply("聊聊摄影师如何记录舞台现场", "before-hidden")
+        await self.bot.reference_send_feedback(sent=True, message=message("hidden-sent", uid="99999999", text=source["text"]))
+        visible = await self.reply("你现在还喜欢这个吗", "hidden-interest")
+        self.assertTrue(any(row["kind"] == "interest" and "蓝色手稿" in row["text"] for row in self.memories))
+        self.assertIn(source["text"], visible)
+        for withheld in ("蓝色手稿", private["text"], "目前不太感兴趣", "兴趣有所减弱"):
+            self.assertNotIn(withheld, visible)
+
+    async def test_another_version_of_the_same_original_cannot_resolve_the_interest(self):
+        runtime = self.bot._ensure_reference()
+        stale = {**self.photo, "text": "这份材料过去是另一版。"}
+        result = runtime._interest_followup({"query": "你现在还喜欢这个吗"}, stale)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["records"], [])
+
     async def test_negative_reaction_keeps_dislike_and_multiple_sources_require_clarification(self):
         await self.reply("你有没有不喜欢的", "before-negative")
         await self.bot.reference_send_feedback(sent=True,
@@ -232,4 +321,9 @@ class InterestQuestionTests(unittest.TestCase):
             self.assertEqual(interest_question(text), "")
         for text in ("你为什么喜欢这个？", "你为什么不喜欢它"):
             self.assertTrue(reading_reaction_question(text))
+            self.assertFalse(interest_followup_question(text))
+        for text in ("你以前不是喜欢这个吗？", "你现在还喜欢这个吗", "你的喜好怎么变了！"):
+            self.assertTrue(interest_followup_question(text))
+            self.assertTrue(reading_reaction_question(text))
+            self.assertFalse(interest_followup_question("朋友问"+text))
         self.assertFalse(reading_reaction_question("她问你为什么喜欢这个"))

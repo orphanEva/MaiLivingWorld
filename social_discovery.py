@@ -26,8 +26,8 @@ _REACTION_QUESTIONS = {
     "刚才那篇你怎么看", "刚才那篇哪里让你感兴趣", "你为什么对它感兴趣",
     "你喜欢它什么", "你喜欢刚才那篇的什么", "你最喜欢它哪一点",
     "你为什么喜欢这个", "你为什么喜欢它", "你为什么不喜欢这个", "你为什么不喜欢它",
-    "你以前不是喜欢这个吗", "你现在还喜欢这个吗", "你的喜好怎么变了",
 }
+_INTEREST_FOLLOWUPS = {"你以前不是喜欢这个吗", "你现在还喜欢这个吗", "你的喜好怎么变了"}
 _INTEREST_QUESTIONS = {
     "positive": {"你喜欢什么", "你最近喜欢什么", "你现在喜欢什么", "你有什么爱好", "你平时有什么爱好",
                  "你最近有什么爱好", "你对什么感兴趣", "你最近对什么感兴趣", "你现在对什么感兴趣"},
@@ -38,18 +38,24 @@ _INTEREST_QUESTIONS = {
 }
 
 
-def interest_question(text):
+def _short_question(text):
     if not isinstance(text, str) or len(text) > 80:
         return ""
-    text = unicodedata.normalize("NFKC", text).strip().rstrip("?？!！。~～").strip()
+    return unicodedata.normalize("NFKC", text).strip().rstrip("?？!！。~～").strip()
+
+
+def interest_question(text):
+    text = _short_question(text)
     return next((direction for direction, questions in _INTEREST_QUESTIONS.items() if text in questions), "")
 
 
+def interest_followup_question(text):
+    return _short_question(text) in _INTEREST_FOLLOWUPS
+
+
 def reading_reaction_question(text):
-    if not isinstance(text, str) or len(text) > 80:
-        return False
-    text = unicodedata.normalize("NFKC", text).strip().rstrip("?？!！。~～").strip()
-    return text in _REACTION_QUESTIONS
+    text = _short_question(text)
+    return text in _REACTION_QUESTIONS or text in _INTEREST_FOLLOWUPS
 
 
 def discovery_period(text):

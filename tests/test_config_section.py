@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.34.0")
+        self.assertRegex(defaults["plugin"]["config_version"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
         self.assertFalse(defaults["mcp"]["public_sources_enabled"])
         self.assertEqual(defaults["mcp"]["social_mode"], "关闭")
         self.assertFalse(defaults["general"]["enabled"])

@@ -114,6 +114,34 @@ class GrowthMySQLLiveTests(unittest.TestCase):
         records = derived_memories(reopened.state(now=122), resolved, fingerprint=source_fingerprint)
         self.assertEqual(annotate_interest_changes(records, reopened.history(limit=20)), records)
 
+    def test_interest_overflow_commits_with_siblings_atomically_across_connections(self):
+        from unittest.mock import patch
+        from MaiLivingWorld.tests.test_growth_store import fill_interest_sources, interest, records
+        db, peer = self.store(), self.store()
+        original = fill_interest_sources(db, records("old-private-", 24))
+        before = peer.state(now=131)["revision"]
+        new = records("fresh-", 2)
+        proposal = {"interests": [*interest(new[:1])["interests"], *interest(new[1:], topic="天文")["interests"]]}
+        jid = db.enqueue(new, now=140)
+        job = db.claim(now=140)
+        execute = db.con.execute
+        def fail_history(sql, parameters=()):
+            if sql.startswith("INSERT INTO growth_history"):
+                raise RuntimeError("synthetic-history-failure")
+            return execute(sql, parameters)
+        with patch.object(db.con, "execute", side_effect=fail_history):
+            with self.assertRaisesRegex(RuntimeError, "synthetic-history-failure"):
+                db.complete(jid, job["token"], proposal, new, now=141, skip_interest_overflow=True)
+        self.assertEqual(peer.state(now=142)["revision"], before)
+        self.assertEqual(peer.status()["consumed"], 24)
+        self.assertEqual(peer.status()["jobs"]["running"], 1)
+        result = db.complete(jid, job["token"], proposal, new, now=143, skip_interest_overflow=True)
+        self.assertEqual((result["interests"], result["skipped_interest_overflow"]), (1, 1))
+        self.assertEqual(peer.state(now=144)["interests"][0], original)
+        self.assertEqual(peer.status()["consumed"], 25)
+        self.assertEqual([ref["id"] for ref in peer.history()[0]["sources"]], [new[1]["id"]])
+        self.assertEqual(peer.rollback(result["revision"], now=145)["interests"], [original])
+
     def test_racing_claims_and_expired_lease_recovery(self):
         db = self.store()
         rows = evidence()

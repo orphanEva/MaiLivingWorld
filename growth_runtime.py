@@ -129,8 +129,11 @@ class GrowthRuntime:
                     raise _Changed()
                 records = sources()
                 self.last_counts = self.store.complete(job_id, token, proposal, records,
-                    expected_revision=revision, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes)
+                    expected_revision=revision, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes,
+                    skip_interest_overflow=True)
                 self.last_status = "observed" if mode == "observe" else "learned"
+                if mode == "active" and self.last_counts.get("skipped_interest_overflow") and not self.last_counts["changed"]:
+                    self.last_status = "interest_source_capacity"
             except _Budget:
                 release("budget_or_cooldown", max(60, budget.min_interval_seconds))
                 self.last_status = "budget_or_cooldown"

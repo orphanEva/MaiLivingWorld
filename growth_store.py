@@ -120,7 +120,7 @@ def _view(row: dict, now: float) -> dict:
 
 def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
                     records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False,
-                    emotional_episodes=False):
+                    emotional_episodes=False, skip_interest_overflow=False):
     fields = {*COLLECTIONS, "traits", "mood"} | ({"emotions"} if emotional_episodes else set())
     if not isinstance(proposal, dict) or set(proposal) - fields:
         raise ValueError("invalid_proposal")
@@ -149,7 +149,7 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             raise ValueError("invalid_evidence")
         return [allowed[sid] for sid in sorted(ids)]
 
-    def merge_sources(old: list[dict], new: list[dict]) -> list[dict]:
+    def merge_sources(old: list[dict], new: list[dict], *, skip_overflow=False) -> list[dict]:
         combined = {ref["id"]: ref for ref in old}
         for ref in new:
             previous = combined.get(ref["id"])
@@ -157,6 +157,10 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
                 raise ValueError("source_revision_conflict")
             combined[ref["id"]] = ref
         if len(combined) > MAX_RECORDS:
+            # Check every proposed reference for conflicting versions before
+            # classifying a valid merge as too large. Evidence is always nonempty.
+            if skip_overflow:
+                return []
             raise ValueError("source_capacity")
         return [combined[sid] for sid in sorted(combined)]
 
@@ -183,6 +187,7 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
         used.update(ref["id"] for ref in item["sources"] if ref["id"] in allowed)
 
     seen_interests = set()
+    skipped_interest_overflow = 0
     for item in proposal.get("interests", []):
         item_fields(item, {"topic", "delta", "evidence_ids"})
         topic = _text(item["topic"], 60, "invalid_topic")
@@ -197,8 +202,12 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
         weight = round(max(-1.0, min(1.0, previous + delta)), 8)
         if not fresh or weight == previous:
             continue
+        merged = merge_sources(current["sources"] if current else [], refs, skip_overflow=skip_interest_overflow)
+        if not merged:
+            skipped_interest_overflow += 1
+            continue
         changed = {"key": key, "topic": topic, "weight": weight,
-                   "sources": merge_sources(current["sources"] if current else [], refs),
+                   "sources": merged,
                    "revision": current["revision"] + 1 if current else 1}
         put("interests", current, changed)
         scalar_sources.update(ref["id"] for ref in fresh)
@@ -302,7 +311,7 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             stats["emotions"] = count
             used.update(emotion_used)
             scalar_sources.update(receipts)
-    return after, stats, used, scalar_sources
+    return after, stats, used, scalar_sources, skipped_interest_overflow
 
 
 class GrowthStore:
@@ -464,12 +473,14 @@ class GrowthStore:
 
     def complete(self, job_id: str, token: str, proposal: dict, records: list[dict],
                  now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False,
-                 emotional_episodes: bool = False) -> dict:
+                 emotional_episodes: bool = False, skip_interest_overflow: bool = False) -> dict:
         timestamp = _now(now)
         if type(review_beliefs) is not bool:
             raise ValueError("invalid_belief_review_mode")
         if type(emotional_episodes) is not bool:
             raise ValueError("invalid_emotional_episodes_mode")
+        if type(skip_interest_overflow) is not bool:
+            raise ValueError("invalid_interest_overflow_mode")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("invalid_revision")
         refs, lookup = _records(records)
@@ -494,8 +505,9 @@ class GrowthStore:
             consumed = {row[0] for row in self.con.execute(
                 "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in receipt_ids) + ")",
                 tuple(sorted(receipt_ids))).fetchall()}
-            after, stats, used, scalar_sources = _apply_proposal(before, proposal, allowed, lookup, consumed, timestamp,
-                review_beliefs=review_beliefs, emotional_episodes=emotional_episodes)
+            after, stats, used, scalar_sources, skipped = _apply_proposal(
+                before, proposal, allowed, lookup, consumed, timestamp, review_beliefs=review_beliefs,
+                emotional_episodes=emotional_episodes, skip_interest_overflow=skip_interest_overflow)
             changed = any(stats.values()) and job["mode"] == "active"
             revision = int(old["revision"])
             if changed:
@@ -511,6 +523,8 @@ class GrowthStore:
                                      (sid, job_id, timestamp))
             self.con.execute("UPDATE growth_jobs SET status='done',lease_token='',lease_until=0,"
                              "updated=?,error_code='' WHERE id=?", (timestamp, job_id))
+            if skipped:
+                stats["skipped_interest_overflow"] = skipped
             return {**stats, "revision": revision, "changed": bool(changed), "observed": job["mode"] == "observe"}
 
     def rollback(self, expected_revision: int, now: float | None = None) -> dict:
