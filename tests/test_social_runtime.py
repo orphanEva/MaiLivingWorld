@@ -28,7 +28,7 @@ class PublicFixture:
 
     async def list_tools(self):
         inputs = {"mastodon_identity": (), "mastodon_mentions": ("limit",), "mastodon_search": ("query", "limit"),
-                  "news_search": ("limit",), "web_search": ("query", "limit"), "news_read": ("id",),
+                  "news_search": ("query", "limit"), "web_search": ("query", "limit"), "news_read": ("id",),
                   "web_read": ("id",), "mastodon_read": ("id",)}
         return {name: {"input_schema": {"type": "object", "properties": {
             key: {"type": "integer" if key == "limit" else "string"} for key in keys}}} for name, keys in inputs.items()}
@@ -297,6 +297,86 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.calls("mastodon_identity") or self.calls("mastodon_reply"))
             self.assertIn("独立账号", self.bot._social_runtime().help_hint(OWNER))
 
+    async def test_no_account_news_search_uses_the_safe_interest_topic(self):
+        self.bot.config.mcp.social_mode = "只逛逛"
+        self.bot._interest_memories = lambda: [
+            {"kind": "interest", "topic": PRIVATE + "的摄影", "weight": .3},
+            {"kind": "interest", "topic": "游戏", "weight": -.4}]
+        self.pick = "摄影"
+        original = self.fixture.call_tool
+        async def topic_news(name, args):
+            if name == "news_search":
+                self.fixture.calls.append((name, dict(args)))
+                title = "摄影光线实验" if args.get("query") == "摄影" else "普通社区通告"
+                return {"items": [{"id": "un:2026:11:1143147", "title": title, "summary": ""}],
+                        "unavailable_sources": []}
+            return await original(name, args)
+        self.fixture.call_tool = topic_news
+        with patch.dict(os.environ, {"MLW_MASTODON_TOKEN": "", "MLW_BRAVE_SEARCH_KEY": ""}):
+            await self.tick()
+        self.assertEqual(self.calls("news_search"), [{"limit": 10, "query": "摄影"}])
+        self.assertEqual(self.calls("news_read"), [{"id": "un:2026:11:1143147"}])
+        self.assertFalse(self.calls("web_search") or self.calls("mastodon_identity") or self.calls("mastodon_reply"))
+        self.assertNotIn(PRIVATE, repr(self.prompts) + repr(self.fixture.calls))
+
+    async def test_complete_empty_topic_search_falls_back_to_latest_news_once(self):
+        self.pick = "科技新闻"
+        original = self.fixture.call_tool
+        async def empty_topic(name, args):
+            if name == "news_search" and args.get("query"):
+                self.fixture.calls.append((name, dict(args)))
+                return {"items": [], "unavailable_sources": []}
+            return await original(name, args)
+        self.fixture.call_tool = empty_topic
+        with patch.dict(os.environ, {"MLW_MASTODON_TOKEN": "", "MLW_BRAVE_SEARCH_KEY": ""}):
+            await self.tick()
+        self.assertEqual(self.calls("news_search"), [{"limit": 10, "query": "天文"}, {"limit": 10}])
+        self.assertEqual(len(self.calls("news_read")), 1)
+
+    async def test_topic_fallback_does_not_repeat_failed_partial_or_unverified_searches(self):
+        original = self.fixture.call_tool
+        for index, response in enumerate(({"items": []}, {"items": [], "unavailable_sources": ["feed"]}, None)):
+            with self.subTest(response=response):
+                async def incomplete(name, args):
+                    if name == "news_search":
+                        self.fixture.calls.append((name, dict(args)))
+                        if response is None:
+                            raise RuntimeError("synthetic provider failure")
+                        return response
+                    return await original(name, args)
+                self.fixture.call_tool = incomplete
+                before = len(self.calls("news_search"))
+                with patch.dict(os.environ, {"MLW_MASTODON_TOKEN": "", "MLW_BRAVE_SEARCH_KEY": ""}):
+                    if index:
+                        await self.next_window(hours=index*3)
+                    else:
+                        await self.tick()
+                self.assertEqual(len(self.calls("news_search"))-before, 1)
+                self.assertFalse(self.calls("news_read"))
+
+    async def test_topic_fallback_preserves_the_tool_budget_and_interest_version(self):
+        original = self.fixture.call_tool
+        interests = [{"kind": "interest", "topic": "摄影", "weight": .3}]
+        self.bot._interest_memories = lambda: interests
+        change = False
+        async def empty_topic(name, args):
+            if name == "news_search":
+                self.fixture.calls.append((name, dict(args)))
+                if change:
+                    interests[0]["weight"] = -.3
+                return {"items": [], "unavailable_sources": []}
+            return await original(name, args)
+        self.fixture.call_tool = empty_topic
+        self.bot.config.mcp.max_daily_calls = 1
+        with patch.dict(os.environ, {"MLW_MASTODON_TOKEN": "", "MLW_BRAVE_SEARCH_KEY": ""}):
+            await self.tick()
+            self.assertEqual(len(self.calls("news_search")), 1)
+            self.bot.config.mcp.max_daily_calls = 10
+            change = True
+            await self.next_window()
+        self.assertEqual(len(self.calls("news_search")), 2)
+        self.assertFalse(self.calls("news_read"))
+
     async def test_only_direct_owner_acknowledgment_resolves_pending_help(self):
         social = self.bot._social_runtime()
         self.bot._ensure_tool_store().social_help(social.key(OWNER), "social_reply_uncertain")
@@ -316,6 +396,7 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertEqual(self.calls("web_search")[0]["query"], "摄影")
         self.assertEqual(self.calls("mastodon_search")[0]["query"], "摄影")
+        self.assertEqual(self.calls("news_search")[0]["query"], "摄影")
         self.assertNotIn(PRIVATE, repr(self.prompts) + repr(self.fixture.calls))
         self.assertNotIn("游戏", public_interests([{"kind": "interest", "topic": "游戏", "weight": -0.5}]))
         self.assertEqual(public_interests([{"kind": "interest", "topic": t, "weight": -1}

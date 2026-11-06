@@ -253,7 +253,11 @@ class SocialRuntime:
         elif cfg.social_mode == "参与讨论" or not cfg.public_sources_enabled:
             store.social_help(key, "social_setup_required")
         if cfg.public_sources_enabled:
-            add("news", "news_read", await read("news", "news_search", {"limit": 10}))
+            news_args = {"limit": 10, **({"query": topic} if topic else {})}
+            news = await read("news", "news_search", news_args)
+            add("news", "news_read", news)
+            if topic and news.get("items") == [] and news.get("unavailable_sources") == []:
+                add("news", "news_read", await read("news", "news_search", {"limit": 10}))
             if topic and os.environ.get("MLW_BRAVE_SEARCH_KEY"):
                 add("news", "web_read", await read("news", "web_search", {"query": topic, "limit": 5}))
         choice = await self._choose(choices, topics, valid, interest_scores=scores)

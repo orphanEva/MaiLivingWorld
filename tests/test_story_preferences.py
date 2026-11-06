@@ -5,6 +5,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from MaiLivingWorld.explore import Story
 from MaiLivingWorld.growth_model import empty_growth
@@ -84,6 +85,28 @@ class StoryPreferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.bot._choose_story(TARGET))["key"], "neutral")
         self.bot._store.record_attempt(TARGET, time.time(), "explore", "neutral")
         self.assertIsNone(await self.bot._choose_story(TARGET))
+
+    async def test_interest_ranking_uses_a_bounded_pool_beyond_the_small_reply_menu(self):
+        source = self.source("photography", "摄影资料介绍了构图和光线的变化。")
+        await self.learn(source, interests=[("摄影", .05)])
+        self.story("favorite", "摄影光线实验", age=10)
+        for number in range(5):
+            self.story("notice-"+str(number), "普通社区通告"+str(number), age=5-number)
+        with patch.object(self.bot._store, "candidates", wraps=self.bot._store.candidates) as candidates:
+            self.assertEqual((await self.bot._choose_story(TARGET))["key"], "favorite")
+        self.assertEqual(candidates.call_args.args[-1], 60)
+        self.bot._tool_store.retract_observation("news", "photography")
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "notice-4")
+
+    async def test_blocked_newer_stories_do_not_hide_an_eligible_older_choice(self):
+        source = self.source("games", "游戏资料讨论反复竞争的体验。")
+        await self.learn(source, interests=[("游戏", -.1)])
+        self.bot.config.explorer.blocked_words = ["广告"]
+        self.story("normal", "海洋观测记录", age=10)
+        self.story("game", "游戏排行榜", age=6)
+        for number in range(3):
+            self.story("blocked-"+str(number), "热门广告"+str(number), age=3-number)
+        self.assertEqual((await self.bot._choose_story(TARGET))["key"], "normal")
 
     async def test_independent_renewal_changes_public_selection_across_restart_and_new_retraction(self):
         old = self.source("old-photo", "公开摄影教程介绍了常见构图方式。")

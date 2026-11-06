@@ -15,6 +15,7 @@ from MaiLivingWorld.tests.test_mcp_plugin import message, OWNER, OTHER, GROUP
 from MaiLivingWorld.tests.test_mcp_research import LibraryClient
 from MaiLivingWorld.tests.test_companion_runtime import NovelMCP, NOTE
 from MaiLivingWorld.growth_model import empty_growth
+from MaiLivingWorld.tests.test_growth_store import fill_interest_sources
 from MaiLivingWorld.projects_runtime import ProjectsRuntime
 from MaiLivingWorld.store import Store
 from MaiLivingWorld.unified_expression import parse_expression
@@ -88,6 +89,14 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         event = message(**kw)
         self.bot._unified.capture(event, private_users=[OWNER, OTHER], group_ids=[GROUP])
         return event
+
+    def grow(self, sources, proposal, **options):
+        store = self.bot._growth
+        ident = store.enqueue(sources)
+        lease = store.claim()
+        self.assertEqual(lease["id"], ident)
+        return store.complete(ident, lease["token"], proposal, sources,
+                              expected_revision=store.state()["revision"], **options)
 
     def three_open_questions(self, *, select=True):
         for index, topic in enumerate(("森林旅人色彩", "森林旅人作者")):
@@ -192,6 +201,153 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(attention._activity_record(candidates[0]))
         self.assertEqual(self.runtime.candidates(), [])
 
+    async def test_gather_continues_when_the_same_interest_gains_evidence(self):
+        row = self.runtime.prepare()
+        original_seed = row["seed"]
+        more = self.bot._tool_store.put_observation("cap", "album:more-interest",
+            "森林旅人资料进一步描述了旅途中的风景。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([more], {"interests": [{"topic": "森林旅人", "delta": .02,
+                                        "evidence_ids": [more["id"]]}]})
+        self.runtime.prepare()
+        current = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual((current["status"], current["revision"], current["seed"]),
+                         ("active", row["revision"], original_seed))
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        self.assertEqual(self.runtime.candidates()[0]["key"], row["id"])
+        self.assertTrue((await self.runtime.tick())["success"])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["stage"], "review")
+
+    async def test_gather_accepts_question_evidence_but_stops_when_the_question_changes(self):
+        row = self.runtime.prepare()
+        more = self.bot._tool_store.put_observation("cap", "album:more-question",
+            "森林旅人提供了一份补充旅途线索。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([more], {"questions": [{"topic": "森林旅人", "question": row["seed"]["question"],
+            "status": "open", "evidence_ids": [more["id"]]}]})
+        self.runtime.prepare()
+        self.assertEqual(len(self.runtime.candidates()), 1)
+        changed = self.bot._tool_store.put_observation("cap", "album:changed-question",
+            "森林旅人的新资料转而讨论作者。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([changed], {"questions": [{"topic": "森林旅人", "question": "森林旅人的作者有何创作经历？",
+            "status": "open", "evidence_ids": [changed["id"]]}]})
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.candidates(), [])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["reason"], "source_changed")
+
+    async def test_new_interest_basis_cannot_continue_a_project_via_question_sources(self):
+        fresh = self.bot._tool_store.put_observation("cap", "album:renewal-basis",
+            "森林旅人还有一份可供重新了解的独立材料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([fresh], {"questions": [{"topic": "森林旅人", "question": "森林旅人如何描写旅途？",
+            "status": "open", "evidence_ids": [fresh["id"]]}]})
+        row = self.runtime.prepare()
+        interest = self.bot._growth.state()["interests"][0]
+        self.bot._growth.retire(interest["key"], expected_revision=self.bot._growth.state()["revision"])
+        extra = self.bot._tool_store.put_observation("cap", "album:renewal-extra",
+            "同批还有一份别的作品资料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([fresh, extra], {"interests": [{"topic": "森林旅人", "delta": .03, "evidence_ids": [fresh["id"]]}]})
+        self.assertTrue(all(ref in self.bot._growth_snapshot()["questions"][0]["sources"]
+                            for ref in row["seed"]["seed_refs"]))
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.candidates(), [])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["reason"], "source_changed")
+
+    async def test_large_interest_project_preserves_all_private_sources_and_small_review(self):
+        sources = [self.bot._tool_store.put_observation("cap", "album:long-"+str(index),
+            "森林旅人第"+str(index)+"份材料描述了旅途景象。",
+            "private:"+(OTHER if index == 158 else OWNER),
+            subject_id=OTHER if index == 158 else OWNER) for index in range(159)]
+        fill_interest_sources(self.bot._growth, sources, "森林旅人")
+        state = self.bot._growth.state()
+        self.bot._growth.retire(state["questions"][0]["key"], expected_revision=state["revision"])
+        separate = self.bot._tool_store.put_observation("cap", "album:separate-question",
+            "另一份材料提出森林旅人的旅途描写问题。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([separate], {"questions": [{"topic": "森林旅人", "question": "森林旅人如何描写旅途？",
+            "status": "open", "evidence_ids": [separate["id"]]}]})
+        row = self.runtime.prepare()
+        self.assertEqual(len(row["seed"]["interest_refs"]), 160)
+        self.assertEqual(len(row["seed"]["seed_refs"]), 161)
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        with patch.object(self.bot, "_resolve_roots", wraps=self.bot._resolve_roots) as resolve:
+            self.assertTrue((await self.runtime.tick())["success"])
+        self.assertTrue(all(len(call.args[0]) <= 128 for call in resolve.call_args_list))
+        self.model()
+        self.assertTrue((await self.tick_later())["success"])
+        for call in self.bot.ctx.llm.generate.await_args_list:
+            self.assertNotIn(sources[-1]["text"], call.args[0])
+            self.assertLess(len(call.args[0]), 12000)
+        result = self.runtime.records()[0]
+        self.assertEqual(len(result["sources"]), 162)
+        self.assertEqual(result["sensitivity"], "personal")
+        self.assertEqual(result["subject_id"], "")
+        self.bot._tool_store.retract_observation("cap", "album:long-158")
+        self.assertEqual(self.runtime.records(), [])
+
+    async def test_owner_paused_and_stopped_projects_keep_their_status_after_interest_growth(self):
+        row = self.runtime.prepare()
+        self.runtime.store.command(OWNER, row["id"], row["revision"], "pause", "a"*64, "b"*64)
+        more = self.bot._tool_store.put_observation("cap", "album:owner-paused",
+            "森林旅人的资料增补了旅途内容。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([more], {"interests": [{"topic": "森林旅人", "delta": .02, "evidence_ids": [more["id"]]}]})
+        self.runtime.prepare()
+        paused = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual((paused["status"], paused["reason"]), ("paused", "owner_pause"))
+        self.runtime.store.command(OWNER, row["id"], paused["revision"], "stop", "c"*64, "d"*64)
+        self.runtime.prepare()
+        stopped = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual((stopped["status"], stopped["reason"]), ("stopped", "owner_stop"))
+        self.assertEqual(self.runtime.candidates(), [])
+
+    async def test_negative_interest_pauses_and_later_recovery_waits_for_owner_resume(self):
+        row = self.runtime.prepare()
+        for index, delta in enumerate((-.1, .1)):
+            source = self.bot._tool_store.put_observation("cap", "album:changed-interest-"+str(index),
+                "森林旅人的另一份材料展示了新的旅途视角。", "private:"+OWNER, subject_id=OWNER)
+            self.grow([source], {"interests": [{"topic": "森林旅人", "delta": delta,
+                                              "evidence_ids": [source["id"]]}]})
+            self.runtime.prepare()
+            current = self.runtime.store.get(OWNER, row["id"])
+            self.assertEqual((current["status"], current["reason"]), ("paused", "source_changed"))
+        self.assertTrue(self.runtime.capture(message(
+            text=f"/项目 继续 {row['id']} {current['revision']}", mid="resume-after-recovery")))
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
+
+    async def test_legacy_separate_sources_need_an_exact_seed_to_preserve_the_old_interest_basis(self):
+        state = self.bot._growth.state()
+        self.bot._growth.retire(state["questions"][0]["key"], expected_revision=state["revision"])
+        source = self.bot._tool_store.put_observation("cap", "album:legacy-separate",
+            "森林旅人的独立问题资料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([source], {"questions": [{"topic": "森林旅人", "question": "森林旅人如何描写旅途？",
+            "status": "open", "evidence_ids": [source["id"]]}]})
+        seed = self.runtime.seed_candidates()[0]
+        seed.pop("interest_refs")
+        row = self.runtime.store.create(OWNER, seed)
+        self.assertTrue(self.runtime._current(row, active=True))
+        more = self.bot._tool_store.put_observation("cap", "album:legacy-more",
+            "森林旅人的新兴趣材料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([more], {"interests": [{"topic": "森林旅人", "delta": .02, "evidence_ids": [more["id"]]}]})
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "paused")
+
+    async def test_legacy_separate_basis_does_not_assume_continuity_for_a_refined_review(self):
+        state = self.bot._growth.state()
+        self.bot._growth.retire(state["questions"][0]["key"], expected_revision=state["revision"])
+        source = self.bot._tool_store.put_observation("cap", "album:legacy-review-question",
+            "森林旅人的独立问题资料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([source], {"questions": [{"topic": "森林旅人", "question": "森林旅人如何描写旅途？",
+            "status": "open", "evidence_ids": [source["id"]]}]})
+        seed = self.runtime.seed_candidates()[0]
+        seed.pop("interest_refs")
+        row = self.runtime.store.create(OWNER, seed)
+        self.assertTrue((await self.runtime.tick())["success"])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["stage"], "review")
+        more = self.bot._tool_store.put_observation("cap", "album:legacy-refined-review",
+            "森林旅人的新资料把问题细化到旅途的色彩描写。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([more], {"questions": [{"topic": "森林旅人", "question": "森林旅人如何用色彩描写旅途？",
+            "status": "open", "evidence_ids": [more["id"]]}]})
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "paused")
+
     async def test_gathered_project_reviews_original_question_after_growth_answers_it(self):
         row = await self.gathered()
         for status in ("open", "resolved"):
@@ -225,8 +381,14 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_pixiv_project_continues_with_same_sources_after_restart(self):
         seed = self.runtime.seed_candidates()[0]
+        seed.pop("interest_refs")
         seed["source_signature"] = self.bot._mcp_source_signature("pixiv")
         row = self.runtime.store.create(OWNER, seed)
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
+        source = self.bot._tool_store.put_observation("cap", "album:legacy-shared-more",
+            "森林旅人的新增旅途资料。", "private:"+OWNER, subject_id=OWNER)
+        self.grow([source], {"interests": [{"topic": "森林旅人", "delta": .02, "evidence_ids": [source["id"]]}]})
         self.runtime.prepare()
         self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
         self.assertTrue((await self.runtime.tick())["success"])

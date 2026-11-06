@@ -321,11 +321,17 @@ def seed_followthrough(store):
 def seed_projects(store):
     owner = "12345678"
     def seed(letter):
-        return {"question_key": "q:"+letter*24, "interest_key": "i:"+letter*24,
+        item = {"question_key": "q:"+letter*24, "interest_key": "i:"+letter*24,
                 "topic": "天文作品", "question": "这篇作品有哪些天文线索？",
                 "seed_refs": [{"id": "brain:fact:"+letter, "digest": "a"*64,
                                "scope": "private:"+owner, "sensitivity": "personal"}],
                 "source_signature": "b"*64}
+        if letter == "a":
+            item["seed_refs"] = [
+                {"id": "brain:fact:project-source-"+str(index), "digest": "a"*64,
+                 "scope": "private:"+owner, "sensitivity": "personal"} for index in range(184)]
+            item["interest_refs"] = item["seed_refs"][:160]
+        return item
     completed = store.create(owner, seed("a"), now=100)
     claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=101)
     evidence = {"id": "tool:observation:"+"c"*64, "digest": "d"*64,
@@ -401,6 +407,12 @@ def assert_v20_restore(case, store, expected):
     if "projects_items" in expected:
         items = {item["seed"]["question_key"]: item for item in store.items("12345678")}
         case.assertEqual(items["q:"+"a"*24]["status"], "completed")
+        case.assertEqual(len(items["q:"+"a"*24]["seed"]["seed_refs"]), 184)
+        interest_refs = items["q:"+"a"*24]["seed"]["interest_refs"]
+        case.assertEqual(len(interest_refs), 160)
+        case.assertEqual({ref["id"] for ref in interest_refs},
+                         {"brain:fact:project-source-"+str(index) for index in range(160)})
+        case.assertTrue(all(ref in items["q:"+"a"*24]["seed"]["seed_refs"] for ref in interest_refs))
         case.assertEqual(items["q:"+"b"*24]["status"], "paused")
         case.assertEqual(items["q:"+"c"*24]["reason"], "source_changed")
         case.assertEqual(items["q:"+"d"*24]["status"], "stopped")
@@ -827,7 +839,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.36")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.37")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -854,6 +866,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V35_LEDGERS, backup.V34_LEDGERS)
         self.assertEqual(backup.V36_LEDGERS, backup.V35_LEDGERS)
         self.assertIsNot(backup.V36_LEDGERS, backup.V35_LEDGERS)
+        self.assertEqual(backup.V37_LEDGERS, backup.V36_LEDGERS)
+        self.assertIsNot(backup.V37_LEDGERS, backup.V36_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -874,7 +888,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1269,6 +1283,13 @@ class SQLiteBackupTests(unittest.TestCase):
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (21, []))
 
+    def test_v36_archive_restores_with_the_current_schema(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.36")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.36", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
     def test_long_interest_and_original_tool_material_survive_restore_and_retraction(self):
         from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.tool_store import ToolStore
@@ -1399,7 +1420,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.36")
+        self.assertEqual(current["catalog"], "v0.37")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1854,7 +1875,7 @@ class MySQLBackupTests(unittest.TestCase):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
         current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35"):
+        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36"):
             with self.subTest(catalog=catalog):
                 archive = Path(self.temp.name)/(catalog+".zip")
                 with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
@@ -1929,7 +1950,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.36")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.37")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v35_backup_"+table+"`")
@@ -1979,7 +2000,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.36")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.37")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

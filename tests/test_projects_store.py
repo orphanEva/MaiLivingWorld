@@ -2,8 +2,12 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from MaiLivingWorld.projects_store import ProjectsStore, digest
+from MaiLivingWorld.projects_store import (
+    MAX_PROJECT_SOURCES, MAX_SEED_SOURCES, ProjectsStore, digest, references, seed_value,
+)
+from MaiLivingWorld.growth_limits import MAX_INTEREST_SOURCES
 
 OWNER, OTHER = "12345678", "87654321"
 
@@ -15,6 +19,14 @@ def reference(letter="a"):
 def seed(key="a"):
     return {"question_key": "q:"+key*24, "interest_key": "i:"+"d"*24,
             "topic": "天文作品", "question": "这些天文作品提供了哪些资料？", "seed_refs": [reference()], "source_signature": "e"*64}
+
+
+def long_seed():
+    refs = [{"id": "tool:observation:"+digest(["project", index]), "digest": digest(["source", index]),
+             "scope": "private:"+OWNER, "sensitivity": "personal"}
+            for index in range(MAX_SEED_SOURCES)]
+    refs[-1] = {**refs[-1], "scope": "private:"+OTHER, "sensitivity": "confidential"}
+    return {**seed(), "seed_refs": refs, "interest_refs": refs[:MAX_INTEREST_SOURCES]}
 
 
 def result(outcome="supported", letter="c"):
@@ -47,6 +59,85 @@ class ProjectsChecks:
         self.assertEqual(completed["result"], result())
         self.assertEqual(self.created(db, now=405)["status"], "completed")
         self.assertIsNone(db.get(OTHER, row["id"]))
+
+    def test_long_seed_and_separate_evidence_survive_restart_and_completion(self):
+        db = self.store()
+        source = long_seed()
+        canonical = seed_value(source)
+        row = db.create(OWNER, source, now=100)
+        self.assertEqual(len(row["seed"]["seed_refs"]), 184)
+        self.assertEqual(len(row["seed"]["interest_refs"]), 160)
+        reader = self.store()
+        self.assertEqual(reader.get(OWNER, row["id"])["seed"], canonical)
+        evidence = [{**reference(), "id": "tool:observation:"+digest(["evidence", index])}
+                    for index in range(24)]
+        claim = self.claimed(reader, row)
+        self.assertTrue(reader.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                                      action="gathered", evidence_refs=evidence, now=102))
+        gathered = db.get(OWNER, row["id"])
+        self.assertEqual(len(references(gathered["seed"]["seed_refs"]+gathered["evidence_refs"],
+                                        limit=MAX_PROJECT_SOURCES)), 208)
+        conclusion = {**result(), "quotes": [{"source_id": evidence[0]["id"], "quote": "天文主题"}]}
+        review = self.claimed(db, gathered, now=403)
+        self.assertTrue(db.finish(OWNER, row["id"], review["lease_token"], review["revision"],
+                                  action="reviewed", result=conclusion, now=404))
+        completed = reader.get(OWNER, row["id"])
+        self.assertEqual((completed["status"], completed["seed"]), ("completed", canonical))
+        self.assertEqual(completed["evidence_refs"], references(evidence))
+        self.assertTrue(any(ref["scope"] == "private:"+OTHER and ref["sensitivity"] == "confidential"
+                            for ref in completed["seed"]["seed_refs"]))
+
+    def test_long_seed_rollback_on_audit_failure_keeps_the_retry_complete(self):
+        db = self.store()
+        source = long_seed()
+        with patch.object(db, "_audit", side_effect=RuntimeError("synthetic audit failure")):
+            with self.assertRaisesRegex(RuntimeError, "synthetic audit failure"):
+                db.create(OWNER, source, now=100)
+        self.assertEqual(db.items(OWNER), [])
+        self.assertEqual(db.state(OWNER)["revision"], 0)
+        row = db.create(OWNER, source, now=101)
+        self.assertEqual(row["seed"], seed_value(source))
+        self.assertEqual(len(db.items(OWNER)), 1)
+
+    def test_source_limits_and_interest_membership_are_validated_before_writes(self):
+        db = self.store()
+        source = long_seed()
+        extra = {**reference(), "id": "tool:observation:"+digest("extra")}
+        wrong_ref = {**source["interest_refs"][0], "digest": "f"*64}
+        invalid = [
+            {**source, "seed_refs": source["seed_refs"]+[extra]},
+            {**source, "interest_refs": source["seed_refs"][:MAX_INTEREST_SOURCES+1]},
+            {**source, "interest_refs": []},
+            {**source, "interest_refs": [extra]},
+            {**source, "interest_refs": [wrong_ref]},
+            {**source, "unknown": "unexpected"},
+        ]
+        for proposed in invalid:
+            with self.subTest(proposed=proposed.keys()), self.assertRaises(ValueError):
+                db.create(OWNER, proposed, now=100)
+        self.assertEqual(db.items(OWNER), [])
+        self.assertEqual(db.state(OWNER)["revision"], 0)
+        legacy = db.create(OWNER, seed(), now=101)
+        self.assertEqual(legacy["seed"], seed())
+        self.assertNotIn("interest_refs", legacy["seed"])
+
+    def test_default_reference_and_evidence_limits_stay_bounded(self):
+        refs = long_seed()["seed_refs"]
+        self.assertEqual(len(references(refs[:24])), 24)
+        for limit in (True, 0, -1, MAX_PROJECT_SOURCES+1, 24.0):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                references(refs[:1], limit=limit)
+        with self.assertRaises(ValueError):
+            references(refs[:25])
+        self.assertEqual(len(references(refs, limit=MAX_SEED_SOURCES)), 184)
+        self.assertEqual(references([], empty=True), [])
+        db = self.store()
+        row = self.created(db)
+        claim = self.claimed(db, row)
+        with self.assertRaises(ValueError):
+            db.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                      action="gathered", evidence_refs=refs[:25], now=102)
+        self.assertEqual(db.get(OWNER, row["id"])["stage"], "gather")
 
     def test_cannot_complete_without_evidence_or_with_unbound_quotes(self):
         db = self.store()

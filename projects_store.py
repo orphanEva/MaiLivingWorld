@@ -11,8 +11,12 @@ import time
 import uuid
 
 from .mysql_compat import MySQLCompatConnection
+from .growth_limits import MAX_INTEREST_SOURCES, MAX_RECORDS
 from .owner import normalize_qq
 from .sql_logging import connect_sqlite
+
+MAX_SEED_SOURCES = MAX_INTEREST_SOURCES + MAX_RECORDS
+MAX_PROJECT_SOURCES = MAX_SEED_SOURCES + MAX_RECORDS
 
 
 def digest(value):
@@ -50,8 +54,10 @@ def _hex(value):
     return value
 
 
-def references(rows, *, empty=False):
-    if not isinstance(rows, list) or not (0 if empty else 1) <= len(rows) <= 24:
+def references(rows, *, empty=False, limit=MAX_RECORDS):
+    if type(limit) is not int or not 1 <= limit <= MAX_PROJECT_SOURCES:
+        raise ValueError("invalid_sources")
+    if not isinstance(rows, list) or not (0 if empty else 1) <= len(rows) <= limit:
         raise ValueError("invalid_sources")
     result = {}
     for row in rows:
@@ -70,13 +76,22 @@ def references(rows, *, empty=False):
 
 
 def seed_value(seed):
-    if not isinstance(seed, dict) or set(seed) != {"question_key", "interest_key", "topic", "question", "seed_refs", "source_signature"}:
+    fields = {"question_key", "interest_key", "topic", "question", "seed_refs", "source_signature"}
+    if not isinstance(seed, dict) or set(seed) not in (fields, fields | {"interest_refs"}):
         raise ValueError("invalid_seed")
     if not re.fullmatch(r"q:[0-9a-f]{24}", str(seed["question_key"])) or not re.fullmatch(r"i:[0-9a-f]{24}", str(seed["interest_key"])):
         raise ValueError("invalid_seed")
-    return {"question_key": seed["question_key"], "interest_key": seed["interest_key"],
+    checked = {"question_key": seed["question_key"], "interest_key": seed["interest_key"],
             "topic": _text(seed["topic"], 180), "question": _text(seed["question"], 360),
-            "seed_refs": references(seed["seed_refs"]), "source_signature": _hex(seed["source_signature"])}
+            "seed_refs": references(seed["seed_refs"], limit=MAX_SEED_SOURCES),
+            "source_signature": _hex(seed["source_signature"])}
+    if "interest_refs" in seed:
+        interest_refs = references(seed["interest_refs"], limit=MAX_INTEREST_SOURCES)
+        all_refs = {ref["id"]: ref for ref in checked["seed_refs"]}
+        if any(all_refs.get(ref["id"]) != ref for ref in interest_refs):
+            raise ValueError("invalid_seed")
+        checked["interest_refs"] = interest_refs
+    return checked
 
 
 class ProjectsStore:

@@ -10,7 +10,7 @@ from .growth_store import source_fingerprint
 from .mcp_runtime import day_start
 from .owner import extract_sender, normalize_qq
 from .projects_model import evidence_records, understand_project
-from .projects_store import ProjectsStore, digest, references
+from .projects_store import MAX_PROJECT_SOURCES, MAX_SEED_SOURCES, ProjectsStore, digest, references
 from .tool_store import _digest as tool_digest
 from .unified_memory import _terms
 
@@ -107,11 +107,9 @@ class ProjectsRuntime:
                 continue
             score, interest = max(matches, key=lambda pair: (pair[0], pair[1]["weight"], pair[1]["key"]))
             try:
-                refs = references(interest["sources"]+question["sources"])
-                if len(refs) > 16:
-                    continue
+                refs = references(interest["sources"]+question["sources"], limit=MAX_SEED_SOURCES)
                 seed = {"question_key": question["key"], "interest_key": interest["key"], "topic": question["topic"],
-                        "question": question["text"], "seed_refs": refs,
+                        "question": question["text"], "seed_refs": refs, "interest_refs": interest["sources"],
                         "source_signature": self.bot._research_source_signature()}
                 from .projects_store import seed_value
                 seed_value(seed)
@@ -122,7 +120,7 @@ class ProjectsRuntime:
 
     def _resolve(self, refs):
         try:
-            rows = self.bot._resolve_roots([ref["id"] for ref in refs])
+            rows = self.bot._resolve_growth_roots([ref["id"] for ref in refs])
             return rows if all(ref["id"] in rows and _ref(rows[ref["id"]]) == ref for ref in refs) else None
         except (ValueError, KeyError, TypeError):
             return None
@@ -133,7 +131,7 @@ class ProjectsRuntime:
                 or row["seed"]["source_signature"] not in {signature, self.bot._mcp_source_signature("pixiv")}):
             return False
         try:
-            refs = references(row["seed"]["seed_refs"]+row["evidence_refs"])
+            refs = references(row["seed"]["seed_refs"]+row["evidence_refs"], limit=MAX_PROJECT_SOURCES)
         except ValueError:
             return False
         if self._resolve(refs) is None:
@@ -141,14 +139,20 @@ class ProjectsRuntime:
         # Older projects retain their Pixiv source hash in storage. Validate it
         # above, then compare the same seed under the current reader signature.
         seed = dict(row["seed"], source_signature=signature)
-        if not active or seed in self.seed_candidates():
+        if not active:
+            return True
+        candidates = self.seed_candidates()
+        if "interest_refs" not in seed:
+            candidates = [{key: value for key, value in candidate.items() if key != "interest_refs"}
+                          for candidate in candidates]
+        if seed in candidates:
             return True
         # A gathered project reviews its original question and evidence even
         # when the growth worker has already refined or answered that question.
         cfg = self.bot.config
         reading_available = (cfg.mcp.enabled and cfg.mcp_pixiv.enabled and cfg.mcp.remember_results
                              and cfg.reading.enabled and cfg.reading.auto_continue)
-        if row["stage"] != "review" or not (self.bot._research_available() or reading_available):
+        if row["stage"] not in {"gather", "review"} or not (self.bot._research_available() or reading_available):
             return False
         state = self.bot._growth_snapshot()
         question = next((item for item in state["questions"] if item["key"] == seed["question_key"]), None)
@@ -156,11 +160,19 @@ class ProjectsRuntime:
                          and item.get("weight", 0) > 0 and item.get("status", "active") == "active"), None)
         if not question or not interest:
             return False
+        if row["stage"] == "gather" and (question["status"] != "open" or question["topic"] != seed["topic"]
+                or question["text"] != seed["question"] or not (self.bot._research_available(question) or reading_available)):
+            return False
         try:
-            current = references(question["sources"] + interest["sources"])
+            current = references(question["sources"] + interest["sources"], limit=MAX_SEED_SOURCES)
         except ValueError:
             return False
-        return all(ref in current for ref in seed["seed_refs"])
+        # The question may share old interest evidence. Check the interest's own
+        # basis so an independently renewed preference cannot inherit this project.
+        # Legacy seeds cannot attribute a mixed source set to one of its two inputs.
+        interest_refs = seed.get("interest_refs", seed["seed_refs"])
+        return (all(ref in current for ref in seed["seed_refs"])
+                and all(ref in interest["sources"] for ref in interest_refs))
 
     def prepare(self):
         if not self.enabled() or self._activity()[0]:
@@ -343,7 +355,7 @@ class ProjectsRuntime:
         for row in self.store.items(self.owner()):
             if row["status"] not in {"completed", "unresolved"} or not row["result"] or not self._current(row):
                 continue
-            refs = references(row["seed"]["seed_refs"]+row["evidence_refs"])
+            refs = references(row["seed"]["seed_refs"]+row["evidence_refs"], limit=MAX_PROJECT_SOURCES)
             originals = self._resolve(refs)
             if originals is None:
                 continue
