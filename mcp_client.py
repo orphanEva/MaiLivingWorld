@@ -32,7 +32,10 @@ _MAX_PAGES = 4
 _SCHEMA_BYTES = 32768
 _CLOSE_SECONDS = 10.0
 _QUIET = contextvars.ContextVar("mailivingworld_mcp_quiet", default=False)
-_CODES = frozenset({
+_SOCIAL_ERRORS = frozenset({"mastodon_unauthorized", "mastodon_forbidden", "mastodon_not_configured", "mastodon_invalid_config",
+                           "mastodon_reply_uncertain", "mastodon_not_public", "mastodon_self_reply", "mastodon_not_found",
+                           "mastodon_rate_limited", "mastodon_rejected", "mastodon_extra_recipients", "invalid_mastodon_text"})
+_CODES = _SOCIAL_ERRORS | frozenset({
     "invalid_config", "invalid_request", "sdk_unavailable", "queue_full",
     "closed", "timeout", "disconnected", "tool_error", "invalid_response",
     "response_too_large", "close_timeout", "client_error",
@@ -238,6 +241,11 @@ def _result(result, limit):
     if type(error) is not bool:
         raise MCPError("invalid_response")
     if error:
+        blocks = _value(result, "content")
+        if type(blocks) is list and len(blocks) == 1 and _value(blocks[0], "type") == "text":
+            code = _value(blocks[0], "text")
+            if isinstance(code, str) and code in _SOCIAL_ERRORS:
+                raise MCPError(code)
         raise MCPError("tool_error")
     content = _value(result, "content")
     if type(content) is not list or len(content) > 32:
@@ -435,7 +443,7 @@ class StdioMCPClient:
                                     result = _result(raw, self.max_response_bytes)
                         except MCPError as exc:
                             self._fail(request, exc.code)
-                            if exc.code != "tool_error":
+                            if exc.code != "tool_error" and exc.code not in _SOCIAL_ERRORS:
                                 failure = exc.code
                                 break
                         except TimeoutError:

@@ -15,7 +15,9 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.28.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.29.0")
+        self.assertFalse(defaults["mcp"]["public_sources_enabled"])
+        self.assertEqual(defaults["mcp"]["social_mode"], "关闭")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -35,7 +37,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 30)
-        self.assertEqual(total_fields, 199)
+        self.assertEqual(total_fields, 201)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -43,6 +45,36 @@ class ConfigSectionTests(unittest.TestCase):
     def test_manifest_version_consistent(self):
         manifest = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], plugin.Config().plugin.config_version)
+
+    def test_quick_setup_keeps_the_public_tools_and_qq_controls_independent(self):
+        model = plugin.Config.model_json_schema()
+        def fields(section):
+            name = model["properties"][section]["$ref"].rsplit("/", 1)[1]
+            return model["$defs"][name]["properties"]
+
+        self.assertEqual(fields("general")["enabled"]["label"], "主动 QQ 联系")
+        self.assertEqual(fields("general")["dry_run"]["label"], "安全演练")
+        public = fields("mcp")
+        self.assertEqual(public["enabled"]["label"], "启用 MCP 工具")
+        self.assertEqual(public["public_sources_enabled"]["label"], "查新闻和百科")
+        self.assertEqual(public["social_mode"]["enum"], ["关闭", "只逛逛", "参与讨论"])
+        for mode in ("日常陪伴", "陪伴与成长"):
+            with self.subTest(mode=mode):
+                instance = plugin.MaiLivingWorld()
+                instance.set_plugin_config({"plugin": {"config_version": plugin.Config().plugin.config_version},
+                                            "owner": {"setup_mode": mode, "qq": "12345678"}})
+                self.assertFalse(instance.config.general.enabled)
+                self.assertTrue(instance.config.general.dry_run)
+                saved = instance.get_plugin_config_data()
+                saved["general"]["dry_run"] = False
+                saved["mcp"].update(enabled=True, public_sources_enabled=True, social_mode="参与讨论")
+                reloaded = plugin.MaiLivingWorld()
+                reloaded.set_plugin_config(saved)
+                self.assertFalse(reloaded.config.general.enabled)
+                self.assertFalse(reloaded.config.general.dry_run)
+                self.assertTrue(reloaded.config.mcp.enabled and reloaded.config.mcp.public_sources_enabled)
+                self.assertEqual(reloaded.config.mcp.social_mode, "参与讨论")
+                self.assertEqual(reloaded.config.unified_mind.mode, "active")
 
     def test_belief_review_requires_explicit_opt_in_and_has_webui_description(self):
         self.assertFalse(plugin.Config().growth.review_beliefs)

@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .owner import extract_sender
+from .owner import direct_message_text, extract_sender
 from .unified_expression import (
     apply_generalization_review, build_deliberation_prompt,
     build_generalization_review_prompt, expression_hint, parse_expression,
@@ -97,6 +97,10 @@ class UnifiedRuntime:
             "speaker_id": sender.user_id, "query": " ".join(text.split())[:600],
             "seen": now,
         }
+        if sender.kind == "private" and text.startswith("公开回复 "):
+            direct = direct_message_text(message, self.state.state()["owner_id"])
+            if direct:
+                self._contexts[key]["public_reply_digest"] = hashlib.sha256(direct.encode()).hexdigest()
         if sender.kind == "private":
             self._private[sender.stream_id] = sender.message_id
 

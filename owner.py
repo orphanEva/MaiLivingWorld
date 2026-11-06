@@ -51,6 +51,43 @@ def extract_sender(message: Any) -> SenderIdentity | None:
 def is_owner(sender: SenderIdentity | None, owner_qq: str) -> bool:
     return bool(sender and normalize_qq(owner_qq) and sender.platform == "qq" and sender.user_id == normalize_qq(owner_qq))
 
+def direct_message_text(message: Any, owner_qq: str) -> str:
+    """Return the bound owner's own text from a single, plain QQ private message."""
+    sender = extract_sender(message)
+    if (not is_owner(sender, owner_qq) or sender.kind != "private" or not sender.stream_id or not sender.message_id
+            or normalize_qq(message.get("account_id")) == sender.user_id
+            or any(message.get(key) for key in ("reply_to", "is_command", "is_notify", "is_picture", "is_voice", "is_emoji"))):
+        return ""
+    extra = message["message_info"].get("additional_config")
+    if isinstance(extra, dict) and (extra.get("platform_card_payloads") or normalize_qq(extra.get("self_id")) == sender.user_id):
+        return ""
+    # The SDK serializes raw_message as a list of typed components. A flattened
+    # display string alone cannot distinguish a direct statement from a quote.
+    direct = None
+    for key in ("raw_message", "message_segment", "message"):
+        parts = message.get(key)
+        if parts is None:
+            continue
+        if isinstance(parts, dict):
+            parts = parts.get("data") if parts.get("type") == "seglist" else [parts]
+        if not isinstance(parts, list) or not 1 <= len(parts) <= 32:
+            return ""
+        fragments = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                return ""
+            value = part.get("data")
+            value = value.get("text") if isinstance(value, dict) else value
+            if not isinstance(value, str) or len(value) > 600:
+                return ""
+            fragments.append(value)
+        text = "".join(fragments)
+        if not 1 <= len(text) <= 600 or (direct is not None and direct != text):
+            return ""
+        direct = text
+    plain = message.get("processed_plain_text")
+    return direct if direct and (plain is None or plain == direct) else ""
+
 def owner_hint(owner_title: str | None, kind: str, relationship: str = "") -> str:
     title = (owner_title or "主人").strip().replace("\n", " ").replace("\r", " ")[:24]
     title = title.replace("<", "").replace(">", "") or "主人"

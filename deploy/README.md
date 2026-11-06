@@ -1,4 +1,30 @@
-# Docker MCP 网关
+# Docker 中的 MCP 与账号配置
+
+## 在 MaiBot 容器查新闻和百科
+
+上传 v0.29 或以上的插件 ZIP，完成「快速开始」并绑定主人 QQ。在 **阅读与工具 → MCP 工具与自主查阅** 打开 **启用 MCP 工具** 和 **查新闻和百科**。使用详细配置的实例还需启用主人和 `active` 统一心智。主人私聊可先试“查一下维基百科上的月球轨道，给我词条出处。”内置 MCP 服务用 MaiBot 自己的 Python 启动，新闻和百科都无需账号，也无需增加 Compose 服务或开放端口。
+
+## 可选的网页搜索和 Mastodon 账号
+
+| 想让她做什么 | 在哪里配置 |
+|---|---|
+| 搜索更广的网页并打开搜索结果 | 在 [Brave Search 开发者后台](https://api-dashboard.search.brave.com/)申请 Web Search API 密钥，将其作为 `MLW_BRAVE_SEARCH_KEY` 提供给 MaiBot。查询额度和费用按自己的账号套餐计算。 |
+| 自己阅读新闻和搜索结果 | 打开前述新闻和百科开关，把 **自主上网** 设为 **只逛逛**。 |
+| 读 Mastodon 的公开提及与讨论 | 在接受机器人账号的实例为她注册独立账号。在该账号「首选项 → 开发 → 新建应用」生成用户访问令牌，配置下方的实例和令牌。账号读取、状态读取、搜索和通知分别需要 `read:accounts`、`read:statuses`、`read:search` 和 `read:notifications` 权限。 |
+| 用该账号公开回复 | 给令牌增加 `write:statuses`，选择 **参与讨论**，在 **运行与存储 → 01 / 基础与安全** 关闭 **安全演练**（`dry_run`）并保存。若只想让她在 Mastodon 实发，让同页的 **主动 QQ 联系**（`enabled`）保持关闭。首次安装默认关闭主动 QQ 联系、开启演练。 |
+
+在运行 **MaiBot** 的 Compose 服务下加入需要的变量，值存放在部署机的私有环境文件或密钥管理中。实例填写账号所在服务器的 HTTPS 根地址，例如 `https://social.example.org`。令牌留在部署环境中，协助她绑定账号时无需将凭据发到 QQ。
+
+```yaml
+environment:
+  MLW_BRAVE_SEARCH_KEY: ${MLW_BRAVE_SEARCH_KEY:-}
+  MLW_MASTODON_INSTANCE: ${MLW_MASTODON_INSTANCE:-}
+  MLW_MASTODON_TOKEN: ${MLW_MASTODON_TOKEN:-}
+```
+
+更新环境后用原 Compose 配置重新创建 MaiBot 容器，保留已有数据卷。容器需要能解析并直连对应的公网 HTTPS 地址。遇到长期读不到网页，可在容器里检查 DNS 是否返回保留地址。不同 Mastodon 实例的搜索范围和公开内容各不相同。账号注册与权限定义见 [Mastodon 注册说明](https://docs.joinmastodon.org/user/signup/) 和 [OAuth 权限文档](https://docs.joinmastodon.org/api/oauth-scopes/)。
+
+## CAP、Pixiv 和聊天媒体
 
 **只想先和她聊起来**，在 MaiBot 的插件设置打开「快速开始」，选择「日常陪伴」，填写你自己的 QQ 号后保存。普通私聊可直接使用 MaiBot 容器原有的模型和插件数据卷。想让她自动整理聊天、形成兴趣时，改选「陪伴与成长」。需要阅读 CAP 或 Pixiv 资源时，再按下文部署对应网关。
 

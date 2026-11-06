@@ -9,6 +9,7 @@ import asyncio
 import json
 import hashlib
 import os
+import sys
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -41,7 +42,7 @@ from .growth_runtime import GrowthRuntime, style_hint
 from .tool_store import ToolStore
 from .mcp_client import StdioMCPClient, MCPError
 from .mcp_runtime import MCPBridge, outward_result, day_start as tool_day_start, digest as tool_digest
-from .mcp_policy import CATALOG
+from .mcp_policy import CATALOG, PUBLIC_PROVIDERS
 from .companion_runtime import CompanionRuntime
 from .bond_runtime import BondRuntime
 from .continuity_runtime import ContinuityRuntime
@@ -61,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.28.0",
+        default="0.29.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -69,8 +70,8 @@ class PluginSection(PluginConfigBase):
 
 class General(PluginConfigBase):
     __ui_label__ = "01 / 基础与安全"
-    enabled: bool = Field(default=False, description="主动聊天开关；外部探索、公开认知和主人识别由各自开关控制")
-    dry_run: bool = Field(default=True, description="安全演练：抓取并调用模型，但绝不唤醒发消息，也不写长期记忆")
+    enabled: bool = Field(default=False, description="允许在合适时机主动向已配置的 QQ 对象发起聊天", json_schema_extra={"label": "主动 QQ 联系"})
+    dry_run: bool = Field(default=True, description="开启时可抓取资料、调用模型和记录阅读观察，暂停主动发 QQ 消息和发布 Mastodon 回复", json_schema_extra={"label": "安全演练"})
     timezone: str = Field(default="Asia/Shanghai", description="免打扰与日配额时区")
     tick_seconds: int = Field(default=60, ge=30, le=600, description="内部检查频率，不是主动聊天频率")
     startup_delay_seconds: int = Field(default=25, ge=5, le=300, description="容器刚启动时等待宿主完成加载")
@@ -234,13 +235,15 @@ class Growth(PluginConfigBase):
 
 class MCPIntegration(PluginConfigBase):
     __ui_label__ = "12 / MCP 工具与自主查阅"
-    enabled: bool = Field(default=False, description="连接 cap / Pixiv MCP；需统一心智与可信主人绑定，服务独立运行")
-    owner_only: bool = Field(default=True, description="默认只有可信主人能调用；关闭后其他授权用户也仅能读取固定作品元数据")
-    allow_group_reads: bool = Field(default=False, description="允许采集名单内群聊读取固定作品元数据；管理、写入与任务详情仍只在主人私聊")
+    enabled: bool = Field(default=False, description="开放下方选中的 MCP 工具，需要统一心智与可信主人绑定", json_schema_extra={"label": "启用 MCP 工具"})
+    public_sources_enabled: bool = Field(default=False, description="查新闻和百科：使用内置的两个只读 MCP，无需账号或网关；百科检索会把本轮明确提及的公开词条发给维基百科", json_schema_extra={"label": "查新闻和百科"})
+    social_mode: Literal["关闭", "只逛逛", "参与讨论"] = Field(default="关闭", description="自主上网：只逛逛可按兴趣搜索、打开、阅读；参与讨论可用独立 Mastodon 账号公开回复。真实发送另需关闭总演练。", json_schema_extra={"label": "自主上网"})
+    owner_only: bool = Field(default=True, description="仅允许可信主人在聊天中调用工具。关闭后，授权对象也可查询已启用的公开资料和指定作品元数据")
+    allow_group_reads: bool = Field(default=False, description="允许名单内群聊查询已启用的新闻、百科、公开网页和指定作品元数据。账号操作限主人私聊")
     allow_writes: bool = Field(default=False, description="允许主人私聊创建归档、下载或媒体任务；不自动授权账户变更或文件传输")
     allow_account_actions: bool = Field(default=False, description="另行允许主人私聊进行持续订阅、远端收藏/关注和账户迁移")
     allow_file_transfer: bool = Field(default=False, description="另行允许主人私聊使用 cap 已配置的文件发布/接收服务")
-    remember_results: bool = Field(default=True, description="只保存成功返回的作品元数据/小说片段作为带来源观察，不保存任务路径、凭据或签名链接")
+    remember_results: bool = Field(default=True, description="把已读的作品资料、新闻、百科和网页节选连同出处写入统一记忆。搜索列表或外站对话不会形成永久摘录")
     max_daily_calls: int = Field(default=100, ge=0, le=2000, description="所有 MCP 工具及图片读取共用的持久每日调用上限；失败计数")
     timeout_seconds: int = Field(default=30, ge=2, le=120, description="单次 MCP 请求超时；写入结果未知时不自动重试")
     max_response_bytes: int = Field(default=262144, ge=4096, le=1048576, description="解析后 MCP 结果大小上限；只连接管理员配置的可信服务")
@@ -486,6 +489,8 @@ class MaiLivingWorld(MaiBotPlugin):
         self._store: Store | MySQLStore | None = None
         self._last_scan = 0.0
         self._last_chat_check = 0.0
+        self._social = None
+        self._social_job = None
         self._scan_errors: dict[str, str] = {}
         self._last_decision: dict[tuple[str,bool],float] = {}
         # 仅用于本轮推理的临时缓存，不持久化 QQ 发言信息。
@@ -571,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.28.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.29.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -747,6 +752,9 @@ class MaiLivingWorld(MaiBotPlugin):
                 private = list(dict.fromkeys(private + [normalize_qq(self.config.owner.qq)]))
             runtime.capture(message, private_users=private,
                             group_ids=_clean_ids(self.config.brain_memory.group_ids))
+            social = self._social_runtime()
+            if social:
+                social.acknowledge(message)
             bond = self._ensure_bond()
             if bond:
                 try:
@@ -1223,6 +1231,12 @@ class MaiLivingWorld(MaiBotPlugin):
                         timezone=self.config.general.timezone, direct_ids=direct_ids,
                     )
                     hints = {}
+                    social = self._social_runtime()
+                    if (social and before and before["scope"] == "private:"+before["speaker_id"]
+                            and runtime.context(kwargs) == before):
+                        extra = social.help_hint(before["speaker_id"])
+                        if extra:
+                            hints["social_help"] = extra
                     if visual and before and runtime.context(kwargs) == before and self.config.reading.chat_media_enabled:
                         material, visual_sources = visual.hint(before)
                         if material:
@@ -1282,6 +1296,8 @@ class MaiLivingWorld(MaiBotPlugin):
                     runtime.last_status = "storage_or_context_failed"
                 if self._unified_active():
                     updated = inject_brain_prompt(kwargs, BRAIN_MARKER + "\n" + prompt) if prompt else None
+                    if updated and social and "social_help" in hints and hints["social_help"] in prompt:
+                        social.help_hint(before["speaker_id"], consume=True)
                     if reference:
                         try:
                             if reference.signature() == reference_signature:
@@ -2087,6 +2103,28 @@ class MaiLivingWorld(MaiBotPlugin):
     def _mcp_server_config(self, provider):
         return self.config.mcp_cap if provider == "cap" else self.config.mcp_pixiv if provider == "pixiv" else None
 
+    def _social_runtime(self):
+        if not self.config.mcp.enabled or self.config.mcp.social_mode == "关闭" or not self._unified_active():
+            return None
+        if self._social is None:
+            from .social_runtime import SocialRuntime
+            self._social = SocialRuntime(self)
+        return self._social
+
+    async def _browse_in_background(self, social):
+        try:
+            await social.tick()
+        except Exception:
+            self.ctx.logger.warning("[MaiLivingWorld] 这次公开浏览未能完成")
+
+    def _mcp_provider_enabled(self, provider):
+        if provider == "mastodon":
+            return self.config.mcp.social_mode != "关闭"
+        if provider in PUBLIC_PROVIDERS:
+            return self.config.mcp.public_sources_enabled
+        server = self._mcp_server_config(provider)
+        return bool(server and server.enabled)
+
     def _mcp_signature(self, provider):
         server = self._mcp_server_config(provider)
         return tool_digest({"config": self.config.mcp.model_dump(), "server": server.model_dump() if server else None,
@@ -2094,6 +2132,8 @@ class MaiLivingWorld(MaiBotPlugin):
                             "unified": self.config.unified_mind.model_dump()})
 
     def _mcp_source_signature(self, provider):
+        if provider in (*PUBLIC_PROVIDERS, "mastodon"):
+            return tool_digest({"builtin": provider, "environment": self._builtin_mcp_environment(provider)})
         server = self._mcp_server_config(provider)
         if not server:
             return ""
@@ -2102,9 +2142,14 @@ class MaiLivingWorld(MaiBotPlugin):
         return tool_digest({"provider": provider, "server": server.model_dump(),
                             "environment": {name: os.environ.get(name, "") for name in names}})
 
+    @staticmethod
+    def _builtin_mcp_environment(provider):
+        names = {"news": ("MLW_BRAVE_SEARCH_KEY",), "mastodon": ("MLW_MASTODON_INSTANCE", "MLW_MASTODON_TOKEN")}
+        return {name: os.environ[name] for name in names.get(provider, ()) if os.environ.get(name)}
+
     def _mcp_client(self, provider):
         server, cfg = self._mcp_server_config(provider), self.config.mcp
-        if not server or not server.enabled:
+        if not self._mcp_provider_enabled(provider):
             raise MCPError("invalid_config")
         if provider in self._mcp_clients:
             if not self._mcp_clients[provider].retired:
@@ -2112,7 +2157,12 @@ class MaiLivingWorld(MaiBotPlugin):
                     raise MCPError("invalid_config")
                 return self._mcp_clients[provider]
             self._mcp_clients.pop(provider)
-        if server.transport == "http":
+        if provider in (*PUBLIC_PROVIDERS, "mastodon"):
+            script = Path(__file__).resolve().with_name("public_mcp_server.py")
+            client = StdioMCPClient(sys.executable, [str(script), provider], str(script.parent),
+                                    {"PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1", **self._builtin_mcp_environment(provider)},
+                                    timeout_seconds=cfg.timeout_seconds, max_response_bytes=cfg.max_response_bytes)
+        elif server.transport == "http":
             from .mcp_client import HTTPMCPClient
             client = HTTPMCPClient(server.url, os.environ.get(server.token_env, ""),
                                    timeout_seconds=cfg.timeout_seconds, max_response_bytes=cfg.max_response_bytes)
@@ -2145,18 +2195,54 @@ class MaiLivingWorld(MaiBotPlugin):
             return None
         return (context, request) if context else None
 
+    async def _owner_public_reply(self, arguments, kwargs, context, owner, client, valid):
+        from .owner import direct_message_text
+        from .social_runtime import public_reply_text
+        from .mcp_policy import permitted
+        import re
+
+        if not isinstance(arguments, dict) or set(arguments) != {"id", "text"}:
+            return {"success": False, "code": "invalid_tool_arguments"}
+        target, text = arguments["id"], arguments["text"]
+        if (not isinstance(target, str) or not re.fullmatch(r"[1-9][0-9]{0,24}", target)
+                or not isinstance(text, str) or not 2 <= len(text) <= 350 or text != text.strip() or not public_reply_text(text)):
+            return {"success": False, "code": "invalid_tool_arguments"}
+        command = f"公开回复 {target} {text}"
+        signature = hashlib.sha256(command.encode()).hexdigest()
+        if (context.get("public_reply_digest") != signature
+                or ("message" in kwargs and direct_message_text(kwargs["message"], owner) != command)):
+            return {"success": False, "code": "exact_owner_reply_required"}
+        social = self._social_runtime()
+
+        def authorized():
+            return (valid() and social and social.owner() == owner and not self.config.general.dry_run
+                    and permitted("mastodon", "mastodon_reply", self.config.mcp, context, owner)
+                    and self._unified.context({"session_id": context["sid"]}) == context)
+
+        if not authorized():
+            return {"success": False, "code": "social_reply_disabled"}
+        identity = await self._mcp_bridge.execute("mastodon", "mastodon_identity", {}, config=self.config.mcp,
+            context=context, owner=owner, client=client, valid=authorized, timezone=self.config.general.timezone)
+        if not authorized():
+            return {"success": False, "code": "context_changed"}
+        if not identity.get("success"):
+            return identity
+        result = await social.post(target, text, identity["data"], owner, authorized)
+        return result if authorized() else {"success": False, "code": "context_changed"}
+
     async def _invoke_mcp(self, provider, tool, arguments, kwargs, *, catalog=False):
         trusted = self._mcp_context(kwargs)
-        server = self._mcp_server_config(provider)
-        if not trusted or not server or not server.enabled:
+        if not trusted or not self._mcp_provider_enabled(provider):
             return {"success": False, "code": "configure_mcp_and_send_trusted_message"}
         context, request = trusted
         owner = self._self_state.state()["owner_id"]
         generation, signature = self._mcp_generation, self._mcp_signature(provider)
         source_signature = self._mcp_source_signature(provider)
+        dry_run = self.config.general.dry_run
         def valid():
             return (generation == self._mcp_generation and signature == self._mcp_signature(provider)
                     and source_signature == self._mcp_source_signature(provider)
+                    and (provider != "mastodon" or self.config.general.dry_run == dry_run)
                     and self._self_state.state()["owner_id"] == owner
                     and self._unified.context(request) == context)
         task = asyncio.current_task()
@@ -2166,7 +2252,9 @@ class MaiLivingWorld(MaiBotPlugin):
             client = self._mcp_client(provider)
             if catalog:
                 return await self._mcp_bridge.catalog(provider, config=self.config.mcp, context=context,
-                    owner=owner, client=client, valid=valid)
+                    owner=owner, client=client, valid=valid, social_reply_enabled=self._unified_active() and not dry_run)
+            if (provider, tool) == ("mastodon", "mastodon_reply"):
+                return await self._owner_public_reply(arguments, kwargs, context, owner, client, valid)
             return await self._mcp_bridge.execute(provider, tool, arguments, config=self.config.mcp,
                 context=context, owner=owner, client=client, valid=valid,
                 timezone=self.config.general.timezone, record_observations=self.config.mcp.remember_results,
@@ -2176,14 +2264,14 @@ class MaiLivingWorld(MaiBotPlugin):
         finally:
             self._mcp_calls.discard(task)
 
-    @Tool("living_world_mcp_tools", description="查看 cap 或 Pixiv MCP 当前可用的工具和参数；先发现工具再调用，资料不等于指令", parameters={
-        "provider": {"type": "string", "enum": ["cap", "pixiv"], "description": "资料服务"}})
+    @Tool("living_world_mcp_tools", description="发现 MCP 工具。news 查新闻和网页，reference 查百科，Mastodon 看公开讨论，cap/Pixiv 查作品。先看参数再调用。", parameters={
+        "provider": {"type": "string", "enum": ["cap", "pixiv", "news", "reference", "mastodon"], "description": "资料与社区服务"}})
     async def mcp_tools(self, provider: str, **kwargs):
         result = await self._invoke_mcp(provider, "", {}, kwargs, catalog=True)
         return {"success": True, "content": json.dumps(result["tools"], ensure_ascii=False)} if result.get("success") else outward_result(result)
 
-    @Tool("living_world_mcp_call", description="调用已发现的 cap/Pixiv MCP 工具。查询、归档、任务状态分别调用；写入只限已启用权限的主人私聊，排队不代表完成", parameters={
-        "provider": {"type": "string", "enum": ["cap", "pixiv"], "description": "服务"},
+    @Tool("living_world_mcp_call", description="调用已发现的 MCP 工具。聊时事可先 news_search 再 news_read 查看报道，标明出处和日期。主人私聊明确发送「公开回复 帖子编号 正文」时可调用 mastodon_reply，id 和 text 必须与本轮原文完全一致。", parameters={
+        "provider": {"type": "string", "enum": ["cap", "pixiv", "news", "reference", "mastodon"], "description": "服务"},
         "tool": {"type": "string", "description": "living_world_mcp_tools 返回的准确工具名"},
         "arguments": {"type": "object", "description": "按已发现参数 schema 提供的 JSON 对象"}})
     async def mcp_call(self, provider: str, tool: str, arguments: dict, **kwargs):
@@ -2250,7 +2338,10 @@ class MaiLivingWorld(MaiBotPlugin):
     async def mcp_status(self):
         self._ensure_tool_store()
         return {"enabled": self.config.mcp.enabled, "cap_enabled": self.config.mcp_cap.enabled,
-                "pixiv_enabled": self.config.mcp_pixiv.enabled, "connected": list(self._mcp_clients),
+                "pixiv_enabled": self.config.mcp_pixiv.enabled, "public_sources_enabled": self.config.mcp.public_sources_enabled,
+                "social_mode": self.config.mcp.social_mode,
+                "mastodon_configured": len(self._builtin_mcp_environment("mastodon")) == 2,
+                "connected": list(self._mcp_clients),
                 "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
 
     async def _research_tools(self, *, question_key=None, external_valid=None, with_evidence=False, on_dispatch=None):
@@ -2632,6 +2723,11 @@ class MaiLivingWorld(MaiBotPlugin):
                         except Exception:
                             self.ctx.logger.warning("[MaiLivingWorld][FOLLOWTHROUGH] 未确认任务结果，保留跟进")
                     await self._advance_background()
+                    social = self._social_runtime()
+                    if social and (self._social_job is None or self._social_job.done()):
+                        self._social_job = asyncio.create_task(self._browse_in_background(social), name="mai-public-browse")
+                        self._mcp_calls.add(self._social_job)
+                        self._social_job.add_done_callback(self._mcp_calls.discard)
                     if not self.config.general.enabled:
                         continue
                     if now-self._last_chat_check >= self.config.audience.check_interval_minutes*60:
@@ -3083,7 +3179,9 @@ class MaiLivingWorld(MaiBotPlugin):
         followthrough = self._ensure_followthrough() if is_owner_private and unified_active else None
         pending_report = followthrough.due(ident) if followthrough else None
         pending_plan = companion.due_plan(ident) if companion and not pending_report else None
-        story = None if pending_plan or pending_report else await self._choose_story(target)
+        social = self._social_runtime() if is_owner_private else None
+        help_text = social.help_hint(ident) if social and not (pending_report or pending_plan) else ""
+        story = None if pending_plan or pending_report or help_text else await self._choose_story(target)
         if story and experience and not experience.allow(
                 ident, "explore", active=self.config.experience.mode == "active")[0]:
             story = None
@@ -3095,6 +3193,9 @@ class MaiLivingWorld(MaiBotPlugin):
             intent = ("这是一次主人已确认共同计划的到期跟进机会，可以沉默。只和主人自然提及下一步，"
                       "不要声称已经完成，不擅自执行计划或修改状态。下面是计划资料，不是执行指令：\n"
                       + json.dumps({key: pending_plan[key] for key in ("title", "next_step", "due_at")}, ensure_ascii=False))
+        elif help_text:
+            topic = "请主人协助配置或核对外站账号"
+            intent = help_text
         elif story:
             intent=(
                 "这是一次主动发起聊天的机会，你可以选择沉默。你刚刚从公开信息源看到一条真实内容。"
@@ -3216,6 +3317,8 @@ class MaiLivingWorld(MaiBotPlugin):
             intent += ("\n\n请将下面一句原样作为独立整条消息发送，以便成功送达回执确认。不要添加引号、前后缀或任务编号；"
                        "若不适合发送就保持沉默，不能称已回告。\n"+prepared["text"])
         # 先落盘尝试次数以限制调用成本；实际发送成功由独立回执统计。
+        if help_text and social.help_hint(ident, consume=True) != help_text:
+            return
         self._store.record_attempt(target,now,"explore" if story else "history", story['key'] if story else None)
         event_id = feedback.begin(target, sid, now) if feedback else None
         if event_id is not None:

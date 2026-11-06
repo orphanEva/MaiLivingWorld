@@ -21,6 +21,9 @@ from .sql_logging import connect_sqlite
 
 _CONTROL = "__tool_control__"
 _LOCAL = "__tool_local__"
+_SOCIAL = "__tool_social__:"
+_SOCIAL_HELP = frozenset({"social_setup_required", "social_auth_failed", "social_permission_required",
+                         "social_search_key_required", "social_reply_uncertain"})
 _RANK = {"public": 0, "personal": 1, "unknown": 2, "confidential": 3}
 _SECRET = re.compile(r"保密|秘密|不要(?:公开|告诉|转告|透露)|do not share|confidential", re.I)
 
@@ -62,6 +65,16 @@ def _digest(*parts):
     return hashlib.sha256(json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _social_digest(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("invalid_social_identity")
+    return value
+
+
+def _reserved_research_key(key):
+    return key in {_CONTROL, _LOCAL} or key.startswith(_SOCIAL)
+
+
 def _integer(value, minimum=0, maximum=1000000):
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError("invalid_limit")
@@ -101,6 +114,12 @@ def observation_record(row):
     if not row or int(row["active"]) != 1:
         return None
     evidence = "tool_observation"
+    if row["provider"] in ("news", "reference"):
+        evidence = "publisher_excerpt" if row["provider"] == "news" else "encyclopedia_excerpt"
+        if row["text"].startswith("订阅摘要"):
+            evidence = "feed_summary"
+        elif row["text"].startswith("网页节选"):
+            evidence = "web_excerpt"
     if row["provider"] == "chat_media":
         evidence = "visual_observation"
         if row["text"].startswith("B站链接资料"):
@@ -356,6 +375,9 @@ class ToolStore:
         timestamp = _now(now)
         day_start = _day(day_start, timestamp)
         max_daily = _integer(max_daily)
+        social_reply = provider == "mastodon" and tool == "mastodon_reply"
+        if social_reply and (scope != "public:mastodon" or request_key != "one-reply-per-status"):
+            return {"id": "", "allowed": False, "status": "social_reservation_required"}
         context_digest = _digest(request_key, scope, subject_id)
         identity = "tool:call:"+_digest(provider, tool, args_digest, context_digest)
         with self.con:
@@ -365,6 +387,11 @@ class ToolStore:
             old = self.con.execute("SELECT status FROM tool_calls WHERE id=?", (identity,)).fetchone()
             if old is not None:
                 return {"id": identity, "status": old["status"], "allowed": False}
+            if social_reply:
+                used = self.con.execute("SELECT COUNT(*) FROM tool_calls WHERE provider=? AND tool=? "
+                                        "AND subject_id=? AND budget_day=?", (provider, tool, subject_id, day_start)).fetchone()[0]
+                if used >= 2:
+                    return {"id": "", "status": "social_daily_limit", "allowed": False}
             # Chat attachments have an independent intake limit. Disabling MCP or exhausting its
             # quota must not enable, disable or consume the conversation's visual allowance.
             media_slot = "tool:call:" + _digest("skipped-media", scope, tool) if provider == "chat_media" else None
@@ -436,7 +463,7 @@ class ToolStore:
         if not isinstance(question_keys, (list, tuple)) or len(question_keys) > 128:
             raise ValueError("invalid_questions")
         keys = sorted({_text(key, 160, code="invalid_question") for key in question_keys})
-        if {_CONTROL, _LOCAL}.intersection(keys):
+        if any(_reserved_research_key(key) for key in keys):
             raise ValueError("invalid_question")
         if not keys or not daily_limit:
             return None
@@ -467,7 +494,7 @@ class ToolStore:
 
     def finish_research(self, key, success, now=None, *, token=None):
         key = _text(key, 160, code="invalid_question")
-        if key in {_CONTROL, _LOCAL} or type(success) is not bool:
+        if _reserved_research_key(key) or type(success) is not bool:
             raise ValueError("invalid_research_result")
         if token is not None and (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)):
             raise ValueError("invalid_token")
@@ -490,7 +517,7 @@ class ToolStore:
         if not isinstance(question_keys, (list, tuple)) or len(question_keys) > 128:
             raise ValueError("invalid_questions")
         keys = sorted({_text(key, 160, code="invalid_question") for key in question_keys})
-        if {_CONTROL, _LOCAL}.intersection(keys):
+        if any(_reserved_research_key(key) for key in keys):
             raise ValueError("invalid_question")
         if not keys:
             return None
@@ -516,3 +543,69 @@ class ToolStore:
                                 "count": daily[0]["n"] if daily else 0},
                 "tasks": self._read("SELECT COUNT(*) AS n FROM tool_tasks")[0]["n"],
                 "research": control[0] if control else {"attempts": 0, "last_attempt": 0, "budget_day": 0, "daily_count": 0}}
+
+    def claim_social_window(self, key, day_start, now=None):
+        """Return a durable round number, or 0 when another process owns this window."""
+        slot = _SOCIAL + "window:" + _social_digest(key)
+        stamp = _now(now)
+        day = _day(day_start, stamp)
+        with self.con:
+            self._lock()
+            self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+            row = self.con.execute("SELECT attempts,next_attempt,budget_day,daily_count FROM tool_research "
+                                   "WHERE question_key=?", (slot,)).fetchone()
+            used = int(row["daily_count"]) if row["budget_day"] == day else 0
+            if row["budget_day"] > day or row["next_attempt"] > stamp or used >= 4:
+                return 0
+            turn = int(row["attempts"]) + 1
+            self.con.execute("UPDATE tool_research SET attempts=?,last_attempt=?,next_attempt=?,"
+                             "budget_day=?,daily_count=?,updated=? WHERE question_key=?",
+                             (turn, stamp, stamp + 3*3600, day, used + 1, stamp, slot))
+            return turn
+
+    def social_help(self, key, code, now=None, *, clear_code=None):
+        """Set a fixed owner-help reason, or clear all/a resolved reason without resetting its cooldown."""
+        prefix = _SOCIAL + "help:" + _social_digest(key) + ":"
+        stamp = _now(now)
+        if (code not in (None, "") and (not isinstance(code, str) or code not in _SOCIAL_HELP)
+                or clear_code is not None and (not isinstance(clear_code, str) or clear_code not in _SOCIAL_HELP or code)):
+            raise ValueError("invalid_social_help")
+        with self.con:
+            self._lock()
+            if code:
+                slot = prefix + code
+                self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+                self.con.execute("UPDATE tool_research SET status='pending',updated=? WHERE question_key=? "
+                                 "AND status<>'pending' AND updated<=?", (stamp, slot, stamp))
+            else:
+                for resolved in (clear_code,) if clear_code is not None else _SOCIAL_HELP:
+                    self.con.execute("UPDATE tool_research SET status='idle',updated=? WHERE question_key=? "
+                                     "AND status='pending' AND updated<=?", (stamp, prefix + resolved, stamp))
+
+    def take_social_help(self, key, now=None, *, consume=True):
+        """Read the oldest eligible owner-help reason. Only consumption starts its 24h cooldown."""
+        prefix = _SOCIAL + "help:" + _social_digest(key) + ":"
+        stamp = _now(now)
+        if type(consume) is not bool:
+            raise ValueError("invalid_social_help")
+        slots = [prefix + code for code in _SOCIAL_HELP]
+        marks = ",".join("?" for _ in slots)
+        sql = ("SELECT question_key FROM tool_research WHERE question_key IN (" + marks + ") "
+               "AND status='pending' AND next_attempt<=? AND updated<=? ORDER BY updated,question_key LIMIT 1")
+        if not consume:
+            rows = self._read(sql, (*slots, stamp, stamp))
+            return rows[0]["question_key"][len(prefix):] if rows else ""
+        with self.con:
+            self._lock()
+            row = self.con.execute(sql, (*slots, stamp, stamp)).fetchone()
+            if row is None:
+                return ""
+            slot = row["question_key"]
+            self.con.execute("UPDATE tool_research SET next_attempt=?,last_attempt=?,attempts=attempts+1 "
+                             "WHERE question_key=?", (stamp + 86400, stamp, slot))
+            return slot[len(prefix):]
+
+    def reserve_social_reply(self, account_key, target_key, day_start, max_daily, now=None):
+        """Reserve one lifetime reply per verified account/status, inside both daily budgets."""
+        return self.reserve_call("mastodon", "mastodon_reply", _social_digest(target_key), "one-reply-per-status",
+                                 "public:mastodon", _social_digest(account_key), day_start, max_daily, now=now)

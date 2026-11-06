@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.mai-living-world",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "name": "MaiLivingWorld · 麦麦的小世界",
-  "description": "唯一主人与长期伴侣：自然近况、待续话题、倾听和联系节奏、持久回忆、阅读成长及 cap/Pixiv MCP",
+  "description": "唯一主人的长期伴侣。能记住相处经历、看图和短片，通过 MCP 查新闻、读百科和作品，也可用独立 Mastodon 账号参与公开讨论。",
   "author": {
     "name": "Community integration / independent implementation",
     "url": "https://github.com/orphanEva"

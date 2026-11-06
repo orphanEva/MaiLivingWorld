@@ -64,3 +64,18 @@ class PublicMediaHTTP(unittest.TestCase):
         reply = self.response(302, {"Location": "https://localhost/sensitive"})
         with self.assertRaises(media.MediaFetchError):
             self.get(reply)
+
+    def test_search_key_is_only_sent_to_fixed_api_and_never_follows_redirect(self):
+        api = "https://api.search.brave.com/res/v1/web/search?q=space"
+        for url in (URL, api.replace("/web/search", "/chat"), api.replace("api.search", "not-api.search")):
+            with patch.object(media, "_connect") as connect, self.assertRaises(media.MediaFetchError):
+                media.fetch_brave_api(url, token="fixture-key", max_bytes=20)
+            connect.assert_not_called()
+        for location in (URL, api):
+            with patch.object(media, "_connect", return_value=MagicMock()) as connect, \
+                    patch.object(media.http.client, "HTTPConnection") as conn:
+                conn.return_value.getresponse.return_value = nullcontext(self.response(302, {"Location": location}))
+                with self.assertRaisesRegex(media.MediaFetchError, "bad_redirect"):
+                    media.fetch_brave_api(api, token="fixture-key", max_bytes=20)
+                self.assertEqual(connect.call_count, 1)
+                self.assertEqual(conn.return_value.request.call_args.kwargs["headers"]["X-Subscription-Token"], "fixture-key")

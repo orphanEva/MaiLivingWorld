@@ -1,0 +1,244 @@
+"""Public-source discovery, memory and access control via the host plugin's normal entry points."""
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message, schema
+from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
+
+
+NEWS_ID = "ithome:0:875:123"
+NEWS_URL = "https://www.ithome.com/0/875/123.htm"
+NEWS = {"id": NEWS_ID, "source": "IT之家", "url": NEWS_URL, "title": "火星沙丘观测",
+        "published_at": "2026-11-06T02:00:00+00:00", "basis": "article", "text": "观测小组比较了沙丘两侧的风蚀痕迹。"}
+REFERENCE = {"page_id": 42, "language": "zh", "revision_id": 98, "offset": 0, "next_offset": None,
+             "title": "木卫二", "source": "中文维基百科", "url": "https://zh.wikipedia.org/wiki/Europa",
+             "updated_at": "2026-10-01T00:00:00Z", "text": "冰壳中可见线状裂纹。", "basis": "encyclopedia_excerpt"}
+
+
+def fixture_client():
+    string, integer = {"type": "string"}, {"type": "integer"}
+    definitions = {
+        "news_search": schema({"query": string}, []), "news_read": schema({"id": string}, ["id"]),
+        "web_search": schema({"query": string}, ["query"]), "web_read": schema({"id": string}, ["id"]),
+        "reference_search": schema({"query": string, "language": string}, ["query"]),
+        "reference_read": schema({"page_id": integer, "language": string, "offset": integer}, ["page_id"]),
+        "mastodon_search": schema({"query": string}, ["query"]), "mastodon_reply": schema({}, []),
+        "expose_private_history": schema({}, []),
+    }
+    return SimpleNamespace(retired=False, close=AsyncMock(), call_tool=AsyncMock(),
+        list_tools=AsyncMock(return_value={name: {"input_schema": value} for name, value in definitions.items()}))
+
+
+class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+        self.client = fixture_client()
+        self.factory = self.enterContext(patch.object(plugin, "StdioMCPClient", return_value=self.client))
+        self.bot = self.make_bot()
+
+    def make_bot(self):
+        bot = plugin.MaiLivingWorld()
+        bot.ctx = FakeContext()
+        bot.ctx.paths = SimpleNamespace(data_dir=self.folder)
+        bot.config = plugin.Config()
+        bot.config.owner.enabled = True
+        bot.config.owner.qq = OWNER
+        bot.config.brain_memory.group_ids = [GROUP]
+        bot.config.brain_memory.private_users = [OTHER]
+        bot.config.unified_mind.enabled = True
+        bot.config.unified_mind.mode = "active"
+        bot.config.mcp.enabled = True
+        bot.config.mcp.public_sources_enabled = True
+        self.addAsyncCleanup(bot.on_unload)
+        return bot
+
+    async def capture(self, mid, text, **audience):
+        event = message(mid, text=text, **audience)
+        await self.bot.capture_unified(message=event)
+        return event
+
+    async def call(self, event, provider, tool, args):
+        return await self.bot.mcp_call(provider, tool, args, message=event)
+
+    async def test_discovery_separates_credentials_and_public_social_operations(self):
+        secrets = {"MLW_BRAVE_SEARCH_KEY": "test-search-key", "MLW_MASTODON_INSTANCE": "https://social.example",
+                   "MLW_MASTODON_TOKEN": "test-account-token", "UNRELATED_HOST_SECRET": "test-host-secret"}
+        event = await self.capture("catalog", "有哪些新闻？")
+        self.bot.config.mcp.social_mode = "参与讨论"
+        self.bot.config.mcp.allow_writes = True
+        self.bot.config.mcp.allow_account_actions = True
+        expected = {
+            "news": ({"news_search", "news_read", "web_search", "web_read"}, {"MLW_BRAVE_SEARCH_KEY"}),
+            "reference": ({"reference_search", "reference_read"}, set()),
+            "mastodon": ({"mastodon_search"}, {"MLW_MASTODON_INSTANCE", "MLW_MASTODON_TOKEN"}),
+        }
+        with patch.dict(os.environ, secrets):
+            for provider, (allowed, inherited) in expected.items():
+                catalog = await self.bot.mcp_tools(provider, message=event)
+                self.assertTrue(catalog["success"], catalog)
+                self.assertEqual({item["name"] for item in json.loads(catalog["content"])}, allowed)
+                executable, argv, cwd, env = self.factory.call_args.args
+                self.assertEqual(executable, sys.executable)
+                self.assertEqual(argv, [str(Path(plugin.__file__).resolve().with_name("public_mcp_server.py")), provider])
+                self.assertEqual(Path(cwd), Path(argv[0]).parent)
+                self.assertEqual(set(env), {"PYTHONUTF8", "PYTHONDONTWRITEBYTECODE"} | inherited)
+                self.assertEqual({k: env[k] for k in inherited}, {k: secrets[k] for k in inherited})
+            result = await self.call(event, "mastodon", "mastodon_reply", {"id": "23", "text": "hello"})
+        self.assertFalse(result["success"])
+        self.client.call_tool.assert_not_called()
+
+    async def test_search_is_ephemeral_read_becomes_public_memory_and_budget_survives_restart(self):
+        self.bot.config.mcp.max_daily_calls = 2
+        event = await self.capture("browse", "我给这次聊天取个名字：金色的灯塔。请查查星球。")
+        self.client.call_tool.return_value = {"items": [{"id": NEWS_ID, "title": "搜索页专有标题"}]}
+        result = await self.call(event, "news", "news_search", {"query": "星球"})
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.bot._tool_store.observations(), [])
+        self.client.call_tool.return_value = NEWS
+        result = await self.call(event, "news", "news_read", {"id": NEWS_ID})
+        self.assertTrue(result["success"], result)
+        self.assertIn(NEWS_URL, result["content"])
+        root, = self.bot._tool_store.observations()
+        self.assertEqual((root["scope"], root["sensitivity"], root["subject_id"]), ("public:news", "public", ""))
+        self.assertEqual((root["evidence_status"], root["url"]), ("publisher_excerpt", NEWS_URL))
+        for value in (NEWS["source"], NEWS["text"], NEWS["title"], NEWS["published_at"]):
+            self.assertIn(value, root["text"])
+        for excluded in ("搜索页专有标题", "金色的灯塔", "星球", OWNER):
+            self.assertNotIn(excluded, str(root))
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.mcp.max_daily_calls = 2
+        group_event = await self.capture("group-after-restart", "提到的沙丘报道", group=GROUP, sid="different-group")
+        self.assertIn(root["id"], {r["id"] for r in self.bot._collect_roots("沙丘")})
+        self.bot.config.mcp.allow_group_reads = True
+        denied = await self.call(group_event, "news", "news_search", {})
+        self.assertFalse(denied["success"], denied)
+        self.assertIn("budget_exhausted", denied["content"])
+        self.assertEqual(self.client.call_tool.await_count, 2)
+
+    async def test_online_queries_require_public_terms_from_current_trusted_message(self):
+        self.bot.config.mcp.social_mode = "只逛逛"
+        self.client.call_tool.return_value = {"items": []}
+        for mid, text, topic in [("absent", "聊聊天文望远镜", "室友小王"),
+                ("secret", "木卫二观测是秘密，别告诉别人", "木卫二"), ("personal", "号码 1234567890", "1234567890")]:
+            event = await self.capture(mid, text)
+            for provider, tool in [("news", "web_search"), ("reference", "reference_search"),
+                                   ("mastodon", "mastodon_search")]:
+                result = await self.call(event, provider, tool, {"query": topic})
+                self.assertFalse(result["success"], result)
+                self.assertIn("ask_for_public_search_terms", result["content"])
+        self.client.call_tool.assert_not_called()
+        event = await self.capture("public-topic", "想了解木卫二的表面地形")
+        result = await self.call(event, "reference", "reference_search", {"query": "木卫二"})
+        self.assertTrue(result["success"], result)
+        self.client.call_tool.assert_awaited_once_with("reference_search", {"query": "木卫二"})
+        self.assertEqual(self.bot._tool_store.observations(), [])
+        self.client.call_tool.return_value = REFERENCE
+        result = await self.call(event, "reference", "reference_read", {"page_id": 42})
+        self.assertTrue(result["success"], result)
+        memory, = self.bot._tool_store.observations()
+        self.assertEqual((memory["evidence_status"], memory["scope"], memory["url"]),
+                         ("encyclopedia_excerpt", "public:reference", REFERENCE["url"]))
+
+    async def test_public_group_access_requires_enabled_group_and_never_inherits_account_access(self):
+        self.bot.config.mcp.social_mode = "参与讨论"
+        self.client.call_tool.return_value = {"items": []}
+        args = {"query": "天文"}
+        event = await self.capture("group", "查查天文新闻", group=GROUP, uid=OTHER, sid="group-one")
+        self.assertFalse((await self.call(event, "news", "news_search", args))["success"])
+        self.bot.config.mcp.owner_only = False
+        self.assertFalse((await self.call(event, "news", "news_search", args))["success"])
+        self.bot.config.mcp.allow_group_reads = True
+        allowed = await self.call(event, "news", "news_search", args)
+        self.assertTrue(allowed["success"], allowed)
+        self.assertFalse((await self.call(event, "mastodon", "mastodon_search", args))["success"])
+        self.bot.config.mcp.public_sources_enabled = False
+        self.assertFalse((await self.bot.mcp_tools("news", message=event))["success"])
+        self.client.call_tool.assert_awaited_once_with("news_search", args)
+
+    async def test_reply_after_restart_cites_only_an_approved_persisted_public_source(self):
+        from MaiLivingWorld.tests.test_unified_runtime import kwargs, response
+        from MaiLivingWorld.unified_expression import expression_hint, parse_expression
+
+        event = await self.capture("read-source", "帮我看这篇沙丘的报道")
+        self.client.call_tool.return_value = NEWS
+        self.assertTrue((await self.call(event, "news", "news_read", {"id": NEWS_ID}))["success"])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.unified_mind.min_interval_seconds = 0
+        record, = self.bot._ensure_tool_store().observations()
+        fake_url = "https://invented.example/not-the-source"
+        for mid, decision, permitted in [("allowed", {"mode": "say"}, True), ("internal", {"mode": "internal"}, False),
+                                        ("model-supplied", {"mode": "say", "source_url": fake_url}, False)]:
+            await self.capture(mid, "沙丘报道是从哪里看到的？", group=GROUP, uid=OTHER, sid="different-group")
+            self.bot.ctx.llm.generate.return_value = response([{"id": record["id"], **decision}])
+            hint = await self.bot.brain_reply_hint(**kwargs("different-group", mid))
+            reply = json.dumps(hint, ensure_ascii=False)
+            self.assertEqual(NEWS_URL in reply, permitted)
+            if permitted:
+                self.assertIn("来自查到的公开资料", reply)
+                self.assertIn(NEWS["title"], reply)
+            self.assertNotIn(NEWS_URL, self.bot.ctx.llm.generate.await_args.args[0])
+            self.assertNotIn(fake_url, reply)
+
+        audience = {"audience_scope": "group:" + GROUP, "speaker_id": OTHER, "is_owner": False}
+        ask = response([{"id": record["id"], "mode": "say"}])
+        for changes in ({"url": fake_url}, {"url": NEWS_URL + "?token=test"}, {"url": NEWS_URL + "#fragment"},
+                        {"url": NEWS_URL.replace("https://", "https://bob@")}, {"url": NEWS_URL + "x" * 1000},
+                        {"source": "brain_event"}, {"evidence_status": "search_snippet"}, {"derived": True},
+                        {"scope": "private:" + OWNER, "subject_id": OWNER, "sensitivity": "personal"}):
+            plan = parse_expression(ask, [{**record, **changes}], **audience)
+            self.assertNotIn("source_url", expression_hint(plan), changes)
+
+    async def test_mismatched_article_and_search_snippet_cannot_become_article_evidence(self):
+        for mid, change in [("wrong-resource", {"id": "ithome:0:111:222"}),
+                            ("wrong-origin", {"url": "https://different.example/news"}),
+                            ("not-article", {"basis": "search_snippet"}), ("blocked", {"basis": "unavailable"})]:
+            event = await self.capture(mid, "请读一下那篇报道")
+            self.client.call_tool.return_value = {**NEWS, **change}
+            await self.call(event, "news", "news_read", {"id": NEWS_ID})
+            self.assertEqual(self.bot._tool_store.observations(), [], mid)
+
+        event = await self.capture("feed-summary", "可以看一下摘要吗")
+        self.client.call_tool.return_value = {**NEWS, "basis": "feed_summary"}
+        result = await self.call(event, "news", "news_read", {"id": NEWS_ID})
+        self.assertTrue(result["success"], result)
+        memory, = self.bot._tool_store.observations()
+        self.assertEqual(memory["evidence_status"], "feed_summary")
+
+        event = await self.capture("web-result", "看看刚才那个网页")
+        ident = "web_" + "f" * 32
+        url = "https://observatory.example/geology"
+        self.client.call_tool.return_value = {"id": ident, "basis": "web_excerpt", "source": "observatory.example",
+            "url": url, "title": "地质资料", "text": "这里列出了陨石坑的直径范围。"}
+        result = await self.call(event, "news", "web_read", {"id": ident})
+        self.assertTrue(result["success"], result)
+        evidence = {m["url"]: m["evidence_status"] for m in self.bot._tool_store.observations()}
+        self.assertEqual(evidence, {NEWS_URL: "feed_summary", url: "web_excerpt"})
+
+    async def test_public_links_remain_clickable_while_credentials_and_paths_are_redacted(self):
+        status_url = "https://social.example/@observatory/900"
+        public_topic = "光谱"
+        private_values = ("https://observatory.example/log?signature=fixture-signed-link",
+                          "https://name:private-userinfo@observatory.example/log",
+                          "https://name@observatory.example/log", r"C:\private\report.txt",
+                          "/srv/hidden/report.txt", "file:///private/research/source.txt")
+        self.client.call_tool.return_value = {"items": [
+            {"title": public_topic, "url": url} for url in (status_url, NEWS_URL, *private_values)]}
+        self.bot.config.mcp.allow_group_reads = True
+        for audience in ({}, {"sid": "group", "group": GROUP}):
+            event = await self.capture("links", "查查光谱", **audience)
+            result = await self.call(event, "news", "web_search", {"query": public_topic})
+            self.assertTrue(result["success"], result)
+            self.assertIn(status_url, result["content"])
+            self.assertIn(NEWS_URL, result["content"])
+            for hidden in ("fixture-signed-link", "private-userinfo", "name@observatory", "report.txt", "source.txt"):
+                self.assertNotIn(hidden, result["content"])

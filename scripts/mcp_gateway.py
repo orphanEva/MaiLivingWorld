@@ -68,7 +68,7 @@ class GatewaySettings:
     pdf_root: str = field(default="/var/lib/cap/downloads", repr=False)
 
     def __post_init__(self):
-        if (self.provider not in CATALOG or not isinstance(self.token, str)
+        if (self.provider not in _CHILD_NAMES or not isinstance(self.token, str)
                 or not 32 <= len(self.token) <= 4096 or any(not 33 <= ord(c) <= 126 for c in self.token)
                 or not isinstance(self.command, str) or not self.command.strip() or "\0" in self.command
                 or not isinstance(self.cwd, str) or not self.cwd.strip() or "\0" in self.cwd

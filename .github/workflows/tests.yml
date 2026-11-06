@@ -30,3 +30,4 @@ jobs:
       - run: pip install 'mcp==2.3.0' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2' 'Pillow>=10,<13'
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mcp_client.py' -v
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mcp_gateway.py' -v
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_public_mcp_server.py' -v

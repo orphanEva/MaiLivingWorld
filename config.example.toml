@@ -14,7 +14,7 @@
 # 插件全局总开关：false 会连主人识别一并关闭。
 enabled = true
 # 当前插件配置版本；必须与安装版本一致，不要随意修改。
-config_version = "0.28.0"
+config_version = "0.29.0"
 
 # ====================================================================
 # 10 / 统一心智与唯一主人（沿用 brain_memory 的输入名单）
@@ -138,7 +138,7 @@ event_limit = 200
 [general]
 # 主动聊天调度开关；探索、公开认知和主人识别由各自 enabled 控制。
 enabled = false
-# true=只模拟选题并记录日志，不发送主动QQ消息、不写外部记忆；false=正式主动唤醒。
+# 安全演练。开启时只演练主动 QQ 联系并阻止 Mastodon 实发。实发还需单独启用对应功能。
 dry_run = true
 # 免打扰与日配额时区
 timezone = "Asia/Shanghai"
@@ -337,11 +337,15 @@ followup_interval_hours = 24
 # 12 / MCP 工具与自主查阅
 # ====================================================================
 [mcp]
-# 连接 cap / Pixiv MCP；需统一心智与可信主人绑定，服务独立运行。
+# MCP 工具总开关，需启用统一心智并绑定主人。CAP 与 Pixiv 使用各自的外部服务。
 enabled = false
-# 默认只有可信主人能调用；关闭后其他授权用户也仅能读取固定作品元数据。
+# 查新闻和百科。开启后可读取公开报道、维基百科，也可通过配置 Brave Search Key 扩充网页搜索。
+public_sources_enabled = false
+# 自主上网方式，可选「关闭」「只逛逛」「参与讨论」。实际公开回复还需绑定独立 Mastodon 账号并关闭安全演练。
+social_mode = "关闭"
+# 默认只有可信主人能调用。关闭后其他授权用户可读固定作品资料和已启用的公开来源。
 owner_only = true
-# 允许采集名单内群聊读取固定作品元数据；管理、写入与任务详情仍只在主人私聊。
+# 允许采集名单内群聊读取固定作品资料和已启用的公开来源。CAP/Pixiv 管理、写入与任务详情仅限主人私聊。
 allow_group_reads = false
 # 允许主人私聊创建归档、下载或媒体任务；不自动授权账户变更或文件传输。
 allow_writes = false
@@ -349,7 +353,7 @@ allow_writes = false
 allow_account_actions = false
 # 另行允许主人私聊使用 cap 已配置的文件发布/接收服务。
 allow_file_transfer = false
-# 只保存成功返回的作品元数据/小说片段作为带来源观察，不保存任务路径、凭据或签名链接。
+# 将成功读取的作品资料、小说片段、公开报道、百科和网页节选整理为带来源的观察。
 remember_results = true
 # 所有 MCP 工具及图片读取共用的持久每日调用上限；失败计数。
 max_daily_calls = 100

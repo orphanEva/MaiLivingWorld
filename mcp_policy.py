@@ -5,6 +5,8 @@ import copy
 import json
 import math
 import re
+import unicodedata
+from urllib.parse import urlsplit
 
 
 # kind: read, write, account (persistent/remote account changes), transfer.
@@ -55,16 +57,49 @@ PIXIV_TOOLS = {
     "create_account_migration": ("account", "把本地库收藏及合集关注迁移到后端账户"),
     "retry_account_migration": ("account", "重试账户迁移，会新增远端收藏或关注"),
 }
-CATALOG = {"cap": CAP_TOOLS, "pixiv": PIXIV_TOOLS}
-GROUP_READS = {("cap", "jm_get_album"), ("pixiv", "get_library_work")}
+PUBLIC_PROVIDERS = ("news", "reference")
+NEWS_TOOLS = {"news_search": ("read", "按主题筛选近期公开报道，可留空看最近条目"),
+              "news_read": ("read", "用新闻编号读取出处、发表时间、正文节选或订阅摘要"),
+              "web_search": ("read", "用 Brave 搜索公开网页，只搜索本轮明确的公开关键词"),
+              "web_read": ("read", "用刚取得的结果编号打开网页，阅读有限正文")}
+REFERENCE_TOOLS = {"reference_search": ("read", "按本轮明确提到的公开词条检索中英文维基百科"),
+                   "reference_read": ("read", "按词条编号和语言分页读取真实百科摘录与版本")}
+MASTODON_TOOLS = {"mastodon_search": ("read", "搜索本站索引中的公开讨论"),
+                  "mastodon_read": ("read", "读取一条公开原帖"),
+                  "mastodon_mentions": ("read", "读取该账号收到的公开提及"),
+                  "mastodon_identity": ("read", "核对此账号身份"),
+                  "mastodon_reply": ("write", "主人私聊亲自发送「公开回复 帖子编号 正文」后，按原文回复指定公开帖。")}
+CATALOG = {"cap": CAP_TOOLS, "pixiv": PIXIV_TOOLS, "news": NEWS_TOOLS, "reference": REFERENCE_TOOLS,
+           "mastodon": MASTODON_TOOLS}
+GROUP_READS = {("cap", "jm_get_album"), ("pixiv", "get_library_work"),
+               *((p, t) for p in PUBLIC_PROVIDERS for t in CATALOG[p])}
 _HIDDEN = re.compile(r"(?i)(?:password|secret|token|cookie|authorization|api.?key|headers|env|"
                      r"path|paths|file_uri|download_url|storage_root|raw_meta|metadata_json|novel_content|error|.*_path|.*_paths)$")
 _CREDENTIAL = re.compile(r"(?i)(?:bearer\s+\S+|(?:token|password|api.?key|secret|cookie|signature)\s*[:=]\s*\S+)")
-_LOCAL_PATH = re.compile(r"(?i)(?:file://|[a-z]:[\\/]|\\\\|(?:^|\s)/(?!/)[^\s]+/)")
+_LOCAL_PATH = re.compile(r"(?i)(?:file://|(?<![a-z0-9])[a-z]:[\\/]|\\\\|(?:^|\s)/(?!/)[^\s]+/)")
 
 
 class PolicyError(ValueError):
     """Only a fixed error code, safe for logs and outward results."""
+
+
+def check_public_query(provider, tool, args, context):
+    if (provider, tool) not in {("reference", "reference_search"), ("news", "web_search"),
+                                ("mastodon", "mastodon_search")}:
+        return
+    from .public_reference import public_topic
+    from .unified_expression import _SECRET, _IDENTIFIER, _INSTRUCTION
+    def folded(value):
+        return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) if isinstance(value, str) else ""
+    topic = folded(args.get("query"))
+    original = folded(context.get("query"))
+    try:
+        public_topic(topic)
+    except ValueError:
+        raise PolicyError("ask_for_public_search_terms") from None
+    if (not topic or len(topic) > 80 or topic not in original or _SECRET.search(original)
+            or _IDENTIFIER.search(topic) or _INSTRUCTION.search(topic)):
+        raise PolicyError("ask_for_public_search_terms")
 
 
 def permitted(provider: str, tool: str, config, context: dict, owner: str) -> bool:
@@ -72,6 +107,8 @@ def permitted(provider: str, tool: str, config, context: dict, owner: str) -> bo
     if not spec or not owner or not context:
         return False
     scope, speaker = context.get("scope", ""), context.get("speaker_id", "")
+    if (provider, tool) == ("mastodon", "mastodon_reply"):
+        return scope == "private:"+owner and speaker == owner and config.social_mode == "参与讨论"
     if config.owner_only and speaker != owner:
         return False
     if scope.startswith("group:"):
@@ -165,7 +202,7 @@ def clean_result(value, *, depth=0):
         if _CREDENTIAL.search(value) or _LOCAL_PATH.search(value):
             return "[受保护字段]"
         # Signed/credential-bearing links never leave even under an unexpected key.
-        if re.search(r"https?://\S*[?@]", value, re.I):
+        if re.search(r"https?://(?:[^/\s?#]*@|\S*\?)", value, re.I):
             return "[受保护链接]"
         return value[:4000]
     if value is None or type(value) in (bool, int):
@@ -177,6 +214,53 @@ def clean_result(value, *, depth=0):
 
 def observation(provider: str, tool: str, args: dict, result: dict) -> dict | None:
     """Persist only an actual source detail, never task status or a model's paraphrase."""
+    if (provider, tool) in {("news", "news_read"), ("reference", "reference_read"), ("news", "web_read")}:
+        from .unified_expression import _INSTRUCTION, _SECRET
+        import hashlib
+        url = result.get("url")
+        if not isinstance(url, str) or not 1 <= len(url) <= 1000:
+            return None
+        try:
+            parts = urlsplit(url)
+            if (parts.scheme != "https" or not parts.hostname or parts.username is not None or parts.password is not None
+                    or parts.port not in (None, 443) or parts.query or parts.fragment or "\\" in url):
+                return None
+        except ValueError:
+            return None
+        if tool == "reference_read":
+            language = args.get("language", "zh")
+            if (result.get("page_id") != args.get("page_id") or result.get("language") != language
+                    or parts.hostname != language+".wikipedia.org" or not parts.path.startswith("/wiki/")
+                    or result.get("basis") != "encyclopedia_excerpt" or result.get("offset") != args.get("offset", 0)):
+                return None
+            key = f"wiki:{language}:{args['page_id']}"
+            resource = key + ":" + str(args.get("offset", 0))
+            label = "百科节选"
+        else:
+            if not isinstance(args.get("id"), str) or result.get("id") != args["id"]:
+                return None
+            if tool == "news_read":
+                from .public_news import _article_url
+                try:
+                    if _article_url(args["id"])[1] != url or result.get("basis") not in {"article", "feed_summary"}:
+                        return None
+                except ValueError:
+                    return None
+            elif result.get("basis") != "web_excerpt":
+                return None
+            key = "article:" + hashlib.sha256(url.encode()).hexdigest()
+            resource = key
+            label = "订阅摘要" if result.get("basis") == "feed_summary" else "网页节选" if tool == "web_read" else "报道节选"
+        fields = [result.get(k, "") for k in ("source", "title", "text")]
+        if not all(isinstance(value, str) and value.strip() for value in fields):
+            return None
+        stamp = result.get("published_at") or result.get("updated_at") or ""
+        # Store the publisher's bounded excerpt and attribution only, never the search terms or chat context.
+        text = unicodedata.normalize("NFKC", f"{label}（{fields[0][:70]} {str(stamp)[:28]}）《{fields[1][:110]}》 {fields[2]}")
+        text = " ".join(text.split())[:575]
+        if _INSTRUCTION.search(text) or _SECRET.search(text):
+            return None
+        return {"resource_key": resource, "origin_key": key, "text": text, "url": url}
     if provider == "cap" and tool == "jm_get_album":
         if str(result.get("jm_id")) != args["jm_id"] or not isinstance(result.get("title"), str):
             return None

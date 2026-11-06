@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from .policy import extract_text
 from .unified_memory import _source_id
@@ -91,7 +92,35 @@ def _correction_id(record: dict) -> str:
         and record.get("scope") == "private:"+subject and record.get("evidence_status") == "owner_reported") else ""
 
 
-def _records(memories: Any, *, include_mention_history: bool = False) -> dict[str, dict[str, Any]]:
+def _public_source_url(item: dict) -> str:
+    provider, status, url = item.get("source_name"), item.get("evidence_status"), item.get("url")
+    if (provider not in ("news", "reference") or item.get("source") != "tool" or item.get("kind") != "observation"
+            or item.get("scope") != "public:" + provider or item.get("subject_id") != ""
+            or item.get("sensitivity") != "public" or item.get("derived")
+            or not re.fullmatch(r"tool:observation:[0-9a-f]{64}", str(item.get("id", "")))
+            or not re.fullmatch("tool:" + provider + r":[0-9a-f]{64}", str(item.get("origin_key", "")))
+            or not isinstance(url, str) or not 1 <= len(url) <= 1000):
+        return ""
+    # Use only the exact canonical HTTPS link supplied by the local reader. Never
+    # repair a signed/credential-bearing URL or extract a URL from source text.
+    from .public_web_search import _public_url
+    if _public_url(url) != url:
+        return ""
+    parts = urlsplit(url)
+    if provider == "reference":
+        return url if (status == "encyclopedia_excerpt" and parts.hostname in ("zh.wikipedia.org", "en.wikipedia.org")
+                       and parts.path.startswith("/wiki/")) else ""
+    if status == "web_excerpt":
+        return url
+    if status in ("publisher_excerpt", "feed_summary"):
+        from .public_news import _story_id
+        if _story_id("ithome", url) or _story_id("un", url):
+            return url
+    return ""
+
+
+def _records(memories: Any, *, include_mention_history: bool = False, include_public_links: bool = False
+             ) -> dict[str, dict[str, Any]]:
     """Take a bounded copy; reject duplicate source IDs instead of guessing precedence."""
     if not isinstance(memories, list):
         return {}
@@ -130,6 +159,10 @@ def _records(memories: Any, *, include_mention_history: bool = False) -> dict[st
                     records[ident]["previously_mentioned"] = True
         if correction_id:
             records[ident]["correction_id"] = correction_id
+        if include_public_links:
+            source_url = _public_source_url(item)
+            if source_url:
+                records[ident]["source_url"] = source_url
     for ident in duplicates:
         records.pop(ident, None)
     return records
@@ -182,6 +215,7 @@ def build_deliberation_prompt(memories: list[dict], *, query: str,
         "必须由原来源支持，将交给独立复核后才使用；保密内容不能通过概括绕过。"
         "internal 表示记住并理解但不说出；omit 表示与当前交谈无关。"
         "主人可被更熟悉地对待，但主人地位不把未经核实的信息变为事实。"
+        "谈新闻时区分报道日期与事情发生的日期，保留资料出处和报道里的不确定性。只有摘要时只转述摘要能支持的内容。"
         "记录涉及谁、来自哪个窗口，都不能用来推断谁说过这句话或哪位听众已经知道。"
         "recently_asked=true表示这条同版本近况近期确实问过，仅供理解背景；"
         "没有新进展且本轮未主动谈及时，不主动重复追问。该标记不扩大表达权限。"
@@ -273,7 +307,7 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
             or not isinstance(decisions, list) or len(decisions) > MAX_MEMORIES):
         return None
     owner_reply = is_owner is True and not proactive and audience_scope == "private:" + speaker_id
-    records = _records(memories, include_mention_history=owner_reply)
+    records = _records(memories, include_mention_history=owner_reply, include_public_links=True)
     plan: dict[str, Any] = {"behavior": behavior, "memories": [],
                             "pending_generalizations": [],
                             "stats": {"considered": len(records), "withheld": 0,
@@ -307,6 +341,8 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
                     and (record["source"], record["kind"], record["evidence_status"]) in {
                         ("story", "story", "source_metadata"), ("tool", "observation", "tool_observation")}):
                 direct["attribution"] = "public_material"
+            if record.get("source_url"):
+                direct.update(attribution="public_material", source_url=record["source_url"])
             if (is_owner is True and record.get("recently_asked") is True
                     and audience_scope == "private:"+speaker_id
                     and record["scope"] == audience_scope and record["subject_id"] == speaker_id):
@@ -406,6 +442,8 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
             if item.get("mode") == "say":
                 if item.get("attribution") == "public_material":
                     visible[-1]["attribution"] = "来自查到的公开资料。转述时保留资料的说法，阅读或观看进度另需依据。"
+                    if item.get("source_url"):
+                        visible[-1]["source_url"] = item["source_url"]
                 elif item.get("attribution") == "owner_correction" and corrected:
                     visible[-1]["attribution"] = "对方亲自更正过标明的引文。其余叙述的作者仍待确认。"
                 if item.get("previously_mentioned") is True:

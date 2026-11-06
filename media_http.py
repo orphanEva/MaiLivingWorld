@@ -73,15 +73,18 @@ def _interrupt(sock):
         pass
 
 
-def _request(url, hosts, max_bytes, deadline, referer, redirect_only):
+def _request(url, hosts, max_bytes, deadline, referer, redirect_only, api_key=None, allow_redirects=True):
     for hop in range(4):
         p = _parts(url, hosts)
         host = p.hostname
         target = (p.path or "/") + ("?" + p.query if p.query else "")
-        headers = {"Host": host, "User-Agent": "MaiLivingWorld/0.28 (read-only)", "Accept-Encoding": "identity",
+        headers = {"Host": host, "User-Agent": "MaiLivingWorldBot/0.29 (+https://github.com/orphanEva/MaiLivingWorld)", "Accept-Encoding": "identity",
                    "Connection": "close"}
         if referer:
             headers["Referer"] = referer
+        if api_key:
+            headers["X-Subscription-Token"] = api_key
+            headers["Accept"] = "application/json"
         with _connect(host, deadline) as sock:
             conn = http.client.HTTPConnection(host, 443, timeout=_remaining(deadline))
             conn.sock = sock  # Keep TLS hostname verification while connecting to the already checked IP.
@@ -93,6 +96,8 @@ def _request(url, hosts, max_bytes, deadline, referer, redirect_only):
                 sock.settimeout(_remaining(deadline))
                 with conn.getresponse() as response:
                     if response.status in (301, 302, 303, 307, 308):
+                        if not allow_redirects or api_key:
+                            raise MediaFetchError("bad_redirect")
                         location = response.getheader("Location")
                         if not location or hop == 3 or len(location) > 8192:
                             raise MediaFetchError("bad_redirect")
@@ -125,21 +130,29 @@ def _request(url, hosts, max_bytes, deadline, referer, redirect_only):
     raise MediaFetchError("bad_redirect")
 
 
-def _read(url, hosts, max_bytes, timeout, referer, redirect_only):
+def _read(url, hosts, max_bytes, timeout, referer, redirect_only, api_key=None, allow_redirects=True):
     if (type(max_bytes) is not int or not 1 <= max_bytes <= 32 * 1024 * 1024
             or type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 45):
         raise MediaFetchError("invalid_limit")
     try:
-        return _request(url, hosts, max_bytes, time.monotonic() + timeout, referer, redirect_only)
+        return _request(url, hosts, max_bytes, time.monotonic() + timeout, referer, redirect_only, api_key, allow_redirects)
     except MediaFetchError:
         raise
     except (OSError, ValueError, UnicodeError, http.client.HTTPException):
         raise MediaFetchError("fetch_failed") from None
 
 
-def fetch_public(url, *, allowed_hosts, max_bytes, timeout=8.0, referer="") -> bytes:
-    return _read(url, allowed_hosts, max_bytes, timeout, referer, False)
+def fetch_public(url, *, allowed_hosts, max_bytes, timeout=8.0, referer="", allow_redirects=True) -> bytes:
+    return _read(url, allowed_hosts, max_bytes, timeout, referer, False, allow_redirects=allow_redirects)
 
 
 def public_redirect(url, *, allowed_hosts, timeout=5.0) -> str:
     return _read(url, allowed_hosts, 1, timeout, "", True)
+
+
+def fetch_brave_api(url, *, token, max_bytes, timeout=8.0):
+    hosts = ("api.search.brave.com",)
+    if (_parts(url, hosts).path != "/res/v1/web/search" or not isinstance(token, str)
+            or not 1 <= len(token) <= 512 or any(not 33 <= ord(c) <= 126 for c in token)):
+        raise MediaFetchError("invalid_search_configuration")
+    return _read(url, hosts, max_bytes, timeout, "", False, token)
