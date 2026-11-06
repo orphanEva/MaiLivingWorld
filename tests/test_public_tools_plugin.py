@@ -165,6 +165,30 @@ class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.bot.mcp_tools("news", message=event))["success"])
         self.client.call_tool.assert_awaited_once_with("news_search", args)
 
+    async def test_reference_revision_is_preserved_and_updates_same_excerpt_identity(self):
+        from MaiLivingWorld.growth_store import source_fingerprint
+        records = []
+        for revision in (98, 99):
+            self.client.call_tool.return_value = {**REFERENCE, "revision_id": revision}
+            event = await self.capture("revision-"+str(revision), "请读木卫二百科")
+            result = await self.call(event, "reference", "reference_read", {"page_id": 42})
+            self.assertTrue(result["success"], result)
+            row, = self.bot._tool_store.observations()
+            self.assertIn("修订"+str(revision), row["text"])
+            records.append(row)
+        self.assertEqual(records[0]["id"], records[1]["id"])
+        self.assertEqual(records[0]["origin_key"], records[1]["origin_key"])
+        self.assertEqual(records[0]["url"], records[1]["url"])
+        self.assertNotEqual(source_fingerprint(records[0]), source_fingerprint(records[1]))
+
+    async def test_reference_without_verified_revision_cannot_create_memory(self):
+        for index, revision in enumerate((None, True, False, 0, -1, "98", 98.0)):
+            with self.subTest(revision=revision):
+                self.client.call_tool.return_value = {**REFERENCE, "revision_id": revision}
+                event = await self.capture("invalid-revision-"+str(index), "请读木卫二百科")
+                await self.call(event, "reference", "reference_read", {"page_id": 42})
+                self.assertEqual(self.bot._tool_store.observations(), [])
+
     async def test_external_search_never_extracts_an_unrequested_private_name(self):
         self.bot.config.mcp.social_mode = "只逛逛"
         self.client.call_tool.return_value = {"items": []}

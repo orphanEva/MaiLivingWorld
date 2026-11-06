@@ -393,7 +393,8 @@ def build_growth_prompt(records: list[dict], state: dict, *, review_beliefs=Fals
         "所有派生内容仍继承原来源限制，不能因为被称为观点或知识就宣布可以公开。"
         "知识必须有来源支持，转述和模型猜测不等于真相；beliefs保留不确定性，confidence不要虚高。"
         "新闻、网页节选保留发布者归属与时间，转载同一报道只算一个来源。订阅摘要只支持摘要里的信息。"
-        "questions只记录具体待研究问题；resolved需要真实的新来源支持，不能虚构已执行的研究或行动。"
+        "questions的open条目在question填写具体待研究问题；resolved条目在question填写新来源支持的简短答案或结论，"
+        "保留原问题的topic以便核对，不能仅重复问句，也不能虚构已执行的研究或行动。"
         "当前档案只能用于比较，不是新证据，已生成的成长条目不能自证。"
         + belief_rules + (EMOTION_RULES if emotional_episodes else "") +
         "每项引用1到3个给定原始记录ID，不重复引用。兴趣/观点/知识各最多2项，问题最多1项，"

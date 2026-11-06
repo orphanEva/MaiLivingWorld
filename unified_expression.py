@@ -165,7 +165,7 @@ def _records(memories: Any, *, include_mention_history: bool = False, include_pu
             if source_url:
                 if include_public_links:
                     records[ident]["source_url"] = source_url
-                if (include_browse_dates and item.get("source_name") == "news" and isinstance(item.get("browse_date"), str)
+                if (include_browse_dates and item.get("source_name") in ("news", "reference") and isinstance(item.get("browse_date"), str)
                         and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", item["browse_date"])):
                     records[ident]["browse_date"] = item["browse_date"]
     for ident in duplicates:

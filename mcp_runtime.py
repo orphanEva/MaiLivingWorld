@@ -170,7 +170,8 @@ class MCPBridge:
                 public = provider in PUBLIC_PROVIDERS
                 saved = self.store.put_observation(provider=provider, **item, scope="public:"+provider if public else context["scope"],
                     subject_id="" if public else context["speaker_id"], sensitivity="public" if public else "personal")
-                if autonomous_read and provider == "news" and tool in ("news_read", "web_read"):
+                if autonomous_read and (provider, tool) in {
+                        ("news", "news_read"), ("news", "web_read"), ("reference", "reference_read")}:
                     from .social_discovery import browse_receipt
                     summary = browse_receipt(saved)
             elif provider == "pixiv" and result.get("pixiv_id") == args.get("pixiv_id") and (

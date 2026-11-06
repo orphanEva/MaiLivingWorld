@@ -389,7 +389,9 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
             if identity in ranked:
                 duplicates.add(identity)
                 continue
-            if kind != "interest" and item.get("status") != ("open" if kind == "question" else "active"):
+            if kind == "question" and item.get("status") not in {"open", "resolved"}:
+                continue
+            if kind not in {"interest", "question"} and item.get("status") != "active":
                 continue
             if kind == "interest" and item.get("status") not in (None, "active"):
                 continue
@@ -422,6 +424,11 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
                 content += "；"+reaction[0]
             if text:
                 content += "；"+_text(text)
+            if kind == "question" and item["status"] == "resolved":
+                content = "关于"+_text(topic, 180)+"，已标记解决的问题记录为"+_text(text)
+                content += "。答案仍需原始材料支持，可随新证据修订。"
+                if len(content) > MAX_TEXT_CHARS:
+                    continue
             if kind == "belief":
                 assessment = item.get("assessment")
                 if assessment is not None and (not isinstance(assessment, dict)
@@ -471,6 +478,8 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
             }
             if kind == "interest":
                 ranked[identity]["weight"] = float(strength)
+            elif kind == "question":
+                ranked[identity]["status"] = item["status"]
     for identity in duplicates:
         ranked.pop(identity, None)
     return sorted(ranked.values(), key=lambda item: (-item["score"], -item["timestamp"], item["id"]))[:min(limit, MAX_RESULTS)]

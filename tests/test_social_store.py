@@ -21,6 +21,44 @@ ACCOUNT = fingerprint("instance,verified account")
 
 
 class SocialStoreChecks:
+    def test_autonomous_reference_pages_share_one_recent_slot_and_keep_news_receipts(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        owner = "12345678"
+        db = self.store()
+        news = db.put_observation("news", "old-article", "报道节选：天文观测", "public:news",
+            sensitivity="public", url="https://www.ithome.com/0/875/123.htm", now=10)
+        page = db.put_observation("reference", "wiki:zh:42:0", "百科节选（修订98）：第一段", "public:reference",
+            sensitivity="public", url="https://zh.wikipedia.org/wiki/Europa", origin_key="wiki:zh:42", now=20)
+        continuation = db.put_observation("reference", "wiki:zh:42:1200", "百科节选（修订99）：后续一段", "public:reference",
+            sensitivity="public", url="https://zh.wikipedia.org/wiki/Europa", origin_key="wiki:zh:42", now=30)
+        for record, provider, tool, stamp in ((news, "news", "news_read", 11), (page, "reference", "reference_read", 21),
+                                              (continuation, "reference", "reference_read", 31)):
+            call = db.reserve_call(provider, tool, fingerprint(record["id"]), "window", "private:"+owner, owner, 0, 20, now=stamp)
+            db.complete_call(call["id"], "succeeded", browse_receipt(record), now=stamp+1)
+        second = self.store()
+        recent = second.recent_social_reads(owner, now=33)
+        self.assertEqual([row["id"] for row in recent], [continuation["id"], news["id"]])
+        self.assertEqual(recent[0]["text"], continuation["text"])
+        self.assertEqual(recent[0]["browse_time"], 32)
+        self.assertNotIn("第一段", recent[0]["text"])
+        self.assertEqual(second.recent_social_reads("87654321", now=33), [])
+        db.retract_origin("reference", "wiki:zh:42", now=34)
+        self.assertEqual([row["id"] for row in second.recent_social_reads(owner, now=35)], [news["id"]])
+
+    def test_reference_receipt_rejects_manual_updates_and_expired_reads(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        owner = "12345678"
+        db = self.store()
+        options = dict(sensitivity="public", url="https://zh.wikipedia.org/wiki/Europa", origin_key="wiki:zh:42")
+        page = db.put_observation("reference", "wiki:zh:42:0", "百科节选（修订98）：原摘录", "public:reference", now=10, **options)
+        call = db.reserve_call("reference", "reference_read", fingerprint("page"), "window", "private:"+owner, owner, 0, 20, now=11)
+        self.assertEqual(db.recent_social_reads(owner, now=11), [])
+        db.complete_call(call["id"], "succeeded", browse_receipt(page), now=12)
+        self.assertEqual(len(db.recent_social_reads(owner, now=13)), 1)
+        self.assertEqual(db.recent_social_reads(owner, now=13+7*86400), [])
+        db.put_observation("reference", "wiki:zh:42:0", "百科节选（修订99）：原摘录", "public:reference", now=14, **options)
+        self.assertEqual(db.recent_social_reads(owner, now=15), [])
+
     def test_article_freshness_requires_recent_autonomous_body_and_matching_listing(self):
         from MaiLivingWorld.social_discovery import browse_receipt
         owner, url = "12345678", "https://www.ithome.com/0/875/123.htm"

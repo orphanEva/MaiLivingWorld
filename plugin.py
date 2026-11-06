@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.31.0",
+        default="0.32.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.31.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.32.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1216,7 +1216,7 @@ class MaiLivingWorld(MaiBotPlugin):
                         elif resolved and resolved["status"] == "resolved":
                             focus = resolved["records"]
                             ids = {row["id"] for row in focus}
-                            related = [row for row in self._collect_unified(resolved["query"])
+                            related = [] if resolved.get("question_progress") else [row for row in self._collect_unified(resolved["query"])
                                        if row["id"] not in ids and any(
                                            ref.get("id") in ids for ref in row.get("sources", []) if isinstance(ref, dict))]
                             records = (focus + related)[:self.config.unified_mind.recall_limit]
@@ -1225,8 +1225,7 @@ class MaiLivingWorld(MaiBotPlugin):
                             owner = normalize_qq(self.config.owner.qq)
                             discovery_turn = (context["speaker_id"] == owner and context["scope"] == "private:"+owner)
                             records = []
-                            social = self._social_runtime()
-                            if (discovery_turn and social and social.owner() == owner and
+                            if (discovery_turn and self.config.mcp.enabled and
                                     self.config.mcp.remember_results and self.config.mcp.public_sources_enabled):
                                 now = time.time()
                                 items = self._ensure_tool_store().recent_social_reads(owner, now=now)
@@ -2428,6 +2427,10 @@ class MaiLivingWorld(MaiBotPlugin):
                     # proposal and independent review can reassess the same question.
                     records = list({r["id"]: r for r in public["records"] + evidence}.values())
                     self._growth.enqueue(records, mode=self.config.growth.mode)
+                    marker = result.get("read_marker")
+                    if marker and valid():
+                        store.mark_research_read(owner, marker["question_digest"], marker["url"],
+                            marker["version"], evidence[0], call_id=marker["call_id"])
             else:
                 client = self._mcp_client("pixiv")
                 options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,

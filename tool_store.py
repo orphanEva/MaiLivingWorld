@@ -22,6 +22,7 @@ from .sql_logging import connect_sqlite
 _CONTROL = "__tool_control__"
 _LOCAL = "__tool_local__"
 _SOCIAL = "__tool_social__:"
+_RESEARCH_READ = "__tool_research_read__:"
 _SOCIAL_HELP = frozenset({"social_setup_required", "social_auth_failed", "social_permission_required",
                          "social_search_key_required", "social_reply_uncertain"})
 _RANK = {"public": 0, "personal": 1, "unknown": 2, "confidential": 3}
@@ -85,7 +86,7 @@ def _social_article_inputs(owner, candidates):
 
 
 def _reserved_research_key(key):
-    return key in {_CONTROL, _LOCAL} or key.startswith(_SOCIAL)
+    return key in {_CONTROL, _LOCAL} or key.startswith((_SOCIAL, _RESEARCH_READ))
 
 
 def _integer(value, minimum=0, maximum=1000000):
@@ -544,6 +545,76 @@ class ToolStore:
                              (chosen, time.time(), _LOCAL))
             return chosen
 
+    def new_research_candidates(self, owner, question_digest, candidates, now=None):
+        """Skip recently enqueued versions for this exact question, preserving alternative sources."""
+        from .growth_store import source_fingerprint
+        from .unified_expression import _public_source_url
+        _social_article_inputs(owner, candidates)
+        _social_digest(question_digest)
+        if len(candidates) > 3:
+            raise ValueError("invalid_research_candidates")
+        if not candidates:
+            return set()
+        stamp = _now(now)
+        prefix = _RESEARCH_READ + _digest(owner, question_digest) + ":"
+        slots = {prefix + _digest(url): url for url in candidates}
+        marks = ",".join("?" for _ in slots)
+        rows = self._read("SELECT question_key,status,lease_token,updated FROM tool_research "
+                          "WHERE question_key IN (" + marks + ") AND updated>? AND updated<=?",
+                          (*slots, stamp-86400, stamp))
+        records = {r["id"]: r for r in self.resolve([row["lease_token"] for row in rows])}
+        blocked = set()
+        for row in rows:
+            url = slots[row["question_key"]]
+            record = records.get(row["lease_token"])
+            if (record and _public_source_url(record) == url
+                    and row["status"] == _digest(candidates[url], source_fingerprint(record))):
+                blocked.add(url)
+        return set(candidates) - blocked
+
+    def mark_research_read(self, owner, question_digest, url, version, record, *, call_id, now=None):
+        """Called after durable growth enqueue; retain at most 256 source-version markers."""
+        from .growth_store import source_fingerprint
+        from .social_discovery import browse_receipt
+        from .unified_expression import _public_source_url
+        _social_article_inputs(owner, {url: version})
+        _social_digest(question_digest)
+        if not isinstance(record, dict) or _public_source_url(record) != url:
+            return False
+        if not isinstance(call_id, str) or not re.fullmatch(r"tool:call:[0-9a-f]{64}", call_id):
+            raise ValueError("invalid_call")
+        stamp = _now(now)
+        calls = self._read("SELECT payload FROM tool_calls WHERE id=? AND status='succeeded' "
+                           "AND scope=? AND subject_id=? AND updated BETWEEN ? AND ? "
+                           "AND ((provider='news' AND tool IN ('news_read','web_read')) "
+                           "OR (provider='reference' AND tool='reference_read'))",
+                           (call_id, "private:"+owner, owner, stamp-60, stamp))
+        if not calls:
+            return False
+        try:
+            payload = json.loads(calls[0]["payload"])
+        except (ValueError, TypeError):
+            return False
+        receipt = browse_receipt(record)
+        if not receipt or not isinstance(payload, dict) or payload.get("summary") != receipt:
+            return False
+        current = self.resolve([record["id"]])
+        if not current or source_fingerprint(current[0]) != source_fingerprint(record):
+            return False
+        slot = _RESEARCH_READ + _digest(owner, question_digest) + ":" + _digest(url)
+        version = _digest(version, source_fingerprint(record))
+        with self.con:
+            self._lock()
+            self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+            self.con.execute("UPDATE tool_research SET status=?,lease_token=?,updated=? "
+                             "WHERE question_key=? AND updated<=?", (version, record["id"], stamp, slot, stamp))
+            oldest = self.con.execute("SELECT question_key FROM tool_research WHERE question_key>=? AND question_key<? "
+                                      "ORDER BY updated DESC,question_key DESC LIMIT 1 OFFSET 256",
+                                      (_RESEARCH_READ, _RESEARCH_READ + "~")).fetchone()
+            if oldest:
+                self.con.execute("DELETE FROM tool_research WHERE question_key=?", (oldest["question_key"],))
+        return True
+
     def status(self):
         # Dedicated reads are side-effect free even on a new empty database.
         calls = {row["status"]: int(row["n"]) for row in self._read("SELECT status,COUNT(*) AS n FROM tool_calls WHERE provider<>? GROUP BY status", ("chat_media",))}
@@ -634,7 +705,8 @@ class ToolStore:
         # The budget_day predicate uses the existing daily call index. Only bounded
         # autonomous browsing/research carries this marker; ordinary lookups do not.
         rows = self._read("SELECT payload,updated FROM tool_calls WHERE budget_day>=? AND updated BETWEEN ? AND ? "
-                          "AND provider='news' AND tool IN ('news_read','web_read') AND status='succeeded' "
+                          "AND ((provider='news' AND tool IN ('news_read','web_read')) "
+                          "OR (provider='reference' AND tool='reference_read')) AND status='succeeded' "
                           "AND scope=? AND subject_id=? AND payload LIKE ? ORDER BY updated DESC,id DESC LIMIT 40",
                           (stamp - 8*86400, stamp - 7*86400, stamp, "private:"+owner, owner,
                            '{"summary":"' + RECEIPT_PREFIX + '%'))
@@ -649,11 +721,12 @@ class ToolStore:
             if ref:
                 receipts.append((ref[0], summary, float(row["updated"])))
         records = {r["id"]: r for r in self.resolve([entry[0] for entry in receipts])}
-        selected = []
+        selected, origins = [], set()
         for ident, receipt, finished in receipts:
             record = records.get(ident)
-            if record and browse_receipt(record) == receipt:
+            if record and record["origin_key"] not in origins and browse_receipt(record) == receipt:
                 selected.append({**record, "browse_time": finished})
+                origins.add(record["origin_key"])
                 del records[ident]
                 if len(selected) == limit:
                     break

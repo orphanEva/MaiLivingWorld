@@ -1,17 +1,22 @@
 """Public questions reuse the real research quota, source ledger and growth review."""
 import copy
+from contextlib import ExitStack
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from MaiLivingWorld.growth_model import empty_growth, MAX_RECORDS
 from MaiLivingWorld.growth_store import source_fingerprint
 from MaiLivingWorld.mcp_policy import observation
 from MaiLivingWorld.public_research import public_question
+from MaiLivingWorld.public_news import _article_url
 from MaiLivingWorld.tests.test_growth_runtime import model_response, review
 from MaiLivingWorld.tests.test_public_tools_plugin import NEWS, REFERENCE, fixture_client
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
@@ -73,13 +78,24 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
         if name == "reference_read":
             return {**REFERENCE, "text": "望远镜的分辨率与口径、波长有关，观测还需考虑大气条件。"}
         if name in ("news_read", "web_read"):
-            return {**NEWS, "id": arguments["id"], "url": "https://news.un.org/zh/story/2026/11/1143147",
+            url = (_article_url(arguments["id"])[1] if name == "news_read" else
+                   next(row["url"] for row in self.results if row["id"] == arguments["id"]))
+            return {**NEWS, "id": arguments["id"], "url": url,
                     "basis": "article" if name == "news_read" else "web_excerpt",
                     "text": "报道给出了望远镜口径和观测条件。"}
         raise AssertionError(name)
 
     def calls(self):
         return [call.args for call in self.client.call_tool.await_args_list]
+
+    def clock(self, stamp):
+        day = datetime.fromtimestamp(stamp, ZoneInfo(self.bot.config.general.timezone)).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        stack = ExitStack()
+        stack.enter_context(patch("MaiLivingWorld.tool_store.time.time", return_value=stamp))
+        stack.enter_context(patch.object(plugin, "tool_day_start", return_value=day))
+        stack.enter_context(patch("MaiLivingWorld.mcp_runtime.day_start", return_value=day))
+        return stack
 
     async def test_public_question_reads_background_without_pixiv_and_survives_restart(self):
         result = await self.bot._research_tools(with_evidence=True)
@@ -148,12 +164,77 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls()), 3)
         self.assertEqual(self.bot._growth_snapshot()["questions"][0]["status"], "open")
 
-    async def test_original_web_result_only_keeps_question_open(self):
+    async def test_original_web_result_only_continues_with_wikipedia(self):
         os.environ["MLW_BRAVE_SEARCH_KEY"] = "fixture-secret-key"
         self.results = [{"id": "web_original", "url": NEWS["url"]}]
-        self.assertEqual(await self.bot._research_tools(with_evidence=True), {"success": True, "records": []})
-        self.assertEqual(len(self.calls()), 1)
-        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+        result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["source_name"], "reference")
+        self.assertEqual([name for name, _ in self.calls()], ["web_search", "reference_search", "reference_read"])
+        self.assertEqual(self.bot._growth_snapshot()["questions"][0]["status"], "open")
+
+    async def test_unhelpful_first_source_gives_way_to_next_source_after_restart(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"},
+                        {"id": "un:2026:11:1143148", "url": "https://news.un.org/zh/story/2026/11/1143148"}]
+        stamp = time.time()
+        first = await self.bot._research_tools(with_evidence=True)
+        data = empty_growth()
+        self.bot.ctx.llm.generate.side_effect = [model_response(data), model_response(review(data))]
+        await self.bot._grow()
+        self.assertEqual(self.bot._growth_snapshot()["questions"][0]["status"], "open")
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            second = await self.bot._research_tools(with_evidence=True)
+        self.assertNotEqual(first["records"][0]["id"], second["records"][0]["id"])
+        self.assertEqual(self.calls()[-1], ("news_read", {"id": "un:2026:11:1143148"}))
+
+    async def test_changed_listing_and_expired_marker_allow_research_reread(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147",
+                         "title": "原报道"}]
+        stamp = time.time()
+        await self.bot._research_tools()
+        self.results[0]["title"] = "更正报道"
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            await self.bot._research_tools()
+        self.assertEqual(self.calls()[-1][0], "news_read")
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+91000):
+            await self.bot._research_tools()
+        self.assertEqual(self.calls()[-1][0], "news_read")
+
+    async def test_web_handle_change_keeps_read_progress_then_falls_back_to_reference(self):
+        os.environ["MLW_BRAVE_SEARCH_KEY"] = "fixture-secret-key"
+        self.results = [{"id": "web_original", "url": "https://public.example/new", "title": "观测记录"}]
+        stamp = time.time()
+        await self.bot._research_tools()
+        self.results[0]["id"] = "web_new-handle"
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual([name for name, _ in self.calls()], ["web_search", "reference_search", "reference_read"])
+        self.assertEqual(result["records"][0]["source_name"], "reference")
+
+    async def test_queue_failure_does_not_consume_source_candidate(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"}]
+        stamp = time.time()
+        with patch.object(self.bot._growth, "enqueue", side_effect=ValueError("queue_capacity")):
+            self.assertFalse(await self.bot._research_tools())
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            self.assertTrue(await self.bot._research_tools())
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "news_read"])
+
+    async def test_already_considered_wikipedia_does_not_get_read_again(self):
+        stamp = time.time()
+        await self.bot._research_tools()
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result, {"success": True, "records": []})
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "reference_search"])
+        self.assertEqual(self.bot._growth_snapshot()["questions"][0]["status"], "open")
 
     async def test_failed_lookup_backs_off_and_does_not_claim_completion(self):
         self.client.call_tool.side_effect = RuntimeError("offline")

@@ -49,7 +49,7 @@ def discovery_period(text):
 
 
 def browse_receipt(record):
-    if (not record or record.get("source_name") != "news" or not _public_source_url(record)):
+    if not record or not _public_source_url(record):
         return ""
     return RECEIPT_PREFIX + record["id"] + ":" + source_fingerprint(record)
 

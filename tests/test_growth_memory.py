@@ -244,7 +244,43 @@ class GrowthMemoryTests(unittest.TestCase):
         state["questions"][0]["status"]="resolved"
         state["beliefs"][0]["status"]="rejected"
         rows = derived_memories(state,sources,fingerprint=fingerprint)
-        self.assertEqual({row["kind"] for row in rows},{"interest","knowledge"})
+        self.assertEqual({row["kind"] for row in rows},{"interest","knowledge","question"})
+        question = next(row for row in rows if row["kind"] == "question")
+        self.assertEqual(question["status"], "resolved")
+        self.assertIn("已标记解决的问题记录", question["text"])
+        self.assertNotIn("待解问题", question["text"])
+
+    def test_resolved_question_keeps_all_source_boundaries_and_current_conclusion(self):
+        ids = [self.fact("question", text="缓存过期后是否会返回旧值", scope="group:22222222"),
+               self.fact("answer", text="在过期时重新验证可阻止旧值被当成最新结果")]
+        originals = self.resolve(ids)
+        current = item("questions", list(originals.values()), text="应在过期时重新验证", status="resolved", revision=2)
+        state = {"questions": [current]}
+        before = copy.deepcopy(state)
+        result = derived_memories(state, originals, fingerprint=fingerprint, query="缓存")[0]
+        self.assertEqual((result["scope"], result["sensitivity"]), ("global:derived", "personal"))
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["revision"], 2)
+        self.assertIn("应在过期时重新验证", result["text"])
+        self.assertIn("答案仍需原始材料支持，可随新证据修订", result["text"])
+        self.assertEqual(result["evidence_status"], "inferred")
+        self.assertEqual(result["sources"], current["sources"])
+        self.assertEqual(state, before)
+        with self.brain.con:
+            self.brain.con.execute("UPDATE brain_facts SET value='旧结论需要更正' WHERE id='answer'")
+        self.assertEqual(derived_memories(state, self.resolve(ids), fingerprint=fingerprint), [])
+
+    def test_question_open_resolved_and_legacy_statuses_have_distinct_recall(self):
+        originals = self.resolve([self.fact()])
+        for status in ("open", "resolved", "rejected", "paused", None):
+            state = {"questions": [item("questions", list(originals.values()), status=status)]}
+            result = derived_memories(state, originals, fingerprint=fingerprint)
+            if status in {"open", "resolved"}:
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["status"], status)
+                self.assertEqual("待解问题" in result[0]["text"], status == "open")
+            else:
+                self.assertEqual(result, [])
 
     def test_derived_bounds_and_duplicate_keys_fail_closed_without_mutation(self):
         sources = self.resolve([self.fact()])

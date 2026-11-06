@@ -5,7 +5,9 @@ import unicodedata
 
 from .growth_store import source_fingerprint
 from .growth_model import MAX_RECORDS
+from .mcp_runtime import digest
 from .public_reference import public_topic
+from .public_web_search import _public_url
 from .unified_expression import _INSTRUCTION, _SECRET, _public_source_url
 
 
@@ -38,6 +40,9 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
     if not checked or not valid():
         return {"success": False, "records": []}
     topic = checked["topic"]
+    question_digest = digest(question)
+    owner = bot._self_state.state()["owner_id"]
+    store = bot._ensure_tool_store()
     context = {**context, "query": topic, "public_search_terms": [topic]}
 
     async def call(provider, tool, args):
@@ -46,12 +51,12 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
         return await bot._mcp_bridge.execute(provider, tool, args, config=bot.config.mcp, context=context,
             owner=bot._self_state.state()["owner_id"], client=bot._mcp_client(provider), valid=valid,
             timezone=bot.config.general.timezone, record_observations=True, on_dispatch=on_dispatch,
-            autonomous_read=tool in {"news_read", "web_read"})
+            autonomous_read=tool in {"news_read", "web_read", "reference_read"})
 
     # Prefer current web results when the deployment has a search key. Without
     # it, publisher feeds can answer recent questions and Wikipedia supplies background.
     web = bool(bot._builtin_mcp_environment("news").get("MLW_BRAVE_SEARCH_KEY"))
-    searches = [("news", "web_search")] if web else [("news", "news_search"), ("reference", "reference_search")]
+    searches = [("news", "web_search" if web else "news_search"), ("reference", "reference_search")]
     original_urls = {record["url"] for record in checked["records"]}
     row = None
     for provider, search in searches:
@@ -61,7 +66,22 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
         rows = found["data"].get("items", [])
         if not isinstance(rows, list):
             return {"success": False, "records": []}
-        row = next((r for r in rows[:3] if isinstance(r, dict) and r.get("url") not in original_urls), None)
+        candidates = []
+        seen = set(original_urls)
+        for item in rows[:3]:
+            if not isinstance(item, dict):
+                continue
+            url = _public_url(item.get("url"))
+            fields = [item.get(key) for key in ("title", "summary", "published_at", "updated_at")]
+            if not url or len(url) > 1000 or url in seen or any(value is not None and not isinstance(value, str) for value in fields):
+                continue
+            seen.add(url)
+            # Search-service handles are ephemeral. Use the public page and listing
+            # version so restarting the service does not reread the same result.
+            candidates.append((item, url, digest([provider, *fields])))
+        unread = store.new_research_candidates(owner, question_digest, {url: version for _, url, version in candidates})
+        selected = next((item for item in candidates if item[1] in unread), None)
+        row = selected[0] if selected else None
         if row is not None:
             break
     if row is None:
@@ -74,4 +94,7 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
     if not valid() or not detail.get("success"):
         return {"success": False, "records": []}
     record = detail.get("observation")
-    return {"success": True, "records": [record] if record and _public_source_url(record) else []}
+    if not record or not _public_source_url(record):
+        return {"success": True, "records": []}
+    return {"success": True, "records": [record], "read_marker": {
+        "question_digest": question_digest, "url": selected[1], "version": selected[2], "call_id": detail["call_id"]}}

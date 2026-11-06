@@ -141,7 +141,26 @@ class ProjectsRuntime:
         # Older projects retain their Pixiv source hash in storage. Validate it
         # above, then compare the same seed under the current reader signature.
         seed = dict(row["seed"], source_signature=signature)
-        return not active or seed in self.seed_candidates()
+        if not active or seed in self.seed_candidates():
+            return True
+        # A gathered project reviews its original question and evidence even
+        # when the growth worker has already refined or answered that question.
+        cfg = self.bot.config
+        reading_available = (cfg.mcp.enabled and cfg.mcp_pixiv.enabled and cfg.mcp.remember_results
+                             and cfg.reading.enabled and cfg.reading.auto_continue)
+        if row["stage"] != "review" or not (self.bot._research_available() or reading_available):
+            return False
+        state = self.bot._growth_snapshot()
+        question = next((item for item in state["questions"] if item["key"] == seed["question_key"]), None)
+        interest = next((item for item in state["interests"] if item["key"] == seed["interest_key"]
+                         and item.get("weight", 0) > 0 and item.get("status", "active") == "active"), None)
+        if not question or not interest:
+            return False
+        try:
+            current = references(question["sources"] + interest["sources"])
+        except ValueError:
+            return False
+        return all(ref in current for ref in seed["seed_refs"])
 
     def prepare(self):
         if not self.enabled() or self._activity()[0]:

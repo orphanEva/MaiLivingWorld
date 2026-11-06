@@ -279,15 +279,19 @@ def observation(provider: str, tool: str, args: dict, result: dict) -> dict | No
                 return None
         except ValueError:
             return None
+        source_version = ""
         if tool == "reference_read":
             language = args.get("language", "zh")
+            revision = result.get("revision_id")
             if (result.get("page_id") != args.get("page_id") or result.get("language") != language
                     or parts.hostname != language+".wikipedia.org" or not parts.path.startswith("/wiki/")
-                    or result.get("basis") != "encyclopedia_excerpt" or result.get("offset") != args.get("offset", 0)):
+                    or result.get("basis") != "encyclopedia_excerpt" or result.get("offset") != args.get("offset", 0)
+                    or type(revision) is not int or revision <= 0):
                 return None
             key = f"wiki:{language}:{args['page_id']}"
             resource = key + ":" + str(args.get("offset", 0))
             label = "百科节选"
+            source_version = f" 修订{revision}"
         else:
             if not isinstance(args.get("id"), str) or result.get("id") != args["id"]:
                 return None
@@ -308,7 +312,7 @@ def observation(provider: str, tool: str, args: dict, result: dict) -> dict | No
             return None
         stamp = result.get("published_at") or result.get("updated_at") or ""
         # Store the publisher's bounded excerpt and attribution only, never the search terms or chat context.
-        text = unicodedata.normalize("NFKC", f"{label}（{fields[0][:70]} {str(stamp)[:28]}）《{fields[1][:110]}》 {fields[2]}")
+        text = unicodedata.normalize("NFKC", f"{label}（{fields[0][:70]}{source_version} {str(stamp)[:28]}）《{fields[1][:110]}》 {fields[2]}")
         text = " ".join(text.split())[:575]
         if _INSTRUCTION.search(text) or _SECRET.search(text):
             return None

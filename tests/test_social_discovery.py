@@ -12,6 +12,7 @@ from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
 from MaiLivingWorld.tests.test_social_runtime import PublicFixture
 from MaiLivingWorld.tests.test_unified_runtime import kwargs
+from MaiLivingWorld.tests.test_public_tools_plugin import REFERENCE, fixture_client
 
 
 AUTONOMOUS = "自主浏览时亲自选中"
@@ -91,6 +92,40 @@ class SocialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.capture_unified(message=event)
         result = await self.bot.brain_reply_hint(**kwargs(event["session_id"], mid))
         return json.dumps(result, ensure_ascii=False)
+
+    async def read_reference(self, *, autonomous=True):
+        self.bot._ensure_tool_store()
+        client = fixture_client()
+        client.call_tool.return_value = REFERENCE
+        return await self.bot._mcp_bridge.execute("reference", "reference_read", {"page_id": 42},
+            config=self.bot.config.mcp, context={"scope": "private:"+OWNER, "speaker_id": OWNER,
+            "sid": "reference-research", "mid": "read-page"}, owner=OWNER, client=client, valid=lambda: True,
+            record_observations=True, autonomous_read=autonomous, timezone=self.bot.config.general.timezone)
+
+    async def test_autonomous_reference_read_is_recalled_after_restart_with_browsing_off(self):
+        result = await self.read_reference()
+        self.assertTrue(result["success"], result)
+        record, = self.bot._tool_store.recent_social_reads(OWNER)
+        self.assertEqual(record["source_name"], "reference")
+        self.assertIn("修订98", record["text"])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.mcp.social_mode = "关闭"
+        visible = await self.ask("read-recall", "你最近读过什么？")
+        self.assertIn(REFERENCE["url"], visible)
+        self.assertIn(AUTONOMOUS, visible)
+        self.assertIn("修订98", visible)
+        self.mode = "omit"
+        hidden = await self.ask("read-hidden", "你最近读过什么？")
+        self.assertNotIn(REFERENCE["url"], hidden)
+        self.assertNotIn(AUTONOMOUS, hidden)
+
+    async def test_requested_reference_read_does_not_become_own_discovery(self):
+        result = await self.read_reference(autonomous=False)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(len(self.bot._tool_store.observations()), 1)
+        self.assertEqual(self.bot._tool_store.recent_social_reads(OWNER), [])
+        self.assertNotIn(AUTONOMOUS, await self.ask("manual-reference"))
 
     async def test_reading_survives_restart_and_owner_can_recall_it_with_source(self):
         await self.browse()

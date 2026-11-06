@@ -1,5 +1,6 @@
 """Actual source, identity, context and topic stores with offline send receipts."""
 import asyncio
+import hashlib
 from pathlib import Path
 import tempfile
 import time
@@ -8,7 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from MaiLivingWorld.growth_store import source_fingerprint
-from MaiLivingWorld.reference_runtime import ReferenceRuntime, is_followup
+from MaiLivingWorld.reference_runtime import ReferenceRuntime, is_followup, question_progress
 from MaiLivingWorld.self_state import SelfState
 from MaiLivingWorld.tool_store import ToolStore
 from MaiLivingWorld.unified_runtime import UnifiedRuntime
@@ -33,7 +34,8 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         b.ctx = SimpleNamespace(paths=SimpleNamespace(data_dir=Path(self.temp.name)),
             chat=SimpleNamespace(get_stream_by_user_id=AsyncMock(return_value={"stream_id": "private-one"})))
         b.config = SimpleNamespace(plugin=Settings(enabled=True), owner=Settings(enabled=True, qq=OWNER),
-            reference=Settings(enabled=True, ttl_hours=24), unified_mind=Settings(enabled=True, mode="active"))
+            reference=Settings(enabled=True, ttl_hours=24), unified_mind=Settings(enabled=True, mode="active", recall_limit=12),
+            growth=Settings(enabled=True, mode="active"))
         b._mcp_generation = 0
         b._ledger_storage_options = lambda: {}
         b._self_state = SelfState(Path(self.temp.name)/"self.sqlite3")
@@ -47,6 +49,16 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.runtime = ReferenceRuntime(b)
         self.first = self.source("first", "明天下午我准备参加一个编程岗位面试。")
         self.second = self.source("second", "周末我打算坐高铁去海边看日出。")
+        self.questions = []
+        b._ensure_growth = lambda: True
+        b._growth_snapshot = lambda: {"questions": self.questions}
+
+    def progress_question(self, topic="面试准备", status="open", records=None):
+        records = records or [self.first]
+        return {"key": "q:"+hashlib.sha256(topic.encode()).hexdigest()[:24], "topic": topic, "revision": 1,
+                "status": status, "confidence": 1.0, "text": "把主要经历整理成清晰的例子",
+                "sources": [{"id": row["id"], "digest": source_fingerprint(row),
+                             "scope": row["scope"], "sensitivity": row["sensitivity"]} for row in records]}
 
     def source(self, key, text, *, owner=OWNER):
         return self.bot._tool_store.put_observation("cap", key, text, "private:"+owner, subject_id=owner)
@@ -136,6 +148,86 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result = self.runtime.resolve(self.capture_event(quoted))
             self.assertEqual(result["status"], "unavailable", kind)
             self.assertNotIn("自己的判断", result["hint"])
+
+    async def test_question_progress_uses_current_state_and_all_original_sources_after_restart(self):
+        await self.focus()
+        self.runtime.close()
+        self.runtime = ReferenceRuntime(self.bot)
+        for status in ("open", "resolved"):
+            self.questions = [self.progress_question(status=status, records=[self.first, self.second])]
+            text = "之前那个问题后来弄明白了吗？"
+            event = message("progress-"+status, sid="new-session", text=text)
+            event["raw_message"] = [{"type": "text", "data": text}]
+            result = self.runtime.resolve(self.capture_event(event))
+            self.assertEqual(result["status"], "resolved")
+            self.assertTrue(result["question_progress"])
+            self.assertEqual(result["records"][0]["id"], self.first["id"])
+            self.assertEqual(result["records"][1]["id"], self.second["id"])
+            question = result["records"][-1]
+            self.assertEqual(question["status"], status)
+            self.assertEqual(len(question["sources"]), 2)
+            self.assertIn("先前提过材料不证明", result["hint"])
+        self.source("second", "另一条原始依据已被更正。")
+        event["message_id"] = "after-source-change"
+        result = self.runtime.resolve(self.capture_event(event))
+        self.assertEqual((result["status"], result["records"]), ("unavailable", []))
+
+    async def test_progress_bounds_materials_without_reinterpreting_old_resolved_question_text(self):
+        await self.focus()
+        old = self.progress_question(status="resolved", records=[self.first, self.second])
+        old["text"] = "应该如何准备编程面试"
+        self.questions = [old]
+        text = "之前那个问题有答案了吗"
+        for limit in (1, 2):
+            self.bot.config.unified_mind.recall_limit = limit
+            event = {**message("legacy-question-"+str(limit), text=text), "raw_message": [{"type": "text", "data": text}]}
+            result = self.runtime.resolve(self.capture_event(event))
+            self.assertEqual(result["status"], "resolved")
+            self.assertEqual(len(result["records"]), limit)
+            self.assertEqual(result["records"][-1]["status"], "resolved")
+            self.assertIn(old["text"], result["records"][-1]["text"])
+            self.assertIn("标记解决本身不构成答案", result["hint"])
+            if limit == 1:
+                self.assertIn("本轮未提供原文，不能只凭已解决状态解释具体答案", result["hint"])
+            else:
+                self.assertIn("本轮只提供有限原始材料", result["hint"])
+                self.assertEqual(result["records"][0]["id"], self.first["id"])
+
+    async def test_progress_missing_or_many_questions_never_uses_ranked_subset(self):
+        await self.focus()
+        text = "那个问题有答案了吗"
+        event = {**message("no-question", text=text), "raw_message": [{"type": "text", "data": text}]}
+        result = self.runtime.resolve(self.capture_event(event))
+        self.assertEqual((result["status"], result["records"]), ("unavailable", []))
+        self.assertIn("缺少可核验", result["hint"])
+        self.questions = [self.progress_question(topic="问题"+str(i)) for i in range(20)]
+        self.bot._derived_memories = lambda query: (_ for _ in ()).throw(AssertionError("ranked subset used"))
+        event["message_id"] = "many-questions"
+        result = self.runtime.resolve(self.capture_event(event))
+        self.assertEqual((result["status"], result["records"]), ("ambiguous", []))
+        self.assertIn("先问清", result["hint"])
+
+    async def test_progress_requires_direct_current_owner_input_and_enabled_growth(self):
+        text = "那个问题弄明白了吗？"
+        self.questions = [self.progress_question()]
+        for kind in ("missing", "quote", "forward", "other", "disabled"):
+            context = self.capture(mid="establish-"+kind)
+            self.runtime.stage(context, [self.first])
+            self.assertTrue(await self.sent(self.first["text"], mid="sent-"+kind))
+            event = {**message("progress-"+kind, text=text), "raw_message": [{"type": "text", "data": text}]}
+            if kind == "missing":
+                event.pop("raw_message")
+            elif kind == "quote":
+                event["reply_to"] = "older-message"
+            elif kind == "forward":
+                event["raw_message"] = [{"type": "forward", "data": text}]
+            elif kind == "other":
+                event["message_info"]["user_info"]["user_id"] = OTHER
+            else:
+                self.bot.config.growth.enabled = False
+            result = self.runtime.resolve(self.capture_event(event))
+            self.assertEqual(result["records"], [], kind)
+            self.assertNotEqual(result["status"], "resolved", kind)
 
     async def test_multiple_mentions_require_clarification_without_source_text(self):
         await self.focus(records=[self.first, self.second])
@@ -411,8 +503,11 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.sent(self.first["text"], mid="new-approval"))
 
     def test_only_self_contained_short_followups_match(self):
-        for text in ("那件事", "后来呢？", "继续说。", "上次那件事", "你觉得它哪里有意思？", "你怎么看刚才读的"):
+        for text in ("那件事", "后来呢？", "继续说。", "上次那件事", "你觉得它哪里有意思？", "你怎么看刚才读的",
+                     "之前那个问题后来弄明白了吗？", "那个问题查得怎么样了"):
             self.assertTrue(is_followup(text))
         for text in ("你觉得那件事里的角色名字怎么样", "他说：后来呢", "别继续说", "那件事和旅游哪个好",
-                     "她问你怎么看刚才读的", "“你觉得它哪里有意思”", "你怎么看刚才读的那本新书", "你觉得茶叶怎么泡"):
+                     "她问你怎么看刚才读的", "“你觉得它哪里有意思”", "你怎么看刚才读的那本新书", "你觉得茶叶怎么泡",
+                     "他说那个问题有答案了吗", "“那个问题有答案了吗”", "别查那个问题了"):
             self.assertFalse(is_followup(text))
+            self.assertFalse(question_progress(text))

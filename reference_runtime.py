@@ -14,7 +14,7 @@ from .owner import direct_message_text, extract_sender, normalize_qq
 from .reference_store import ReferenceStore
 from .social_discovery import reading_reaction_question
 from .unified_expression import _can_say, _records
-from .unified_memory import _source_id
+from .unified_memory import _source_id, derived_memories
 
 
 _FOLLOWUPS = {"那件事", "那件事呢", "那件事后来呢", "那件事后来怎么样了", "那件事怎么样了", "那个呢", "这个呢",
@@ -24,11 +24,19 @@ _FOLLOWUPS = {"那件事", "那件事呢", "那件事后来呢", "那件事后�
 _CLEAR = {"/话题 清除", "换个话题", "换个话题吧", "这件事先不聊了", "先不聊这个了", "别再提这件事了"}
 _NEUTRAL = {"你好", "嗨", "在吗", "早上好", "晚上好", "早安", "晚安", "嗯", "嗯嗯", "好", "好的", "知道了",
             "谢谢", "谢谢你", "我回来了", "回来了", "我忙完了", "忙完了"}
+_QUESTION_PROGRESS = {"那个问题后来弄明白了吗", "之前那个问题后来弄明白了吗", "那个问题弄明白了吗",
+                      "那个问题后来有答案了吗", "之前那个问题有答案了吗", "那个问题有答案了吗",
+                      "刚才那个问题查明白了吗", "那个问题查得怎么样了", "之前那个问题查得怎么样了"}
 _CLARIFY = "[MaiLivingWorld:reference]\n这句短指代暂不能唯一对应仍有效的话题。先简短问清指的是哪件事，不猜对象或编造后续。"
 _CONTINUE = "[MaiLivingWorld:reference]\n这句短指代可承接最近实际提及且来源仍有效的同一话题。只依据本轮允许表达的记忆，不补猜新的进展。"
 _REACTION = ("主人在问你对刚才材料的看法。先说其中具体吸引你、让你犹豫或不认同的一点，"
              "把报道内容和自己的判断说清楚。只有本轮提供相关的既有兴趣、观点或感受时，"
              "才据此延续原来的态度；也可以说还没形成看法。不补写亲身经历、阅读进度或长久偏好。")
+_PROGRESS = ("主人在问先前提过的材料相关的问题进展。结合本轮问题状态和原始材料回应，保留来源中的限定。"
+             "旧问题记录可能仍是原来的问句，标记解决本身不构成答案。按实际提供的材料解释具体内容，依据不足就保留疑问。"
+             "先前提过材料不证明主人曾问过这个问题或你曾承诺研究，结题状态也不证明实际联网查阅；只按已有记录表达。")
+_NO_PROGRESS = "[MaiLivingWorld:reference]\n这份材料目前缺少可核验的问题进展记录。简短说明还无法确认，先问清具体问题。"
+_MANY_QUESTIONS = "[MaiLivingWorld:reference]\n这份材料关联多个仍有效的问题。先问清指的是哪个问题，再谈进展。"
 _BOILERPLATE = re.compile(r"MaiLivingWorld|主人(?:原话|更正|自述)|未经?独立(?:核实|验证)|作品元数据|未阅读或观看正文|记录于|收到于", re.I)
 _END_PUNCTUATION = " \t\n\r。！？.!?"
 
@@ -38,7 +46,11 @@ def _short(text):
 
 
 def is_followup(text):
-    return _short(text) in _FOLLOWUPS or reading_reaction_question(text)
+    return _short(text) in _FOLLOWUPS or reading_reaction_question(text) or question_progress(text)
+
+
+def question_progress(text):
+    return _short(text) in _QUESTION_PROGRESS
 
 
 def _ref(row):
@@ -128,7 +140,7 @@ class ReferenceRuntime:
         parts, text = message.get("raw_message"), message.get("processed_plain_text")
         pure = not (isinstance(parts, list) and any(not isinstance(p, dict) or p.get("type") != "text" for p in parts)
                     or any(message.get(k) for k in ("is_picture", "is_voice", "is_emoji")))
-        if reading_reaction_question(text):
+        if reading_reaction_question(text) or question_progress(text):
             pure = pure and direct_message_text(message, self.owner()) == text
         control = bool(message.get("is_command") or isinstance(text, str) and text.startswith("/"))
         keep = bool(_short(text) not in _CLEAR and (not pure or control or is_followup(text) or _short(text) in _NEUTRAL))
@@ -225,7 +237,38 @@ class ReferenceRuntime:
         if len(records) == 1:
             hint = _CONTINUE + ("\n" + _REACTION if reading_reaction_question(query) else "")
             result.update(query=query+" "+records[0]["text"][:240], records=records, hint=hint, status="resolved")
+            if question_progress(query):
+                return self._question_progress(result, records[0])
         return result
+
+    def _question_progress(self, result, focus):
+        b = self.bot
+        result = {**result, "question_progress": True, "records": [], "hint": _NO_PROGRESS, "status": "unavailable"}
+        if not (b.config.growth.enabled and b.config.growth.mode == "active" and b._ensure_growth()):
+            return result
+        # Inspect the full validated question set before ranking, so truncation
+        # cannot turn several questions about one source into a unique match.
+        questions = [q for q in b._growth_snapshot().get("questions", [])
+                     if q.get("status") in {"open", "resolved"}
+                     and any(ref["id"] == focus["id"] for ref in q["sources"])]
+        if len(questions) > 1:
+            return {**result, "hint": _MANY_QUESTIONS, "status": "ambiguous"}
+        if not questions:
+            return result
+        roots = b._resolve_roots([ref["id"] for ref in questions[0]["sources"]])
+        progress = derived_memories({"questions": questions}, roots, fingerprint=source_fingerprint,
+                                    query=result["query"], limit=1)
+        if len(progress) != 1:
+            return result
+        others = sorted((row for row in roots.values() if row["id"] != focus["id"]),
+                        key=lambda row: (-row["timestamp"], row["id"]))
+        selected = ([focus]+others)[:b.config.unified_mind.recall_limit-1]
+        hint = _CONTINUE+"\n"+_PROGRESS
+        if not selected:
+            hint += "本轮未提供原文，不能只凭已解决状态解释具体答案。"
+        elif len(selected) < len(roots):
+            hint += "本轮只提供有限原始材料，未提供的细节不能补猜。"
+        return {**result, "records": selected+progress, "hint": hint, "status": "resolved"}
 
     def _live(self, state):
         now = time.time()

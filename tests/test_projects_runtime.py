@@ -192,6 +192,37 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(attention._activity_record(candidates[0]))
         self.assertEqual(self.runtime.candidates(), [])
 
+    async def test_gathered_project_reviews_original_question_after_growth_answers_it(self):
+        row = await self.gathered()
+        for status in ("open", "resolved"):
+            source = self.bot._tool_store.put_observation("cap", "album:progress:"+status,
+                "作品元信息补充了森林旅人的叙述视角。"+status, "private:"+OWNER, subject_id=OWNER)
+            data = empty_growth()
+            data["questions"] = [{"topic": row["seed"]["topic"], "question": "现有资料只支持有限的叙述视角判断。",
+                                  "status": status, "evidence_ids": [source["id"]]}]
+            self.bot._growth.enqueue([source])
+            job = self.bot._growth.claim()
+            self.bot._growth.complete(job["id"], job["token"], data, [source],
+                                      expected_revision=self.bot._growth.state()["revision"])
+            self.runtime.prepare()
+            self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
+            self.assertEqual(len(self.runtime.candidates()), 1)
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        self.model()
+        self.assertTrue((await self.tick_later())["success"])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "unresolved")
+        prompt = self.bot.ctx.llm.generate.await_args_list[0].args[0]
+        self.assertIn(row["seed"]["question"], prompt)
+
+    async def test_gathered_project_still_stops_after_question_is_retired(self):
+        row = await self.gathered()
+        state = self.bot._growth.state()
+        self.bot._growth.retire(row["seed"]["question_key"], expected_revision=state["revision"])
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.candidates(), [])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "paused")
+
     async def test_legacy_pixiv_project_continues_with_same_sources_after_restart(self):
         seed = self.runtime.seed_candidates()[0]
         seed["source_signature"] = self.bot._mcp_source_signature("pixiv")
