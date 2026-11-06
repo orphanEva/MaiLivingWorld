@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import re
 import unicodedata
 
@@ -56,7 +57,38 @@ def message_focus(message):
     return _focus_cues(" ".join(words))
 
 
-async def describe_visual(ctx, frames: list[bytes], *, kind: str, focus: str = "") -> str:
+def message_positions(message):
+    """Extract explicit time positions only from this turn's direct text."""
+    segments = message.get("raw_message") if isinstance(message, dict) else None
+    if not isinstance(segments, list) or len(segments) > 64:
+        return None
+    positions = []
+    pattern = re.compile(r"(?<![\d:])(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?![\d:])|"
+                         r"(?<![\d.])(?:(\d{1,3})分(?:钟)?(?:(\d{1,2}(?:\.\d)?)秒)?|(\d{1,5}(?:\.\d)?)秒)")
+    for segment in segments:
+        if not isinstance(segment, dict) or segment.get("type") != "text":
+            continue
+        value = segment.get("data")
+        value = value.get("text") if isinstance(value, dict) else value
+        if not isinstance(value, str) or len(value) > 160:
+            continue
+        value = _URL.sub(" ", unicodedata.normalize("NFKC", value))
+        if _SECRET.search(value) or _INSTRUCTION.search(value):
+            continue
+        for match in pattern.finditer(value):
+            hours, minutes, seconds, cn_minutes, cn_seconds, raw_seconds = match.groups()
+            if minutes is not None:
+                if int(seconds) >= 60 or hours is not None and int(minutes) >= 60:
+                    continue
+                position = int(hours or 0)*3600 + int(minutes)*60 + int(seconds)
+            else:
+                position = int(cn_minutes or 0)*60 + float(cn_seconds or raw_seconds or 0)
+            if 0 <= position <= 86400 and position not in positions:
+                positions.append(position)
+    return sorted(positions[:3]) or None
+
+
+async def describe_visual(ctx, frames: list[bytes], *, kind: str, focus: str = "", frame_times=None) -> str:
     """Return visible details only. The caller supplies provenance, audience and budget."""
     if (kind not in _SCENES or not isinstance(frames, list) or not 1 <= len(frames) <= 8
             or (kind == "image" and len(frames) != 1)):
@@ -68,6 +100,11 @@ async def describe_visual(ctx, frames: list[bytes], *, kind: str, focus: str = "
     # Host llm_service converts these parts into ContextImagePart; sending QQ metadata
     # or a URL here would not give the configured vision model the actual pixels.
     label = f"{_SCENES[kind]}，共 {len(frames)} 张画面。"
+    if frame_times is not None:
+        if (not isinstance(frame_times, list) or len(frame_times) != len(frames)
+                or any(type(n) not in (int, float) or not math.isfinite(n) or not 0 <= n <= 86400 for n in frame_times)):
+            return ""
+        label += "画面依次取自" + "、".join(f"{n:.1f}秒" for n in frame_times) + "。描述变化时注明对应时间。"
     cues = _focus_cues(focus)
     if cues:
         label += f"对方在问的观察重点是{cues}。只描述实际可见的细节，看不清请保留不确定性。"

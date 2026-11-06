@@ -7,6 +7,7 @@ import re
 import time
 
 from .growth_store import source_fingerprint
+from .growth_limits import MAX_RECORDS
 from .mcp_runtime import day_start
 from .owner import extract_sender, normalize_qq
 from .projects_model import evidence_records, understand_project
@@ -282,8 +283,9 @@ class ProjectsRuntime:
                         action = "failed"
                     else:
                         originals = fetched.get("records", [])
-                        seeds = {ref["id"] for ref in row["seed"]["seed_refs"]}
-                        originals = [r for r in originals if isinstance(r, dict) and r.get("id") not in seeds][:8]
+                        seeds = {ref["id"] for ref in row["seed"]["seed_refs"]+row["evidence_refs"]}
+                        capacity = min(8, max(0, MAX_RECORDS-len(row["evidence_refs"]))) if row.get("plan") else 8
+                        originals = [r for r in originals if isinstance(r, dict) and r.get("id") not in seeds][:capacity]
                         if originals and evidence_records(originals):
                             evidence = references([_ref(r) for r in originals])
                             action = "gathered" if self._resolve(evidence) is not None else "interrupted"
@@ -291,24 +293,34 @@ class ProjectsRuntime:
                             action = "no_evidence"
                 else:
                     resolved = self._resolve(row["evidence_refs"])
-                    originals = [resolved[ref["id"]] for ref in row["evidence_refs"]] if resolved else []
+                    refs = row["evidence_refs"]
+                    if row.get("plan"):
+                        old_quotes = {q["source_id"] for q in row["result"].get("quotes", [])}
+                        prior = [ref for ref in refs if ref["id"] in old_quotes][:3]
+                        latest = row["plan"].get("latest_refs", [])
+                        refs = list({ref["id"]: ref for ref in prior+latest}.values())[:8]
+                    originals = [resolved[ref["id"]] for ref in refs[:8]] if resolved else []
                     result = await understand_project(row["seed"]["question"], originals, generate=b.ctx.llm.generate,
                         reserve=reserve, valid=valid, task_name=b.config.brain.model_task,
-                        timeout=b.config.unified_mind.model_timeout_seconds, on_dispatch=on_dispatch)
+                        timeout=b.config.unified_mind.model_timeout_seconds, on_dispatch=on_dispatch,
+                        adaptive=getattr(b.config.projects, "adaptive_plans", False),
+                        focus=row.get("plan", {}).get("pending_question", ""))
                     if not valid():
                         return None
                     action = "reviewed" if result else "deferred" if exhausted else "failed"
                 if valid():
                     changed = self.store.finish(owner, row["id"], row["lease_token"], row["revision"], action=action,
-                                                evidence_refs=evidence, result=result)
+                                                evidence_refs=evidence, result=result,
+                                                adaptive=getattr(b.config.projects, "adaptive_plans", False))
                     self.last_status = action
                     return {"success": bool(changed and action in {"gathered", "reviewed"}), "stage": action}
             except asyncio.CancelledError:
                 self.last_status = "interrupted"
                 raise
             except Exception:
-                self.last_status = "project_attempt_failed"
-                action = "failed"
+                interrupted = self.signature() != signature or self._activity() != (False, activity)
+                self.last_status = "interrupted" if interrupted else "project_attempt_failed"
+                action = "interrupted" if interrupted else "failed"
             finally:
                 # Release only our still-live lease; never overwrite a new worker or owner command.
                 self.store.finish(owner, row["id"], row["lease_token"], row["revision"], action=action if action in {"failed", "deferred"} else "interrupted")
@@ -353,7 +365,9 @@ class ProjectsRuntime:
         terms, result = _terms(query), []
         rank = {"public": 0, "personal": 1, "unknown": 2, "confidential": 3}
         for row in self.store.items(self.owner()):
-            if row["status"] not in {"completed", "unresolved"} or not row["result"] or not self._current(row):
+            planned = bool(getattr(self.bot.config.projects, "adaptive_plans", False) and row.get("plan"))
+            allowed = {"active", "paused", "completed", "unresolved"} if planned else {"completed", "unresolved"}
+            if row["status"] not in allowed or not row["result"] or not self._current(row):
                 continue
             refs = references(row["seed"]["seed_refs"]+row["evidence_refs"], limit=MAX_PROJECT_SOURCES)
             originals = self._resolve(refs)
@@ -363,6 +377,13 @@ class ProjectsRuntime:
             scopes = {r["scope"] for r in refs}
             subjects = {r.get("subject_id", "") for r in originals.values()}
             text = "查阅小结（限本次证据，暂时推断）："+row["result"]["conclusion"]
+            if planned:
+                status = {"active": "进行中", "paused": "暂停中", "completed": "已完成有限查证", "unresolved": "仍未解决"}[row["status"]]
+                text = "查证项目" + status + "。本轮证据小结为" + row["result"]["conclusion"][:150]
+                if row["status"] != "completed":
+                    step = row["plan"]
+                    text += "。待核对的问题为" + step.get("pending_question", "")[:180]
+                    text += "。尚需资料为" + step.get("evidence_needed", "")[:180]
             result.append({"id": "projects:result:"+row["id"].split(":")[-1], "source": "projects", "kind": "project", "derived": True,
                 "scope": "public:derived" if sensitivity == "public" else next(iter(scopes)) if len(scopes) == 1 else "global:derived",
                 "subject_id": next(iter(subjects)) if len(subjects) == 1 else "", "text": text, "timestamp": row["updated"],

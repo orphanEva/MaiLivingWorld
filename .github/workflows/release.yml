@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=1.28.1,<2' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2' 'Pillow>=10,<13' 'imageio-ffmpeg>=0.6,<1'
+        run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=1.28.1,<2' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2' 'Pillow>=10,<13' 'imageio-ffmpeg>=0.6,<1' 'silk-python>=0.2.9,<0.3'
       - name: Test
         run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -v
       - name: Package WebUI plugin ZIP

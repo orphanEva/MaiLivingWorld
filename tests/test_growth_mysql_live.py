@@ -18,6 +18,7 @@ from MaiLivingWorld.proactive_feedback import ProactiveFeedback
 from MaiLivingWorld.self_state import SelfState
 from MaiLivingWorld.store import Store
 from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ALL_TABLES, apply, snapshot
+from MaiLivingWorld.tests.test_growth_archive import GrowthArchiveChecks
 
 
 def evidence(prefix="A"):
@@ -35,7 +36,7 @@ def proposal(rows):
 
 
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1", "Only with ephemeral MySQL CI")
-class GrowthMySQLLiveTests(unittest.TestCase):
+class GrowthMySQLLiveTests(GrowthArchiveChecks, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name)

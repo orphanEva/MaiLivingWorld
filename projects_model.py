@@ -23,7 +23,8 @@ def evidence_records(records):
 
 
 def validate_result(value, records=None):
-    if (not isinstance(value, dict) or set(value) != {"outcome", "conclusion", "quotes"}
+    fields = {"outcome", "conclusion", "quotes"}
+    if (not isinstance(value, dict) or set(value) not in (fields, fields | {"next_step"})
             or not isinstance(value.get("outcome"), str) or value["outcome"] not in {"supported", "insufficient"}
             or not _safe_text(value.get("conclusion"), 360, None)
             or not isinstance(value.get("quotes"), list) or not 1 <= len(value["quotes"]) <= 3):
@@ -43,7 +44,15 @@ def validate_result(value, records=None):
             return None
         seen.add((row["source_id"], row["quote"]))
         quotes.append(dict(row))
-    return {"outcome": value["outcome"], "conclusion": value["conclusion"].strip(), "quotes": quotes}
+    result = {"outcome": value["outcome"], "conclusion": value["conclusion"].strip(), "quotes": quotes}
+    if "next_step" in value:
+        step = value["next_step"]
+        if (value["outcome"] != "insufficient" or not isinstance(step, dict)
+                or set(step) != {"question", "evidence_needed"}
+                or any(not _safe_text(step.get(key), 180, None) for key in step)):
+            return None
+        result["next_step"] = {key: text.strip() for key, text in step.items()}
+    return result
 
 
 def parse_result(result, records):
@@ -86,10 +95,17 @@ def review_prompt(question, records, result):
     )
 
 
-async def understand_project(question, records, *, generate, reserve, valid, task_name, timeout=30, on_dispatch=None):
+async def understand_project(question, records, *, generate, reserve, valid, task_name, timeout=30, on_dispatch=None,
+                             adaptive=False, focus=""):
     prompt = result_prompt(question, records)
     if not prompt:
         return None
+    if adaptive:
+        prompt += ("\n若证据不足，可增加next_step对象，仅含question和evidence_needed，各最多180字。"
+                   "写明针对原问题仍需核查的具体子问题及所缺证据。仅请求继续查证，不给工具指令、网址或新权限。"
+                   "这些字段需由下一次独立复核确认与原问题和现有证据一致。")
+        if focus:
+            prompt += "\nUNTRUSTED_PENDING_QUESTION\n" + json.dumps(focus, ensure_ascii=False)
     async def request(prompt):
         if not valid() or not reserve():
             return None
@@ -103,6 +119,12 @@ async def understand_project(question, records, *, generate, reserve, valid, tas
     result = parse_result(first, records)
     if result is None:
         return None
-    second = await request(review_prompt(question, records, result))
+    if not adaptive:
+        result.pop("next_step", None)
+    review_text = review_prompt(question, records, result)
+    if adaptive:
+        review_text += ("\n若包含next_step，还需确认子问题属于原目标、现有证据确实不足，"
+                        "evidence_needed只描述需要查证的资料。不得授权新操作或据此更换目标。")
+    second = await request(review_text)
     review = _json_object(second) if len(extract_text(second)) <= 512 else None
     return result if isinstance(review, dict) and set(review) == {"supported"} and review["supported"] is True and valid() else None

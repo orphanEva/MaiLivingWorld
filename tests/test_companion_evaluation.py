@@ -34,6 +34,17 @@ def payload(*cases):
 
 
 class EvaluationStaticTests(unittest.TestCase):
+    def test_cognition_suite_can_be_selected_and_exported_without_a_runner(self):
+        path = SCRIPT.parents[1]/"evaluations"/"cognition_scenarios.json"
+        cases = evaluation.validate_scenarios(evaluation.read_json(path))
+        self.assertEqual(len(cases), 8)
+        self.assertEqual(sum(len(case["turns"]) for case in cases), 24)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)/"cognition.json"
+            with patch.object(evaluation.importlib, "import_module", side_effect=AssertionError("offline")):
+                self.assertEqual(evaluation.main(["--scenarios", str(path), "--export", str(destination)]), 0)
+            self.assertEqual(evaluation.validate_scenarios(evaluation.read_json(destination)), cases)
+
     def test_bundled_scenarios_cover_eight_requirements_with_three_to_five_turns(self):
         data = evaluation.read_json(evaluation.DEFAULT_SCENARIOS)
         cases = evaluation.validate_scenarios(data)

@@ -6,10 +6,28 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from MaiLivingWorld.visual_model import describe_visual, message_focus
+from MaiLivingWorld.visual_model import describe_visual, message_focus, message_positions
 
 
 class VisualModelTests(unittest.IsolatedAsyncioTestCase):
+    def test_direct_time_questions_ignore_quotes_urls_and_flattened_history(self):
+        event = {"processed_plain_text": "第55秒", "raw_message": [
+            {"type": "reply", "data": {"text": "第44秒"}},
+            {"type": "forward", "data": [{"type": "text", "data": "第33秒"}]},
+            {"type": "text", "data": "看看第12秒、1分20秒和01:35的画面 https://example.com/99秒"}]}
+        self.assertEqual(message_positions(event), [12., 80., 95])
+        self.assertIsNone(message_positions({"processed_plain_text": "第12秒"}))
+        self.assertIsNone(message_positions({"raw_message": [{"type": "text", "data": "00:99"}]}))
+
+    async def test_frame_times_are_attached_to_ordered_pixels_and_validated(self):
+        await describe_visual(self.ctx, [self.frame, self.frame], kind="video", frame_times=[12., 80.])
+        label = self.generate.call_args.args[0][1]["content"][0]["text"]
+        self.assertIn("12.0秒、80.0秒", label)
+        self.generate.reset_mock()
+        for times in ([1], [0, float("nan")], [0, -1]):
+            self.assertEqual(await describe_visual(self.ctx, [self.frame, self.frame], kind="video", frame_times=times), "")
+        self.generate.assert_not_awaited()
+
     def setUp(self):
         self.generate = AsyncMock(return_value={
             "success": True, "response": '{"visible":"两只猫挤在窗台上。"}', "reasoning": "internal",

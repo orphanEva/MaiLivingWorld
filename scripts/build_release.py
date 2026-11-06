@@ -36,7 +36,7 @@ if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(manifest["version"])):
 version = manifest["version"]
 required = (
     "__init__.py", "_manifest.json", "plugin.py", "config_layout.py", "policy.py", "explore.py",
-    "growth_limits.py",
+    "growth_limits.py", "memory_semantics.py", "cognitive_workspace.py", "audio_model.py", "audio_silk.py", "deploy/COGNITION.md",
     "bilibili.py", "store.py", "mysql_store.py", "sql_logging.py", "mysql_compat.py", "owner.py", "relationship.py", "memory_bridge.py", "mind.py", "proactive_feedback.py", "cognition.py", "experience_loop.py", "brain_core.py", "brain_runtime.py", "self_state.py", "unified_memory.py", "unified_expression.py", "unified_runtime.py", "growth_store.py", "growth_model.py", "growth_runtime.py", "tool_store.py", "mcp_client.py", "mcp_policy.py", "mcp_runtime.py", "mcp_media.py",
     "companion_runtime.py", "companion_store.py", "reading_model.py", "document_reader.py", "dashboard.py", "webui.json", "webui/index.html",
     "bond_store.py", "bond_runtime.py", "companion_style.py", "deploy/COMPANION.md",
@@ -52,7 +52,7 @@ required = (
     "belief_revision.py", "emotion_episodes.py", "memory_archive.py",
     "visual_model.py", "chat_media.py", "bilibili_media.py", "media_http.py", "visual_runtime.py",
     "public_mcp_server.py", "public_news.py", "public_reference.py", "public_web_search.py", "public_research.py", "mastodon_api.py", "social_runtime.py", "social_discovery.py",
-    "scripts/evaluate_companion.py", "evaluations/companion_scenarios.json", "deploy/EVALUATION.md",
+    "scripts/evaluate_companion.py", "evaluations/companion_scenarios.json", "evaluations/cognition_scenarios.json", "deploy/EVALUATION.md",
     "scripts/backup_state.py", "scripts/migrate_all_sqlite_to_mysql.py", "scripts/migrate_sqlite_to_mysql.py",
     "sql/mysql.sql", "sql/mysql_comments_existing.sql", "deploy/BACKUP.md",
     "scripts/mcp_gateway.py", "deploy/README.md", "deploy/compose.mcp.yml", "deploy/Dockerfile.mcp-gateway", "deploy/mcp.example.env", "deploy/cap-option.example.yml",

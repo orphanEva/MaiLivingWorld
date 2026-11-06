@@ -202,6 +202,8 @@ class GrowthModelTests(unittest.TestCase):
         self.assertEqual(data["current_self"]["traits"]["curiosity"], 0.55)
         self.assertEqual(data["current_self"]["beliefs"][0]["text"], "耐心倾听有助于理解问题")
         self.assertIn("不能单独成为自身兴趣", prompt)
+        self.assertIn("audio_transcription仅记录片段听写", prompt)
+        self.assertIn("可信身份与权限核验", prompt)
 
     def test_review_prompt_contains_only_used_sources_and_item_indices(self):
         proposal = empty_growth()

@@ -17,11 +17,19 @@ from .media_http import fetch_public
 from .owner import extract_sender, normalize_qq
 
 IMAGE_LIMIT = 8 * 1024 * 1024
+AUDIO_LIMIT = 8 * 1024 * 1024
 VIDEO_LIMIT = 32 * 1024 * 1024
 _JPEG_LIMIT = 512 * 1024
 _QQ_HOSTS = (".qpic.cn", "multimedia.nt.qq.com.cn", "multimedia.nt.qq.com", "grouptalk.c2c.qq.com",
              ".groupfile.qq.com", ".video.qq.com", ".ftn.qq.com", "gxh.vip.qq.com")
 _VIDEO_MARKER = re.compile(r"\[视频\](?: 文件: [^\r\n]{1,1024}(?:，大小: \d{1,16})?| 大小: \d{1,16})?")
+_AUDIO_KINDS = {"audio", "voice", "record"}
+
+
+def _media_kind(kind):
+    if not isinstance(kind, str):
+        return ""
+    return "audio" if kind in _AUDIO_KINDS else "image" if kind == "emoji" else kind
 
 
 class ChatMediaError(ValueError):
@@ -59,7 +67,7 @@ def _cdn_url(value):
 
 
 def _direct(segment, kind):
-    limit = IMAGE_LIMIT if kind == "image" else VIDEO_LIMIT
+    limit = VIDEO_LIMIT if kind == "video" else IMAGE_LIMIT
     data = segment.get("data")
     fields = data if isinstance(data, dict) else {}
     size = str(fields.get("file_size") or fields.get("size") or "")
@@ -84,7 +92,7 @@ def extract_attachments(message) -> list[Attachment]:
     if account == sender.user_id:
         return []
     result = []
-    seen = {"image": 0, "video": 0}
+    seen = {"image": 0, "video": 0, "audio": 0}
     for segment in parts:
         if not isinstance(segment, dict):
             continue
@@ -99,11 +107,13 @@ def extract_attachments(message) -> list[Attachment]:
                 kind = "image"
             elif _VIDEO_MARKER.fullmatch(value):
                 kind = "video"
+            elif value in ("[语音]", "[语音消息]", "[语音消息，转录失败]", "[音频]", "[voice]", "[audio]", "[record]"):
+                kind = "audio"
             else:
                 continue
             direct = None
-        elif kind in ("image", "emoji", "video"):
-            kind = "image" if kind == "emoji" else kind
+        elif kind in ("image", "emoji", "video", *_AUDIO_KINDS):
+            kind = _media_kind(kind)
             direct = _direct(segment, kind)
         elif kind == "file" and isinstance(segment.get("data"), dict):
             payload = segment["data"]
@@ -112,6 +122,8 @@ def extract_attachments(message) -> list[Attachment]:
                 kind = "image"
             elif mime in {"video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "video/x-msvideo"}:
                 kind = "video"
+            elif mime in {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/ogg", "audio/flac", "audio/mp4", "audio/amr"}:
+                kind = "audio"
             else:
                 continue
             direct = _direct(segment, kind)
@@ -154,7 +166,7 @@ async def _resolve(item, api_call):
         raise ChatMediaError("attachment_unavailable")
     parts = detail.get("message")
     if isinstance(parts, list) and len(parts) <= 64:
-        candidates = [p for p in parts if isinstance(p, dict) and p.get("type") == item.kind]
+        candidates = [p for p in parts if isinstance(p, dict) and _media_kind(p.get("type")) == item.kind]
         if len(candidates) > item.ordinal:
             direct = _direct(candidates[item.ordinal], item.kind)
             if direct:
@@ -208,10 +220,10 @@ def _ffmpeg():
         raise ChatMediaError("video_decoder_unavailable") from exc
 
 
-async def _ffmpeg_run(args, *, probe=False):
+async def _ffmpeg_run(args, *, probe=False, env=None):
     """Limit diagnostics even for containers with hostile metadata. Always reap the decoder."""
     proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE if probe else asyncio.subprocess.DEVNULL)
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE if probe else asyncio.subprocess.DEVNULL, env=env)
     try:
         if probe:
             diagnostics = bytearray()
@@ -236,7 +248,18 @@ async def _ffmpeg_run(args, *, probe=False):
         await proc.communicate()
 
 
-async def sample_video(data: bytes) -> list[bytes]:
+def sample_positions(duration, positions=None):
+    """Keep bounded explicit seconds, or use the default three-frame overview."""
+    duration = duration if isinstance(duration, (int, float)) and math.isfinite(duration) and 0 < duration <= 86400 else 0
+    if positions is not None:
+        if (not isinstance(positions, (list, tuple)) or not 1 <= len(positions) <= 3
+                or any(type(n) not in (int, float) or not math.isfinite(n) or not 0 <= n <= 86400 for n in positions)):
+            raise ChatMediaError("invalid_media_positions")
+        return sorted({float(n) for n in positions if not duration or n < duration})
+    return [0.0, duration * .5, duration * .9] if duration >= .6 else [0.0]
+
+
+async def sample_video(data: bytes, *, positions=None, timeline=False):
     """Render up to three distributed frames from a local, bounded byte buffer."""
     fmt = _video_format(data)
     try:
@@ -251,11 +274,10 @@ async def sample_video(data: bytes) -> list[bytes]:
                 base += ["-enable_drefs", "0", "-use_absolute_path", "0"]
             async with asyncio.timeout(15):
                 duration = await _ffmpeg_run([*base, "-i", str(source)], probe=True)
-                positions = [0.0]
-                if math.isfinite(duration) and .6 <= duration <= 86400:
-                    positions += [duration*.5, duration*.9]
+                targets = sample_positions(duration, positions)
                 frames = []
-                for position in positions:
+                times = []
+                for position in targets:
                     output.unlink(missing_ok=True)
                     status = await _ffmpeg_run([*base, "-loglevel", "error", "-ss", f"{position:.3f}",
                         "-i", str(source), "-map", "0:V:0", "-an", "-sn", "-dn", "-frames:v", "1",
@@ -266,18 +288,19 @@ async def sample_video(data: bytes) -> list[bytes]:
                         image = output.read_bytes()
                         if image.startswith(b"\xff\xd8") and image.endswith(b"\xff\xd9"):
                             frames.append(image)
+                            times.append(round(position, 3))
                 if frames:
-                    return frames
+                    return {"frames": frames, "frame_times": times, "duration": duration} if timeline else frames
     except (TimeoutError, OSError) as exc:
         raise ChatMediaError("video_decoder_failed") from exc
     raise ChatMediaError("video_decoder_failed")
 
 
-async def load_attachment(attachment: Attachment, *, api_call=None) -> list[bytes]:
+async def load_media_bytes(attachment: Attachment, *, api_call=None) -> bytes:
     item = attachment
     if item.source == "adapter":
         item = await _resolve(item, api_call)
-    limit = IMAGE_LIMIT if item.kind == "image" else VIDEO_LIMIT
+    limit = VIDEO_LIMIT if item.kind == "video" else IMAGE_LIMIT
     if item.source == "base64" and 0 < len(item.value) <= 4*((limit+2)//3):
         try:
             data = await asyncio.to_thread(base64.b64decode, item.value, validate=True)
@@ -287,8 +310,28 @@ async def load_attachment(attachment: Attachment, *, api_call=None) -> list[byte
         data = await asyncio.to_thread(fetch_public, item.value, allowed_hosts=_QQ_HOSTS, max_bytes=limit)
     else:
         raise ChatMediaError("attachment_unavailable")
-    if item.kind == "image":
+    if not 0 < len(data) <= limit:
+        raise ChatMediaError("invalid_payload_size")
+    return data
+
+
+async def load_attachment(attachment: Attachment, *, api_call=None, positions=None, timeline=False,
+                          include_audio=False):
+    data = await load_media_bytes(attachment, api_call=api_call)
+    if attachment.kind == "image":
         return [await asyncio.to_thread(_jpeg, data)]
+    if attachment.kind == "audio":
+        return {"frames": [], "audio_bytes": data}
+    if timeline:
+        try:
+            result = await sample_video(data, positions=positions, timeline=True)
+        except ChatMediaError:
+            if not include_audio:
+                raise
+            result = {"frames": [], "frame_times": []}
+        if include_audio:
+            result["audio_bytes"] = data
+        return result
     return await sample_video(data)
 
 

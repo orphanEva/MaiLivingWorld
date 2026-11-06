@@ -37,7 +37,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 30)
-        self.assertEqual(total_fields, 201)
+        self.assertEqual(total_fields, 205)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")
@@ -151,7 +151,7 @@ class ConfigSectionTests(unittest.TestCase):
     def test_project_and_shared_reading_defaults_and_bounds_are_explicit(self):
         schema = plugin.Config.model_json_schema()
         expected = {
-            "projects": {"enabled": False, "interval_seconds": 900, "max_daily_actions": 6, "max_active_projects": 2},
+            "projects": {"enabled": False, "adaptive_plans": False, "interval_seconds": 900, "max_daily_actions": 6, "max_active_projects": 2},
             "shared_reading": {"enabled": False},
         }
         for name, defaults in expected.items():

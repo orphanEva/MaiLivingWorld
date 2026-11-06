@@ -112,6 +112,12 @@ class GrowthRuntime:
                 # being re-attributed to the new batch's public sources.
                 available = {item["id"]: source_fingerprint(item) for item in records}
                 state = dict(state)
+                query = " ".join(item.get("text", "") for item in records)[:1200]
+                for entry in self.store.archived(query, limit=32):
+                    item = entry["item"]
+                    if item["sources"] and all(available.get(ref["id"]) == ref["digest"] for ref in item["sources"]):
+                        category = entry["category"]
+                        state[category] = [item] + state[category]
                 for section in ("interests", "beliefs", "knowledge", "questions"):
                     state[section] = [item for item in state[section] if item["sources"] and all(
                         available.get(ref["id"]) == ref["digest"] for ref in item["sources"])]
@@ -140,7 +146,7 @@ class GrowthRuntime:
                 records = sources()
                 self.last_counts = self.store.complete(job_id, token, proposal, records,
                     expected_revision=revision, review_beliefs=review_beliefs, emotional_episodes=emotional_episodes,
-                    skip_interest_overflow=True, renew_interests=renewals)
+                    skip_interest_overflow=True, renew_interests=renewals, archive_overflow=True)
                 self.last_status = "observed" if mode == "observe" else "learned"
                 if mode == "active" and self.last_counts.get("skipped_interest_overflow") and not self.last_counts["changed"]:
                     self.last_status = "interest_source_capacity"

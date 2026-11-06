@@ -240,9 +240,11 @@ class ProjectsStore:
         return bool(row and row["status"] == "active" and row["revision"] == revision
                     and row["lease_token"] == token == control["lease_token"] and row["lease_until"] > now and control["lease_until"] > now)
 
-    def finish(self, owner, ident, token, revision, *, action, evidence_refs=None, result=None, now=None):
+    def finish(self, owner, ident, token, revision, *, action, evidence_refs=None, result=None, now=None, adaptive=False):
         owner, now = _owner(owner), _now(now)
         _int(revision, 1)
+        if type(adaptive) is not bool:
+            raise ValueError("invalid_adaptive_plan")
         if action not in {"gathered", "no_evidence", "reviewed", "failed", "deferred", "interrupted"}:
             raise ValueError("invalid_action")
         if action == "gathered":
@@ -263,10 +265,33 @@ class ProjectsStore:
             if action == "reviewed" and any(q["source_id"] not in {r["id"] for r in row["evidence_refs"]} for q in result["quotes"]):
                 raise ValueError("result_source_mismatch")
             if action == "gathered":
+                if row.get("plan"):
+                    combined = {ref["id"]: ref for ref in row["evidence_refs"]}
+                    for ref in evidence_refs:
+                        if ref["id"] in combined and ref != combined[ref["id"]]:
+                            raise ValueError("source_conflict")
+                        combined[ref["id"]] = ref
+                    if len(combined) == len(row["evidence_refs"]):
+                        raise ValueError("no_new_evidence")
+                    row["plan"]["latest_refs"] = evidence_refs
+                    evidence_refs = references(list(combined.values()))
                 row.update(stage="review", evidence_refs=evidence_refs, failures=0, reason="")
             elif action == "reviewed":
                 row.update(status="completed" if result["outcome"] == "supported" else "unresolved", result=result,
                            stage="finished", reason="reviewed_material_only", failures=0)
+                if adaptive or row.get("plan"):
+                    plan = row.setdefault("plan", {"rounds": [], "pending_question": row["seed"]["question"],
+                                                   "evidence_needed": "", "latest_refs": row["evidence_refs"]})
+                    plan["rounds"].append({"question": plan["pending_question"], "result": result,
+                                           "sources": list(row["evidence_refs"]), "completed_at": now})
+                    step = result.get("next_step")
+                    repeated = step and any(part["question"] == step["question"] for part in plan["rounds"])
+                    if (adaptive and step and not repeated and len(plan["rounds"]) < 3
+                            and len(row["evidence_refs"]) < MAX_RECORDS):
+                        plan.update(pending_question=step["question"], evidence_needed=step["evidence_needed"])
+                        row.update(status="active", stage="gather", reason="more_evidence_needed")
+                    elif result["outcome"] == "insufficient":
+                        row["reason"] = "plan_needs_help"
             elif action in {"failed", "no_evidence"}:
                 row.update(failures=row["failures"]+1, reason=action)
                 if row["failures"] >= 3:

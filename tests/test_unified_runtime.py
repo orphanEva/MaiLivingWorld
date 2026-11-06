@@ -12,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
 
@@ -117,6 +118,48 @@ class UnifiedRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result = await self.bot.brain_reply_hint(**kwargs())
             self.assertNotIn("modified_kwargs", result)
         self.bot.ctx.llm.generate.assert_not_awaited()
+
+    async def test_semantic_recall_uses_shared_budget_cache_and_original_audience(self):
+        bot = self.bot
+        bot.config.unified_mind.semantic_recall = True
+        ident = self.event("我曾经在海边看灯塔。")
+        await self.group_capture(text="那个指引船的地方")
+        request = kwargs("group-one", "group-message")
+        original = bot._unified.context(request)
+        prompts = []
+
+        async def generate(prompt, **options):
+            prompts.append(prompt)
+            if "内部检索词" in prompt:
+                return {"content": json.dumps({"queries": ["海边 灯塔"]})}
+            return response([{"id": ident, "mode": "internal"}])
+
+        bot.ctx.llm.generate.side_effect = generate
+        collect = bot._collect_unified
+        with patch.object(bot, "_collect_unified", side_effect=collect) as recall:
+            result = await bot.brain_reply_hint(**request)
+            self.assertIn("海边 灯塔", [call.args[0] for call in recall.call_args_list])
+        self.assertNotIn("我曾经在海边看灯塔", rendered(result))
+        self.assertEqual(bot._unified.context(request), original)
+        self.assertEqual(sum("内部检索词" in prompt for prompt in prompts), 1)
+        before = (await bot.unified_status())["model_calls"]
+        await bot.brain_reply_hint(**request)
+        self.assertEqual((await bot.unified_status())["model_calls"], before)
+        self.assertEqual(sum("内部检索词" in prompt for prompt in prompts), 1)
+        self.assertGreaterEqual(before, 2)
+
+    async def test_semantic_query_is_discarded_after_context_changes(self):
+        bot = self.bot
+        bot.config.unified_mind.semantic_recall = True
+        await bot.capture_unified(message=host_message())
+
+        async def generate(prompt, **options):
+            await bot.capture_unified(message=host_message("new", text="换个话题"))
+            return {"content": json.dumps({"queries": ["不该缓存的词"]})}
+
+        bot.ctx.llm.generate.side_effect = generate
+        self.assertEqual(await bot._semantic_recall_queries(kwargs()), [])
+        self.assertEqual(bot._semantic_queries_cache, {})
 
     async def test_restart_preserves_agent_owner_budget_and_memory(self):
         ident = self.event()

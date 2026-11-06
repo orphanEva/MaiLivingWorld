@@ -143,6 +143,8 @@ def observation_record(row):
             evidence = "source_metadata"
         elif row["text"].startswith("B站字幕节选"):
             evidence = "subtitle_excerpt"
+        elif row["text"].startswith(("语音转写", "视频语音转写")):
+            evidence = "audio_transcription"
     return {"id": row["id"], "source": "tool", "kind": "observation",
             "scope": row["scope"], "subject_id": row["subject_id"], "text": row["text"],
             "timestamp": float(row["timestamp"]), "sensitivity": row["sensitivity"],
@@ -285,7 +287,7 @@ class ToolStore:
 
     def retract_chat_media(self, message_key, keys, scope, author, *, in_flight=False, now=None):
         """Fence all attachments of one verified original, including workers on another connection."""
-        if (not isinstance(keys, list) or not 1 <= len(keys) <= 9
+        if (not isinstance(keys, list) or not 1 <= len(keys) <= 12
                 or any(not isinstance(k, str) or not re.fullmatch(r"[0-9a-f]{64}", k) for k in [message_key, *keys])):
             raise ValueError("invalid_media_keys")
         ids = [observation_id("chat_media", key) for key in keys]
@@ -338,7 +340,7 @@ class ToolStore:
 
     def recent_chat_media(self, scope, kinds, *, now=None):
         """Return up to two recent candidates, including failed reads so an older one cannot impersonate them."""
-        if not kinds or any(k not in ("image", "video", "bilibili") for k in kinds):
+        if not kinds or any(k not in ("image", "audio", "video", "bilibili") for k in kinds):
             return []
         stamp = _now(now)
         placeholders = ",".join("?" for _ in kinds)

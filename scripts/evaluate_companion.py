@@ -313,11 +313,12 @@ def main(argv=None):
     mode.add_argument("--responses", metavar="PATH", help="offline JSON {case_id: [reply, ...]}")
     mode.add_argument("--runner", metavar="MODULE:CALLABLE", help="explicit whole reply-chain adapter; never auto-selected")
     parser.add_argument("--report", metavar="PATH", help="write redacted report instead of stdout")
+    parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS, help="synthetic scenario JSON to validate")
     parser.add_argument("--timeout", type=float, default=30., help="maximum seconds for each adapter call including initial import")
     parser.add_argument("--max-calls", type=int, default=32, help="at most 40 attempts; bundled suite uses 32")
     options = parser.parse_args(args)
     try:
-        data = read_json(DEFAULT_SCENARIOS)
+        data = read_json(options.scenarios)
         validate_scenarios(data)
         if not options.responses and not options.runner:
             payload = json.dumps(data, ensure_ascii=False, indent=2)+"\n"

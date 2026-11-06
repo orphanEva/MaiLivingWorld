@@ -150,7 +150,8 @@ class UnifiedRuntime:
         return hint + ("\n\n" + style if style else "")
 
     async def reply_hint(self, kwargs: dict, config, *, recall, generate,
-                         task_name: str, timezone: str, direct_ids: set[str] | None = None) -> str:
+                         task_name: str, timezone: str, direct_ids: set[str] | None = None,
+                         prepare_recall=None) -> str:
         context = self.context(kwargs)
         if context is None:
             self.last_status = "unverified_context"
@@ -167,6 +168,13 @@ class UnifiedRuntime:
             generation = self._generation
             owner_id = state["owner_id"]
             mode = config.mode
+            # Preparation shares this turn's lock and call budget. Only an actual
+            # reservation starts the turn's interval; cached retrieval does not.
+            prepared_turn = await prepare_recall() if prepare_recall else False
+            if (generation != self._generation or self.context(kwargs) != context
+                    or self.state.state()["owner_id"] != owner_id or not config.enabled or config.mode != mode):
+                self.last_status = "context_changed"
+                return ""
             memories = recall(context["query"])
             self.last_counts = {"considered": len(memories)}
             if not memories:
@@ -213,7 +221,7 @@ class UnifiedRuntime:
             direct = ()
             try:
                 response = await request(build_deliberation_prompt(memories, query=context["query"], **audience),
-                                         interval=config.min_interval_seconds)
+                                         interval=0 if prepared_turn is True else config.min_interval_seconds)
                 if not current():
                     raise _ContextChanged()
                 if response is None:

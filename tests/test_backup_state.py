@@ -28,12 +28,14 @@ def attention_message():
 
 
 def seed_attention(store):
-    store.capture(attention_message(), owner_id="12345678", now=100, engagement_seconds=1)
+    store.capture_activity(attention_message(), owner_id="12345678", now=100, engagement_seconds=1,
+                           workspace_intent="conversation")
     claimed = store.claim("12345678", candidates=[{"kind": "reading", "key": "reading:"+"a"*64, "version": "b"*64}],
-                          day_start=0, daily_limit=6, interval_seconds=0, now=101, activity_awareness=True)
+                          day_start=0, daily_limit=6, interval_seconds=0, now=101, activity_awareness=True,
+                          integrated_workspace=True)
     if (not claimed or not store.start_activity("12345678", claimed["token"], proof="a"*64, signature="b"*64, now=101)
             or not store.finish("12345678", claimed["token"], outcome="progress", now=102,
-                                activity_awareness=True, activity_proof="c"*64)):
+                                activity_awareness=True, activity_proof="c"*64, learn_capabilities=True)):
         raise AssertionError("expected a confirmed attention batch")
     return store.state("12345678", now=103)
 
@@ -56,8 +58,19 @@ def assert_attention_restore(case, store, expected):
     case.assertEqual(started["proof"], "a"*64)
     case.assertEqual(finished["activity"]["proof"], "c"*64)
     case.assertEqual(started["token_hash"], finished["activity"]["token_hash"])
+    workspace = expected["workspace"]
+    case.assertEqual(workspace["receipt"], expected["latest_receipt"])
+    case.assertEqual(workspace["focus"], expected["focus"])
+    case.assertEqual(workspace["pending"], [expected["focus"]])
+    attempts = expected["capabilities"]["reading"]
+    case.assertEqual(len(attempts), 1)
+    case.assertEqual(attempts[0]["outcome"], "progress")
+    case.assertEqual(attempts[0]["proof"], "c"*64)
+    case.assertEqual(attempts[0]["receipt"], started["token_hash"])
+    case.assertNotIn(attention_message()["processed_plain_text"], before["payload"])
     case.assertNotIn(attention_message()["processed_plain_text"], json.dumps(events, ensure_ascii=False))
-    case.assertFalse(store.capture(attention_message(), owner_id=owner, now=104, engagement_seconds=1))
+    case.assertFalse(store.capture_activity(attention_message(), owner_id=owner, now=104, engagement_seconds=1,
+                                           workspace_intent="conversation"))
     case.assertEqual(store.state(owner, now=103), expected)
 
 
@@ -382,9 +395,20 @@ def seed_projects(store):
     claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=402)
     result = {"outcome": "supported", "conclusion": "本次资料包含天文主题。",
               "quotes": [{"source_id": evidence["id"], "quote": "作品包含天文主题"}]}
+    insufficient = {**result, "outcome": "insufficient", "next_step": {
+        "question": "作品中的天文线索是否有原文？", "evidence_needed": "补充实际原文"}}
     if not claim or not store.finish(owner, claim["id"], claim["lease_token"], claim["revision"],
-                                      action="reviewed", result=result, now=403):
+                                      action="reviewed", result=insufficient, now=403, adaptive=True):
         raise AssertionError("expected a reviewed project result")
+    claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=704)
+    extra = {**evidence, "id": "tool:observation:"+"e"*64}
+    if not claim or not store.finish(owner, claim["id"], claim["lease_token"], claim["revision"],
+                                      action="gathered", evidence_refs=[extra], now=705):
+        raise AssertionError("expected a new plan evidence stage")
+    claim = store.claim(owner, [completed["id"]], day_start=0, daily_limit=6, interval_seconds=300, now=1006)
+    if not claim or not store.finish(owner, claim["id"], claim["lease_token"], claim["revision"],
+                                      action="reviewed", result=result, now=1007, adaptive=True):
+        raise AssertionError("expected a completed revised plan")
     paused = store.create(owner, seed("b"), now=404)
     if not store.command(owner, paused["id"], paused["revision"], "pause", "e"*64, "f"*64, now=405):
         raise AssertionError("expected an owner-paused project")
@@ -447,6 +471,8 @@ def assert_v20_restore(case, store, expected):
     if "projects_items" in expected:
         items = {item["seed"]["question_key"]: item for item in store.items("12345678")}
         case.assertEqual(items["q:"+"a"*24]["status"], "completed")
+        case.assertEqual(len(items["q:"+"a"*24]["plan"]["rounds"]), 2)
+        case.assertEqual(len(items["q:"+"a"*24]["evidence_refs"]), 2)
         case.assertEqual(len(items["q:"+"a"*24]["seed"]["seed_refs"]), 184)
         interest_refs = items["q:"+"a"*24]["seed"]["interest_refs"]
         case.assertEqual(len(interest_refs), 160)
@@ -458,7 +484,7 @@ def assert_v20_restore(case, store, expected):
         case.assertEqual(items["q:"+"d"*24]["status"], "stopped")
         case.assertIsNone(store.claim("12345678", [row["id"] for row in items.values()],
                                      day_start=0, daily_limit=6, interval_seconds=300, now=800))
-        case.assertEqual(store.state("12345678")["daily_actions"], 2)
+        case.assertEqual(store.state("12345678")["daily_actions"], 4)
     else:
         active = store.session("12345678", "reading:"+"a"*64)
         case.assertEqual((active["status"], active["owner_units"], active["discussed_units"]), ("active", 0, 1))
@@ -688,6 +714,22 @@ def assert_repair_restore(case, store, expected):
     case.assertEqual(store.items(owner), items)
 
 
+def seed_growth_archive(growth):
+    from MaiLivingWorld.growth_store import MAX_ITEMS
+    sources = []
+    for index in range(MAX_ITEMS+1):
+        source = {"id": "brain:event:archive-"+str(index), "source": "brain_event", "kind": "event",
+            "scope": "private:12345678", "subject_id": "12345678", "text": "观测主题"+str(index)+"已有资料",
+            "timestamp": 110+index, "sensitivity": "personal", "evidence_status": "recorded_event"}
+        sources.append(source)
+        job_id = growth.enqueue([source], now=110+index)
+        job = growth.claim(now=110+index)
+        proposal = {"knowledge": [{"topic": "观测主题"+str(index), "statement": source["text"],
+                                  "confidence": .7, "evidence_ids": [source["id"]]}]}
+        growth.complete(job_id, job["token"], proposal, [source], now=111+index, archive_overflow=True)
+    return {"archives": growth.archived(), "capacity": growth.capacity_counts(), "sources": sources}
+
+
 def seed_v25_state(growth, advice, repair):
     """Use real public store writes to create mixed feelings and archive turnover."""
     from MaiLivingWorld.growth_model import empty_growth
@@ -710,7 +752,9 @@ def seed_v25_state(growth, advice, repair):
                                 emotional_episodes=True, now=101)
     if not completed["changed"] or len(growth.state(now=102)["emotions"]) != 2:
         raise AssertionError("expected two bounded reactions to the same source")
-    result = {"emotion_source": source, "emotion_state": growth.state(now=102), "emotion_job": job_id}
+    archived = seed_growth_archive(growth)
+    result = {"emotion_source": source, "emotion_state": growth.state(now=102), "emotion_job": job_id,
+              "growth_archive": archived}
     refs = [{"id": "brain:fact:archive-backup", "digest": "a"*64,
              "scope": "private:"+owner, "sensitivity": "personal"}]
     rows = {"advice": [], "repair": []}
@@ -777,6 +821,16 @@ def assert_v25_restore(case, growth, advice, repair, expected):
             order, rows = expected["tables"][table]
             case.assertEqual([dict(row) for row in store.con.execute("SELECT * FROM "+table+" ORDER BY "+order)], rows)
     case.assertEqual(growth.state(now=102), expected["emotion_state"])
+    from MaiLivingWorld.memory_semantics import archive_memories
+    archived = expected["growth_archive"]
+    case.assertEqual(growth.archived(), archived["archives"])
+    case.assertEqual(growth.capacity_counts(), archived["capacity"])
+    case.assertEqual(len(growth.archived()), 1)
+    roots = {row["id"]: row for row in archived["sources"]}
+    records = archive_memories(growth, lambda ids: {key: roots[key] for key in ids if key in roots}, "观测主题0")
+    case.assertEqual(len(records), 1)
+    case.assertTrue(records[0]["archived"])
+    case.assertEqual(archive_memories(growth, lambda ids: {}, "观测主题0"), [])
     emotions = growth.state(now=101+86400)["emotions"]
     case.assertEqual({row["feeling"] for row in emotions}, {"appreciative", "disappointed"})
     case.assertTrue(all(row["intensity"] == .2 for row in emotions))
@@ -879,7 +933,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.38")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.39")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -910,6 +964,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V37_LEDGERS, backup.V36_LEDGERS)
         self.assertEqual(backup.V38_LEDGERS, backup.V37_LEDGERS)
         self.assertIsNot(backup.V38_LEDGERS, backup.V37_LEDGERS)
+        self.assertEqual(backup.V39_LEDGERS, backup.V38_LEDGERS)
+        self.assertIsNot(backup.V39_LEDGERS, backup.V38_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -1332,6 +1388,13 @@ class SQLiteBackupTests(unittest.TestCase):
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (21, []))
 
+    def test_v38_archive_restores_with_the_current_schema(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.38")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.38", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
     def test_v37_archive_restores_with_the_current_schema(self):
         archive = self.legacy_archive(explicit=True, catalog="v0.37")
         checked = backup.verify_archive(archive)
@@ -1471,7 +1534,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.38")
+        self.assertEqual(current["catalog"], "v0.39")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1926,7 +1989,7 @@ class MySQLBackupTests(unittest.TestCase):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
         current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37"):
+        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37", "v0.38"):
             with self.subTest(catalog=catalog):
                 archive = Path(self.temp.name)/(catalog+".zip")
                 with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
@@ -2002,7 +2065,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.38")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.39")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v35_backup_"+table+"`")
@@ -2053,7 +2116,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.38")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.39")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

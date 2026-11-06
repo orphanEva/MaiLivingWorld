@@ -118,9 +118,25 @@ def _view(row: dict, now: float) -> dict:
             **({"emotions": active_emotions(payload, now)} if "emotions" in payload else {})}
 
 
+def _history_payload(kind: str, before: dict, after: dict, **details) -> dict:
+    """Keep active snapshots and only changed archive pointers in each audit row."""
+    payload = {"kind": kind, "before": before, "after": after, **details}
+    if "_archive" not in before and "_archive" not in after:
+        return payload
+    old, new = before.get("_archive", {}), after.get("_archive", {})
+    payload["before"] = {key: value for key, value in before.items() if key != "_archive"}
+    payload["after"] = {key: value for key, value in after.items() if key != "_archive"}
+    payload["archive_index_version"] = 1
+    payload["archive_before_present"] = "_archive" in before
+    payload["archive_delta"] = {key: {"before": old.get(key), "after": new.get(key)}
+                                for key in sorted(old.keys() | new.keys()) if old.get(key) != new.get(key)}
+    return payload
+
+
 def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
                     records: dict[str, dict], consumed: set[str], now: float, *, review_beliefs=False,
-                    emotional_episodes=False, skip_interest_overflow=False, renew_interests=None):
+                    emotional_episodes=False, skip_interest_overflow=False, renew_interests=None,
+                    archive_overflow=False, archived_items=None, archive_revision=0, archived_changes=None):
     fields = {*COLLECTIONS, "traits", "mood"} | ({"emotions"} if emotional_episodes else set())
     if not isinstance(proposal, dict) or set(proposal) - fields:
         raise ValueError("invalid_proposal")
@@ -132,6 +148,8 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
     if not isinstance(mood, dict):
         raise ValueError("invalid_mood")
     after = copy.deepcopy(before)
+    if archived_changes is None:
+        archived_changes = {}
     stats = {key: 0 for key in (*COLLECTIONS, "traits", "mood")}
     if emotional_episodes:
         stats["emotions"] = 0
@@ -174,15 +192,28 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             raise ValueError("invalid_topic")
         key = category[0] + ":" + hashlib.sha256(normalized.encode()).hexdigest()[:24]
         current = next((item for item in after[category] if item["key"] == key), None)
+        if current is None:
+            current = (archived_changes or {}).get(key) or (archived_items or {}).get(key)
         return key, current
 
     def put(category: str, current: dict | None, item: dict) -> None:
-        if current is None:
+        active = next((row for row in after[category] if row["key"] == item["key"]), None)
+        if active is None:
             if len(after[category]) >= MAX_ITEMS:
-                raise ValueError("state_capacity")
+                if not archive_overflow:
+                    raise ValueError("state_capacity")
+                previous = after[category].pop(0)
+                after.setdefault("_archive", {})[previous["key"]] = {
+                    "category": category, "topic": previous["topic"], "revision": archive_revision}
+                archived_changes[previous["key"]] = copy.deepcopy(previous)
             after[category].append(item)
         else:
-            after[category][after[category].index(current)] = item
+            if archive_overflow:
+                after[category].remove(active)
+                after[category].append(item)
+            else:
+                after[category][after[category].index(active)] = item
+        after.get("_archive", {}).pop(item["key"], None)
         stats[category] += 1
         used.update(ref["id"] for ref in item["sources"] if ref["id"] in allowed)
 
@@ -486,10 +517,54 @@ class GrowthStore:
             return [{"revision": row["revision"], "job_id": row["job_id"], "created": row["created"],
                      "rolled_back": bool(row["rolled_back"]), **json.loads(row["payload"])} for row in rows]
 
+    def _archived_item(self, key: str, pointer: dict, *, history_cache=None) -> dict | None:
+        cache = {} if history_cache is None else history_cache
+        revision = pointer["revision"]
+        if revision not in cache:
+            row = self.con.execute("SELECT payload,created,rolled_back FROM growth_history WHERE revision=?",
+                                   (revision,)).fetchone()
+            cache[revision] = ({"payload": json.loads(row["payload"]), "created": row["created"]}
+                               if row is not None and not row["rolled_back"] else None)
+        row = cache[revision]
+        if row is None:
+            return None
+        item = row["payload"].get("archived", {}).get(key)
+        if not isinstance(item, dict) or item.get("key") != key or item.get("topic") != pointer["topic"]:
+            return None
+        return {"category": pointer["category"], "item": item,
+                "archived_at": float(row["created"]), "archive_revision": pointer["revision"]}
+
+    def archived(self, query: str = "", *, limit: int = 32, offset: int = 0) -> list[dict]:
+        """Read indexed historical conclusions; callers must resolve every source before use."""
+        from .unified_memory import _terms
+        if (not isinstance(query, str) or len(query) > 1200 or type(limit) is not int
+                or not 1 <= limit <= 128 or type(offset) is not int or not 0 <= offset <= 1000000):
+            raise ValueError("invalid_archive_query")
+        self._ensure(time.time())
+        terms = _terms(query)
+        with self.con:
+            pointers = json.loads(self._row()["payload"]).get("_archive", {})
+            ranked = sorted(pointers.items(), key=lambda pair: (
+                -sum(term in unicodedata.normalize("NFKC", pair[1]["topic"]).casefold() for term in terms),
+                -pair[1]["revision"], pair[0]))
+            history_cache = {}
+            result = [self._archived_item(key, pointer, history_cache=history_cache)
+                      for key, pointer in ranked[offset:offset+limit]]
+            return [item for item in result if item is not None]
+
+    def capacity_counts(self) -> dict:
+        self._ensure(time.time())
+        with self.con:
+            payload = json.loads(self._row()["payload"])
+            archived = list(payload.get("_archive", {}).values())
+            return {category: {"active": len(payload[category]), "active_limit": MAX_ITEMS,
+                               "archived": sum(row["category"] == category for row in archived)}
+                    for category in COLLECTIONS}
+
     def complete(self, job_id: str, token: str, proposal: dict, records: list[dict],
                  now: float | None = None, *, expected_revision: int | None = None, review_beliefs: bool = False,
                  emotional_episodes: bool = False, skip_interest_overflow: bool = False,
-                 renew_interests: dict[str, int] | None = None) -> dict:
+                 renew_interests: dict[str, int] | None = None, archive_overflow: bool = False) -> dict:
         """Commit reviewed changes; renewal eligibility comes from a trusted root check.
 
         The caller must revalidate the old references as unavailable immediately
@@ -503,6 +578,8 @@ class GrowthStore:
             raise ValueError("invalid_emotional_episodes_mode")
         if type(skip_interest_overflow) is not bool:
             raise ValueError("invalid_interest_overflow_mode")
+        if type(archive_overflow) is not bool:
+            raise ValueError("invalid_archive_mode")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("invalid_revision")
         if renew_interests is not None and (not isinstance(renew_interests, dict)
@@ -528,6 +605,22 @@ class GrowthStore:
             if expected_revision is not None and old["revision"] != expected_revision:
                 raise ValueError("revision_conflict")
             before = json.loads(old["payload"])
+            archived_items = {}
+            history_cache = {}
+            if before.get("_archive"):
+                for category in COLLECTIONS:
+                    items = proposal.get(category, []) if isinstance(proposal, dict) else []
+                    for item in items if isinstance(items, list) else []:
+                        topic = item.get("topic") if isinstance(item, dict) else None
+                        if not isinstance(topic, str):
+                            continue
+                        key = category[0] + ":" + hashlib.sha256(_normalized(topic).encode()).hexdigest()[:24]
+                        pointer = before.get("_archive", {}).get(key)
+                        if pointer is not None:
+                            archived = self._archived_item(key, pointer, history_cache=history_cache)
+                            if archived is None:
+                                raise ValueError("archive_source_missing")
+                            archived_items[key] = archived["item"]
             current_interests = {item["key"]: item["revision"] for item in before["interests"]}
             if any(current_interests.get(key) != revision for key, revision in renewals.items()):
                 raise ValueError("interest_renewal_conflict")
@@ -538,18 +631,22 @@ class GrowthStore:
             consumed = {row[0] for row in self.con.execute(
                 "SELECT source_id FROM growth_consumed WHERE source_id IN (" + ",".join("?" for _ in receipt_ids) + ")",
                 tuple(sorted(receipt_ids))).fetchall()}
+            archived_changes = {}
             after, stats, used, scalar_sources, skipped, renewed, renewal_skipped = _apply_proposal(
                 before, proposal, allowed, lookup, consumed, timestamp, review_beliefs=review_beliefs,
                 emotional_episodes=emotional_episodes, skip_interest_overflow=skip_interest_overflow,
-                renew_interests=renewals)
+                renew_interests=renewals, archive_overflow=archive_overflow, archived_items=archived_items,
+                archive_revision=int(old["revision"])+1, archived_changes=archived_changes)
             changed = any(stats.values()) and job["mode"] == "active"
             revision = int(old["revision"])
             if changed:
                 revision += 1
                 self.con.execute("UPDATE growth_state SET payload=?,revision=?,updated=? WHERE slot=1",
                                  (_json(after), revision, timestamp))
-                payload = {"kind": "growth", "before": before, "after": after,
-                           "sources": [allowed[key] for key in sorted(used)]}
+                payload = _history_payload("growth", before, after,
+                                           sources=[allowed[key] for key in sorted(used)])
+                if archived_changes:
+                    payload["archived"] = archived_changes
                 self.con.execute("INSERT INTO growth_history(revision,job_id,payload,created) VALUES (?,?,?,?)",
                                  (revision, job_id, _json(payload), timestamp))
                 for sid in scalar_sources:
@@ -563,6 +660,8 @@ class GrowthStore:
                 stats["skipped_interest_renewal"] = renewal_skipped
             if changed and renewed:
                 stats["renewed_interests"] = renewed
+            if changed and archived_changes:
+                stats["archived_items"] = len(archived_changes)
             return {**stats, "revision": revision, "changed": bool(changed), "observed": job["mode"] == "observe"}
 
     def rollback(self, expected_revision: int, now: float | None = None) -> dict:
@@ -583,6 +682,15 @@ class GrowthStore:
                 raise ValueError("nothing_to_rollback")
             restored = copy.deepcopy(record["before"])
             existing = json.loads(current["payload"])
+            if record.get("archive_index_version") == 1:
+                restored_index = copy.deepcopy(existing.get("_archive", {}))
+                for key, change in record["archive_delta"].items():
+                    if change["before"] is None:
+                        restored_index.pop(key, None)
+                    else:
+                        restored_index[key] = change["before"]
+                if record["archive_before_present"]:
+                    restored["_archive"] = restored_index
             # Undoing visible traits does not replenish their same-day allowance.
             if existing["_trait_day"] >= restored["_trait_day"]:
                 restored["_trait_day"] = existing["_trait_day"]
@@ -594,8 +702,8 @@ class GrowthStore:
             self.con.execute("UPDATE growth_jobs SET status='pending',lease_token='',lease_until=0,"
                              "next_attempt=?,updated=?,error_code='state_rolled_back' WHERE status='running'",
                              (timestamp, timestamp))
-            rollback = {"kind": "rollback", "before": existing, "after": restored,
-                        "sources": record["sources"], "reverted_revision": expected_revision}
+            rollback = _history_payload("rollback", existing, restored,
+                                        sources=record["sources"], reverted_revision=expected_revision)
             self.con.execute("INSERT INTO growth_history(revision,job_id,payload,created,rolled_back) VALUES (?,?,?,?,1)",
                              (revision, "rollback:" + str(expected_revision), _json(rollback), timestamp))
             return _view({"payload": _json(restored), "revision": revision, "updated": timestamp}, timestamp)
@@ -622,13 +730,17 @@ class GrowthStore:
                     removed = item
                     after[category].remove(item)
                     break
+            if removed is None and key in after.get("_archive", {}):
+                item = self._archived_item(key, after["_archive"][key])
+                if item is not None:
+                    removed = item["item"]
+                    del after["_archive"][key]
             if removed is None:
                 raise ValueError("item_missing")
             revision = expected_revision + 1
             self.con.execute("UPDATE growth_state SET payload=?,revision=?,updated=? WHERE slot=1",
                              (_json(after), revision, timestamp))
-            audit = {"kind": "retire", "before": before, "after": after,
-                     "sources": removed["sources"], "retired_key": key}
+            audit = _history_payload("retire", before, after, sources=removed["sources"], retired_key=key)
             self.con.execute("INSERT INTO growth_history(revision,job_id,payload,created) VALUES (?,?,?,?)",
                              (revision, "retire:" + str(revision) + ":" + key, _json(audit), timestamp))
             self.con.execute("UPDATE growth_jobs SET status='pending',lease_token='',lease_until=0,"

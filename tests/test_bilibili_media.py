@@ -42,6 +42,40 @@ class ShareLinks(unittest.TestCase):
 
 
 class Player(unittest.IsolatedAsyncioTestCase):
+    async def test_targeted_storyboard_keeps_actual_timestamp_and_subtitles_near_question(self):
+        with patch.object(bili, "fetch_public", self.fetch):
+            result = await bili.read_bilibili_link(URL, positions=[7], timeline=True)
+        self.assertEqual(result["frame_times"], [4])
+        self.assertEqual(len(result["frames"]), 1)
+        with Image.open(BytesIO(result["frames"][0])) as frame:
+            self.assertEqual(max(range(3), key=frame.getpixel((8, 8)).__getitem__), 1)
+        body = {"body": [{"from": 0, "to": 2, "content": "开头"},
+                         {"from": 27, "to": 30, "content": "目标片段"},
+                         {"from": 55, "to": 58, "content": "后续片段"}]}
+        text = bili._subtitles([{"subtitle_url": "//aisubtitle.hdslb.com/text"}],
+                              lambda *args: json.dumps(body).encode(), positions=[29], timeline=True)
+        self.assertEqual(text, "27.0–30.0秒 目标片段")
+        self.assertEqual(result["subtitle_excerpt"], "")  # Untimed text cannot answer a precise time question.
+
+    async def test_invalid_storyboard_timestamps_never_label_pixels(self):
+        for stamps in ([0, float("nan"), 8, 12], [0, 8, 4, 12], ["0", 4, 8, 12]):
+            self.data["/x/player/videoshot"]["index"] = stamps
+            with patch.object(bili, "fetch_public", self.fetch):
+                result = await bili.read_bilibili_link(URL, timeline=True)
+            self.assertEqual(result["frames"], [])
+
+    async def test_audio_download_is_optional_and_public_subtitles_avoid_asr_download(self):
+        self.data["/x/player/playurl"] = {"durl": [{"url": "https://upos.bilivideo.com/file", "size": 11}]}
+        with patch.object(bili, "fetch_public", self.fetch):
+            subtitled = await bili.read_bilibili_link(URL, timeline=True, include_audio=True)
+            self.assertNotIn("audio_bytes", subtitled)
+            self.data["/x/player/v2"] = {}
+            quiet = await bili.read_bilibili_link(URL, timeline=True)
+            self.assertNotIn("audio_bytes", quiet)
+            voiced = await bili.read_bilibili_link(URL, timeline=True, include_audio=True)
+            self.assertEqual(voiced["audio_bytes"], b"video bytes")
+            self.assertEqual(len(voiced["frames"]), 3)
+
     def setUp(self):
         self.hits = []
         self.data = {

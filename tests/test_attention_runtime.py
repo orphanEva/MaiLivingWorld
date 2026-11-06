@@ -52,6 +52,31 @@ class AttentionRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def answer(self, mode, evidence, confidence=.95):
         return {"response": json.dumps({"mode": mode, "confidence": confidence, "evidence": evidence}, ensure_ascii=False)}
 
+    async def test_dialogue_reports_real_reservation_and_respects_first_call_interval(self):
+        from MaiLivingWorld.mcp_runtime import day_start
+        b = self.bot
+        b.config.unified_mind.min_interval_seconds = 30
+        self.assertTrue(b._self_state.reserve_thought(now=time.time(), day_start=day_start(b.config.general.timezone),
+            min_interval_seconds=0, daily_limit=b.config.unified_mind.max_daily_model_calls))
+        await self.capture("最近我有点难过，想聊一件事")
+        self.assertFalse(await b._attention.prepare_dialogue(self.kwargs()))
+        b.ctx.llm.generate.assert_not_awaited()
+        await self.capture("今天我有点难过，想聊另一件事", "m2")
+        b.ctx.llm.generate = AsyncMock(side_effect=RuntimeError("simulated classification failure"))
+        self.assertTrue(await b._attention.prepare_dialogue(self.kwargs("m2"), reserved=True))
+        self.assertFalse(await b._attention.prepare_dialogue(self.kwargs("m2"), reserved=True))
+        self.assertEqual(b.ctx.llm.generate.await_count, 1)
+
+    async def test_optional_dialogue_keeps_one_budget_slot_for_expression(self):
+        self.bot.config.unified_mind.max_daily_model_calls = 1
+        await self.capture("最近我有点难过，想聊一件事")
+        self.assertFalse(await self.bot._attention.prepare_dialogue(self.kwargs(), keep_reply_slot=True))
+        self.assertEqual(self.bot._self_state.state()["thought_count"], 0)
+        self.bot.ctx.llm.generate.assert_not_awaited()
+        await self.capture("先听我说就好", "m2")
+        self.assertFalse(await self.bot._attention.prepare_dialogue(self.kwargs("m2")))
+        self.assertEqual(self.bot._attention.store.state(OWNER)["conversation"]["mode"], "listen")
+
     def test_research_priority_respects_signed_active_interests_without_excluding_questions(self):
         self.bot.config.growth.enabled = True
         self.bot.config.growth.mode = "active"

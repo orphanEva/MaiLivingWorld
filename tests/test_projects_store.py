@@ -34,6 +34,42 @@ def result(outcome="supported", letter="c"):
 
 
 class ProjectsChecks:
+    def test_adaptive_plan_retains_sources_and_finishes_after_three_reviews(self):
+        db = self.store()
+        row = self.created(db)
+        stamp = 101
+        for index, letter in enumerate(("c", "d", "e")):
+            claim = self.claimed(db, row, now=stamp, daily_limit=12)
+            self.assertTrue(db.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                action="gathered", evidence_refs=[reference(letter)], now=stamp+1, adaptive=True))
+            stamp += 301
+            claim = self.claimed(db, row, now=stamp, daily_limit=12)
+            value = {**result("insufficient", letter), "next_step": {
+                "question": "还需要核查第"+str(index+1)+"项资料？", "evidence_needed": "有出处的正文节选"}}
+            self.assertTrue(db.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                action="reviewed", result=value, now=stamp+1, adaptive=True))
+            row = self.store().get(OWNER, row["id"])
+            self.assertEqual(len(row["plan"]["rounds"]), index+1)
+            self.assertEqual(len(row["evidence_refs"]), index+1)
+            self.assertEqual(row["status"], "active" if index < 2 else "unresolved")
+            stamp += 301
+        self.assertEqual(row["reason"], "plan_needs_help")
+        self.assertEqual({ref["id"] for ref in row["evidence_refs"]}, {reference(x)["id"] for x in ("c", "d", "e")})
+
+    def test_adaptive_plan_audit_failure_rolls_back_and_owner_stop_wins(self):
+        db = self.store()
+        row = self.gathered(db)
+        claim = self.claimed(db, row, now=403)
+        value = {**result("insufficient"), "next_step": {"question": "正文还有哪些证据？", "evidence_needed": "下一份正文"}}
+        with patch.object(db, "_audit", side_effect=RuntimeError("synthetic failure")):
+            with self.assertRaises(RuntimeError):
+                db.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                          action="reviewed", result=value, now=404, adaptive=True)
+        self.assertNotIn("plan", db.get(OWNER, row["id"]))
+        self.assertTrue(db.command(OWNER, row["id"], claim["revision"], "stop", "a"*64, "b"*64, now=405))
+        self.assertFalse(db.finish(OWNER, row["id"], claim["lease_token"], claim["revision"],
+                                  action="reviewed", result=value, now=406, adaptive=True))
+
     def created(self, db, **options):
         return db.create(OWNER, seed(options.pop("key", "a")), now=options.pop("now", 100), **options)
 

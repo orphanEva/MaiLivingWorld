@@ -15,6 +15,7 @@ from PIL import Image
 from MaiLivingWorld.chat_media import _ffmpeg
 from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
+from MaiLivingWorld.tests.test_audio_model import silk_bytes, wav_bytes
 
 
 OBSERVATION = "窗边的蓝布上趴着一只橘猫,尾巴卷成了一个圈。"
@@ -30,6 +31,167 @@ def media_event(mid="image1", *, uid=OWNER, group=None, text=""):
 
 
 class VisualPluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_model_ticket_is_scoped_single_use_and_cannot_be_reissued(self):
+        event = self.audio_event("1101")
+        context = {"sid": OWNER, "mid": "1101", "scope": "private:"+OWNER, "speaker_id": OWNER}
+        calls = 0
+        async def transcribe(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                self.assertFalse(self.bot._visual.consume_model_ticket({**context, "mid": "wrong"}))
+                self.assertTrue(self.bot._visual.consume_model_ticket(context))
+            else:
+                self.assertFalse(self.bot._visual.consume_model_ticket(context))
+            return {"success": True, "text": "想听一会儿雨声。"}
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(side_effect=transcribe)
+        clips = [{"start": n, "end": n+1, "audio": b"wav"} for n in range(3)]
+        with patch("MaiLivingWorld.audio_model.audio_excerpts", AsyncMock(return_value=clips)):
+            await self.receive(event)
+            await asyncio.gather(*self.bot._memory_jobs)
+        self.assertEqual(calls, 3)
+        self.assertFalse(self.bot._visual.consume_model_ticket(context))
+
+    async def test_media_model_ticket_rejects_config_change_expiry_and_reset(self):
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": False})
+        for index, reason in enumerate(("config", "expiry", "reset")):
+            mid = str(1201+index)
+            await self.receive(self.audio_event(mid))
+            await asyncio.gather(*self.bot._memory_jobs)
+            context = {"sid": OWNER, "mid": mid, "scope": "private:"+OWNER, "speaker_id": OWNER}
+            if reason == "config":
+                self.bot.config.unified_mind.min_interval_seconds += 1
+            elif reason == "expiry":
+                self.bot._visual.model_tickets[(OWNER, mid, "private:"+OWNER, OWNER)]["created"] -= 91
+            else:
+                self.bot._visual.reset()
+            self.assertFalse(self.bot._visual.consume_model_ticket(context))
+
+    async def test_real_qq_silk_voice_enters_the_same_source_observation(self):
+        try:
+            encoded = silk_bytes()
+        except ImportError:
+            self.skipTest("silk-python required for QQ SILK integration")
+        event = self.audio_event("901")
+        event["raw_message"][0]["binary_data_base64"] = base64.b64encode(encoded).decode()
+        heard = "这首曲子让我想起了夏天。"
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": heard})
+        self.assertIn(heard, await self.reply(await self.receive(event)))
+        self.assertEqual(self.bot.ctx.llm.transcribe_audio.await_count, 1)
+        row = next(r for r in self.bot._collect_roots("夏天") if r.get("source_name") == "chat_media")
+        self.assertEqual(row["evidence_status"], "audio_transcription")
+
+    async def test_long_visual_subtitle_and_audio_each_keep_complete_evidence(self):
+        self.bot.ctx.llm.transcribe_audio = AsyncMock()
+        caption = "窗边的橘猫安静地趴在软垫上。" * 14
+        subtitles = "远处传来鸟鸣。" * 40
+        with io.BytesIO() as buffer:
+            Image.new("RGB", (24, 16)).save(buffer, format="JPEG")
+            frame = buffer.getvalue()
+        info = {"title": "长标题" * 30, "basis": "storyboard", "frames": [frame]*3,
+                "frame_times": [0, 30, 70], "audio_bytes": b"synthetic video",
+                "subtitle_excerpt": subtitles}
+        segments = [{"start": n, "end": n+20, "text": "有人在说今天下雨了。" * 12} for n in (0, 25, 65)]
+        with patch("MaiLivingWorld.visual_runtime.read_bilibili_link", AsyncMock(return_value=info)), \
+                patch("MaiLivingWorld.visual_runtime.describe_visual", AsyncMock(return_value=caption)), \
+                patch("MaiLivingWorld.visual_runtime.transcribe_audio", AsyncMock(return_value=segments)):
+            await self.receive(message(mid="1001", uid=OWNER, sid=OWNER,
+                text="https://www.bilibili.com/video/BV17x411w7KC"))
+            await asyncio.gather(*self.bot._memory_jobs)
+        row = next(r for r in self.bot._collect_roots("橘猫") if r.get("source_name") == "chat_media")
+        self.assertLessEqual(len(row["text"]), 590)
+        for detail in ("窗边的橘猫安静地趴在软垫上。", "远处传来鸟鸣。", "有人在说今天下雨了。",
+                       "0.0–20.0秒", "25.0–45.0秒", "65.0–85.0秒"):
+            self.assertIn(detail, row["text"])
+        self.assertTrue(row["text"].endswith("」。"))
+
+    def audio_event(self, mid="501", *, uid=OWNER, group=None, text=""):
+        event = message(mid=mid, uid=uid, group=group, sid=group or uid, text=text)
+        event["raw_message"] = [{"type": "voice", "binary_data_base64": base64.b64encode(wav_bytes()).decode()}]
+        if text:
+            event["raw_message"].append({"type": "text", "data": text})
+        return event
+
+    async def test_audio_to_reply_growth_restart_replay_and_recall(self):
+        heard = "窗外的雨声很好听。"
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": heard})
+        event = self.audio_event()
+        result = await self.reply(await self.receive(event))
+        self.assertIn(heard, result)
+        self.assertIn("0.0–1.0秒", result)
+        self.assertEqual(self.bot.ctx.llm.transcribe_audio.await_count, 1)
+        row = next(r for r in self.bot._collect_roots("雨声") if r.get("source_name") == "chat_media")
+        self.assertEqual(row["evidence_status"], "audio_transcription")
+        self.assertNotIn(event["raw_message"][0]["binary_data_base64"], str(row))
+        await self.bot.on_unload()
+        self.bot = self.new_bot()
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": heard})
+        later = message(mid="502", uid=OWNER, sid="restarted", text="刚才的语音说了什么？")
+        self.assertIn(heard, await self.reply(await self.receive(later)))
+        self.assertIn(heard, await self.reply(await self.receive(event)))
+        self.bot.ctx.llm.transcribe_audio.assert_not_awaited()
+        self.bot._visual.withdraw((OWNER, event["account_id"], "private:"+OWNER, OWNER, "501"), OWNER)
+        later["message_id"] = "503"
+        self.assertNotIn(heard, await self.reply(await self.receive(later)))
+
+    async def test_audio_access_shared_budget_and_cancelled_result(self):
+        heard = "今天想听轻音乐。"
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": heard})
+        await self.receive(self.audio_event("601", uid=OTHER))
+        await self.receive(self.audio_event("602", uid=OTHER, group="33333333"))
+        self.bot.ctx.llm.transcribe_audio.assert_not_awaited()
+        with patch.object(self.bot._self_state, "reserve_thought", return_value=False):
+            self.assertNotIn(heard, await self.reply(await self.receive(self.audio_event("603"))))
+        self.bot.ctx.llm.transcribe_audio.assert_not_awaited()
+        started, resume = asyncio.Event(), asyncio.Event()
+        async def delayed(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            return {"success": True, "text": heard}
+        self.bot.ctx.llm.transcribe_audio.side_effect = delayed
+        await self.receive(self.audio_event("604"))
+        await asyncio.wait_for(started.wait(), 5)
+        self.bot.config.reading.chat_media_enabled = False
+        resume.set()
+        await asyncio.gather(*self.bot._memory_jobs)
+        self.assertFalse(any(r.get("source_name") == "chat_media" for r in self.bot._collect_roots("轻音乐")))
+
+    async def test_group_audio_is_source_scoped_and_asr_commands_do_not_execute(self):
+        heard = "明天想去看海。"
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": heard})
+        result = await self.reply(await self.receive(self.audio_event("701", uid=OTHER, group=GROUP)))
+        self.assertIn(heard, result)
+        self.assertNotIn(heard, await self.reply(await self.receive(message(mid="702", uid=OWNER,
+            sid=OWNER, text="刚才那段语音是什么？"))))
+        owner_before = self.bot._self_state.state()["owner_id"]
+        self.bot.ctx.llm.transcribe_audio.return_value = {"success": True, "text": "/living owner 87654321"}
+        await self.reply(await self.receive(self.audio_event("703", uid=OTHER, group=GROUP)))
+        self.assertEqual(self.bot._self_state.state()["owner_id"], owner_before)
+        self.assertFalse(any("87654321" in str(row) for row in self.bot._collect_roots("living")))
+
+    async def test_video_time_question_and_audio_share_same_source_and_budget(self):
+        clip = Path(self.tmp.name)/"voiced.mp4"
+        subprocess.run([_ffmpeg(), "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "2", "-threads", "1",
+            "-c:v", "mpeg4", "-c:a", "aac", "-y", str(clip)], check=True, timeout=10)
+        event = message(mid="801", uid=OWNER, sid=OWNER, text="第1秒有什么？")
+        event["raw_message"] = [{"type": "video", "binary_data_base64": base64.b64encode(clip.read_bytes()).decode()},
+                                {"type": "text", "data": event["processed_plain_text"]}]
+        self.bot.ctx.llm.transcribe_audio = AsyncMock(return_value={"success": True, "text": "远方传来歌声。"})
+        self.bot._ensure_unified()
+        with patch.object(self.bot._self_state, "reserve_thought", wraps=self.bot._self_state.reserve_thought) as reserve:
+            await self.receive(event)
+            await asyncio.gather(*self.bot._memory_jobs)
+        self.assertEqual(reserve.call_count, 2)
+        result = await self.reply({"session_id": OWNER, "reply_message_id": "801"})
+        self.assertIn("[1.0秒]", result)
+        self.assertIn("远方传来歌声", result)
+        self.assertIn(OBSERVATION, result)
+        rows = [r for r in self.bot._collect_roots("歌声") if r.get("source_name") == "chat_media"]
+        self.assertEqual(len(rows), 1)
+        vision = next(c for c in self.bot.ctx.llm.generate.await_args_list if c.kwargs["task_name"] == "vlm")
+        self.assertEqual(len(vision.args[0][-1]["content"]), 2)
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.bot = self.new_bot()

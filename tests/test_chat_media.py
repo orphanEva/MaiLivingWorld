@@ -26,6 +26,23 @@ def png():
 
 
 class QQAttachments(unittest.IsolatedAsyncioTestCase):
+    async def test_host_voice_and_verified_napcat_record_aliases_share_audio_kind(self):
+        encoded = base64.b64encode(b"synthetic audio payload").decode()
+        for kind in ("voice", "audio", "record"):
+            item, = media.extract_attachments(event([{"type": kind, "binary_data_base64": encoded}]))
+            self.assertEqual(item.kind, "audio")
+            self.assertEqual((await media.load_attachment(item))["audio_bytes"], b"synthetic audio payload")
+        item, = media.extract_attachments(event([{"type": "text", "data": "[语音]"}]))
+        details = {"message_id": 42, "sender": {"user_id": 12345678}, "self_id": 99999999,
+                   "message_type": "private", "message": [{"type": "record", "data": {"base64": encoded}}]}
+        api = AsyncMock(return_value={"success": True, "result": details})
+        self.assertEqual((await media.load_attachment(item, api_call=api))["audio_bytes"], b"synthetic audio payload")
+        details["self_id"] = 11111111
+        with self.assertRaises(media.ChatMediaError):
+            await media.load_attachment(item, api_call=api)
+        self.assertEqual(media.extract_attachments(event([{"type": "forward", "data": [
+            {"type": "voice", "binary_data_base64": encoded}]}])), [])
+
     def test_host_reply_uses_only_direct_structured_target_and_optional_sender(self):
         reply = {"type": "reply", "data": {"target_message_id": "-85", "target_message_sender_id": "34567890",
                  "target_message_content": "[CQ:reply,id=91]", "target_message_sender_nickname": "98765432"}}
@@ -118,6 +135,11 @@ class QQAttachments(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(set(frames)), 2)
             self.assertLessEqual(len(frames), 3)
             self.assertEqual(list(Path(directory).iterdir()), [video])
+            timeline = await media.sample_video(video.read_bytes(), positions=[.3, 1.7], timeline=True)
+            self.assertEqual(timeline["frame_times"], [.3, 1.7])
+            self.assertEqual(len(timeline["frames"]), 2)
+            with self.assertRaises(media.ChatMediaError):
+                await media.sample_video(video.read_bytes(), positions=[9], timeline=True)
             for frame in frames:
                 with Image.open(BytesIO(frame)) as decoded:
                     self.assertEqual(decoded.format, "JPEG")

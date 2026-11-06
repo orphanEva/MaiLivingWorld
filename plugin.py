@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.38.0",
+        default="0.39.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -214,6 +214,7 @@ class Memory(PluginConfigBase):
 class UnifiedMind(PluginConfigBase):
     __ui_label__ = "10 / 统一心智与唯一主人"
     enabled: bool = Field(default=False, description="统一记忆入口；需先启用并绑定唯一主人，沿用脑记忆的采集名单")
+    semantic_recall: bool = Field(default=False, description="使用共享模型额度扩展内部检索词，并核对归档记忆与经历变化；检索词仅在本地使用", json_schema_extra={"label": "语义联想与经历回顾"})
     mode: Literal["observe", "active"] = Field(default="observe", description="observe=只进行内部联想并显示计数；active=让经过表达判断的记忆影响回复")
     recall_limit: int = Field(default=12, ge=1, le=12, description="每轮内部联想的相关记忆数量上限，跨私聊/群聊/公开来源")
     candidate_limit: int = Field(default=200, ge=12, le=1000, description="统一检索最多取回的候选行数，不等于数据库物理扫描行数")
@@ -278,8 +279,8 @@ class MCPPixiv(MCPCap):
 
 
 class Reading(PluginConfigBase):
-    chat_media_enabled: bool = Field(default=False, description="在主人私聊及已允许记忆的群读取图片、视频和 B 站链接。使用宿主 vlm 视觉模型，观察可进入长期记忆。",
-                                     json_schema_extra={"label": "看聊天里的图片和视频"})
+    chat_media_enabled: bool = Field(default=False, description="在主人私聊及已允许记忆的群读取图片、语音、视频和 B 站链接。使用宿主 vlm 与 voice 任务，观察可进入长期记忆。",
+                                     json_schema_extra={"label": "理解聊天里的图片、语音和视频"})
     __ui_label__ = "15 / 连续阅读与学习"
     enabled: bool = Field(default=False, description="保存作品版本、逐页/逐段阅读进度和核验笔记；需统一心智、唯一主人和MCP")
     cap_pdf_enabled: bool = Field(default=False, description="允许读取cap网关中已有PDF，网关也需显式启用PDF读取；不自动下载")
@@ -327,6 +328,8 @@ class Continuity(PluginConfigBase):
 
 class Attention(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用统一关注与后台行动选择，需统一心智active")
+    integrated_workspace: bool = Field(default=False, description="汇总当前意图、暂停任务与待补证据，跨会话核验和接续已有进度", json_schema_extra={"label": "统一工作记忆"})
+    adaptive_motivation: bool = Field(default=False, description="按有据兴趣、情绪、性格、负荷及实际行动结果选择后续任务", json_schema_extra={"label": "动机与行动学习"})
     dialogue_enabled: bool = Field(default=True, description="按当前主人私聊判断短时倾听、建议和误会修复")
     activity_awareness: bool = Field(default=False, description="按真实后台进展记录有限注意力负荷并随时间恢复；主人询问时说明可核验的近期活动，正常对话不等待恢复")
     reply_coordination: bool = Field(default=False, description="为可信主人当前私聊统一选择回应重点，减少倾听时无关建议和任务插话；保留来源权限、共读限制和必要纠正，不额外调用模型")
@@ -362,6 +365,7 @@ class Followthrough(PluginConfigBase):
 class Projects(PluginConfigBase):
     __ui_label__ = "26 / 自主长期项目"
     enabled: bool = Field(default=False, description="从有依据的自身兴趣和未解问题选题，有限查阅、整理与独立复核；需统一心智和成长active，不自动下载或发布")
+    adaptive_plans: bool = Field(default=False, description="证据不足时复核待补问题，再收集资料，最多三轮，随后保留明确求助点", json_schema_extra={"label": "分步查证与修订计划"})
     interval_seconds: int = Field(default=900, ge=300, le=86400, description="项目阶段行动的最小间隔秒数，重启保留；同时遵守原阅读、工具和模型预算")
     max_daily_actions: int = Field(default=6, ge=0, le=24, description="每天最多尝试推进项目阶段的次数，失败也计；主人正在交谈时优先回应")
     max_active_projects: int = Field(default=2, ge=1, le=3, description="同时推进的项目上限；暂停/停止不自动复活")
@@ -473,6 +477,16 @@ class MaiLivingWorld(MaiBotPlugin):
             settings.brain_memory.enable_facts = True
             settings.growth.enabled = True
             settings.growth.mode = "active"
+            settings.growth.review_beliefs = True
+            settings.growth.personality_tensions = True
+            settings.growth.emotional_episodes = True
+            settings.unified_mind.semantic_recall = True
+            settings.attention.enabled = True
+            settings.attention.integrated_workspace = True
+            settings.attention.adaptive_motivation = True
+            settings.attention.activity_awareness = True
+            settings.attention.reply_coordination = True
+            settings.projects.adaptive_plans = True
 
     @classmethod
     def build_config_schema(cls, *, plugin_id="", plugin_name="", plugin_version="", plugin_description="", plugin_author=""):
@@ -508,6 +522,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._brain: BrainBook | None = None
         self._self_state: SelfState | None = None
         self._unified: UnifiedRuntime | None = None
+        self._semantic_queries_cache: dict[tuple, tuple[float, list[str]]] = {}
         self._growth: GrowthStore | None = None
         self._growth_runtime: GrowthRuntime | None = None
         self._tool_store: ToolStore | None = None
@@ -576,7 +591,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.38.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.39.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -856,7 +871,7 @@ class MaiLivingWorld(MaiBotPlugin):
                 # Use a neutral search cue for a bare attachment. Keep the actual message
                 # untouched for command, identity and quoted evidence processing.
                 runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids),
-                                media_fallback="分享的图片或视频")
+                                media_fallback="分享的图片、语音或视频")
         return {"action": "continue"}
 
     @HookHandler(
@@ -1180,7 +1195,7 @@ class MaiLivingWorld(MaiBotPlugin):
         description="核验当前QQ交谈对象，按统一记忆与表达判断形成回复背景",
         # Host v1.3.10 defaults this hook to 6s. Media waits at most 8s, dialogue
         # classification at most 8s, and expression may make two bounded 30s calls.
-        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, timeout_ms=80_000, error_policy=ErrorPolicy.SKIP,
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, timeout_ms=95_000, error_policy=ErrorPolicy.SKIP,
     )
     async def brain_reply_hint(self, **kwargs):
         if self.config.unified_mind.enabled:
@@ -1194,13 +1209,29 @@ class MaiLivingWorld(MaiBotPlugin):
                     visual = self._visual if self.config.reading.chat_media_enabled and self._unified_active() else None
                     if visual and before:
                         await visual.wait_current(before)
-                    if attention:
-                        await attention.prepare_dialogue(kwargs)
                     recollection = self._ensure_recollection()
                     reference = self._ensure_reference()
                     if reference and not reference.trusted(kwargs):
                         reference = None
                     reference_signature = reference.signature() if reference else None
+                    resolution = reference.resolve(kwargs) if reference else None
+                    semantic = []
+                    async def prepare_recall():
+                        nonlocal semantic
+                        current = runtime.context(kwargs)
+                        consume_ticket = getattr(visual, "consume_model_ticket", None)
+                        reserved = bool(consume_ticket and current and consume_ticket(current))
+                        if attention:
+                            reserved = await attention.prepare_dialogue(kwargs, reserved=reserved, keep_reply_slot=True) or reserved
+                        if runtime.context(kwargs) != current:
+                            return reserved
+                        def mark_reserved():
+                            nonlocal reserved
+                            reserved = True
+                        if (before and not before.get("interest_question") and not before.get("discovery_period")
+                                and not (resolution and resolution.get("status") in {"resolved", "ambiguous", "unavailable"})):
+                            semantic = await self._semantic_recall_queries(kwargs, reserved=reserved, on_reserved=mark_reserved)
+                        return reserved
                     recalled = []
                     direct_ids = set()
                     discovery_turn = bool(before and before.get("discovery_period")
@@ -1255,7 +1286,13 @@ class MaiLivingWorld(MaiBotPlugin):
                                 items = self._ensure_tool_store().recent_social_reads(owner, now=now)
                                 records = dated_reads(items, context["discovery_period"], self.config.general.timezone, now)
                         else:
-                            records = self._collect_unified(query)
+                            groups = [self._collect_unified(term) for term in [query] + semantic]
+                            merged = {}
+                            for index in range(self.config.unified_mind.recall_limit):
+                                for group in groups:
+                                    if index < len(group):
+                                        merged.setdefault(group[index]["id"], group[index])
+                            records = list(merged.values())[:self.config.unified_mind.recall_limit]
                         records = self._expression_records(records, context)
                         if visual and context:
                             records = visual.focus_records(records, context)
@@ -1267,6 +1304,7 @@ class MaiLivingWorld(MaiBotPlugin):
                         kwargs, self.config.unified_mind, recall=recall,
                         generate=self.ctx.llm.generate, task_name=self.config.brain.model_task,
                         timezone=self.config.general.timezone, direct_ids=direct_ids,
+                        prepare_recall=prepare_recall,
                     )
                     hints = {}
                     if discovery_turn and runtime.context(kwargs) == before:
@@ -1585,6 +1623,44 @@ class MaiLivingWorld(MaiBotPlugin):
             (self.config.attention.enabled or self.config.recollection.enabled or self.config.habits.enabled) and self._unified_active())
         return self._unified
 
+    async def _semantic_recall_queries(self, kwargs, *, reserved=False, on_reserved=None) -> list[str]:
+        from .memory_semantics import semantic_queries
+        runtime = self._unified
+        config = self.config.unified_mind
+        context = runtime.context(kwargs) if runtime else None
+        if not (self._unified_active() and config.semantic_recall and context):
+            return []
+        owner = self._self_state.state()["owner_id"]
+        key = (id(runtime), owner, context["sid"], context["mid"], context["scope"],
+               context["speaker_id"], context["query"], context["seen"])
+        now = time.monotonic()
+        self._semantic_queries_cache = {item: value for item, value in self._semantic_queries_cache.items()
+                                        if now - value[0] <= 90}
+        if key in self._semantic_queries_cache:
+            return list(self._semantic_queries_cache[key][1])
+
+        def valid():
+            return (self._unified is runtime and self._unified_active() and self.config.unified_mind.semantic_recall
+                    and runtime.context(kwargs) == context and self._self_state.state()["owner_id"] == owner)
+
+        def reserve():
+            accepted = self._self_state.reserve_thought(now=time.time(), day_start=tool_day_start(self.config.general.timezone),
+                min_interval_seconds=0 if reserved else config.min_interval_seconds,
+                daily_limit=max(0, config.max_daily_model_calls - 1),
+                reserve_for_reply=config.reserved_reply_calls, purpose="foreground")
+            if accepted and on_reserved:
+                on_reserved()
+            return accepted
+
+        result = await semantic_queries(context["query"], generate=self.ctx.llm.generate, reserve=reserve,
+            valid=valid, task_name=self.config.brain.model_task, timeout=min(12, config.model_timeout_seconds))
+        if not valid():
+            return []
+        while len(self._semantic_queries_cache) >= 128:
+            self._semantic_queries_cache.pop(next(iter(self._semantic_queries_cache)))
+        self._semantic_queries_cache[key] = (now, result)
+        return result
+
     def _memory_sources(self) -> dict[str, Any]:
         brain = self._ensure_brain() if self.config.brain_memory.enabled else None
         mind = self._ensure_mind() if self.config.mind.enabled else None
@@ -1661,10 +1737,11 @@ class MaiLivingWorld(MaiBotPlugin):
 
     def _recent_growth_history(self, revision: int) -> list[dict]:
         cached = getattr(self, "_growth_history_cache", None)
-        if cached and cached[0] is self._growth and cached[1] == revision:
+        limit = 100 if self.config.unified_mind.semantic_recall else 20
+        if cached and cached[0] is self._growth and cached[1] == (revision, limit):
             return cached[2]
-        history = self._growth.history(limit=20)
-        self._growth_history_cache = (self._growth, revision, history)
+        history = self._growth.history(limit=limit)
+        self._growth_history_cache = (self._growth, (revision, limit), history)
         return history
 
     def _growth_renewal_candidates(self, stored: dict, verified: dict) -> dict[str, int]:
@@ -1705,6 +1782,12 @@ class MaiLivingWorld(MaiBotPlugin):
         refs = [ref["id"] for key in sections for item in state.get(key, []) for ref in item["sources"]]
         resolved = self._resolve_growth_roots(refs)
         records = derived_memories(state, resolved, fingerprint=source_fingerprint, query=query, limit=12)
+        if self.config.unified_mind.semantic_recall:
+            from .memory_semantics import archive_memories
+            from .unified_memory import annotate_experience_timeline
+            records += archive_memories(self._growth, self._resolve_growth_roots, query, limit=4)
+            records = annotate_experience_timeline(records, self._recent_growth_history(state["revision"]))
+            records = rank_records(records, query, now=time.time(), timezone=self.config.general.timezone)
         if not any(record["kind"] == "interest" for record in records):
             return records
         return annotate_interest_changes(records, self._recent_growth_history(state["revision"]))
@@ -1765,7 +1848,13 @@ class MaiLivingWorld(MaiBotPlugin):
         candidates = list({item["id"]: item for item in candidates}.values())[:12]
         if self.config.growth.review_beliefs:
             from .belief_revision import select_belief_context
-            candidates = select_belief_context(candidates, state, self._resolve_roots, limit=12)
+            query = " ".join(item.get("text", "") for item in candidates)[:1200]
+            archived = self._growth.archived(query, limit=32)
+            state["beliefs"] += [entry["item"] for entry in archived if entry["category"] == "beliefs"]
+            known = {ref["id"] for item in state["beliefs"] for ref in item["sources"]}
+            fresh = [item for item in candidates if item["id"] not in known] or candidates
+            selected = select_belief_context(fresh, state, self._resolve_roots, limit=12)
+            candidates = list({item["id"]: item for item in selected + candidates}.values())[:12]
         return candidates
 
     async def _grow(self):
@@ -2536,6 +2625,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if not runtime:
             return {"ready": False, "reason": "enable_growth_unified_mind_and_bind_owner"}
         return {"ready": True, "mode": self.config.growth.mode, **self._growth.status(),
+                "capacity": self._growth.capacity_counts(),
                 "last_status": runtime.last_status, "last_counts": runtime.last_counts}
 
     @API("living_world_growth_profile", description="仅管理员查看成长档案和来源，包含可能敏感的推断，不可公开转发", public=False)

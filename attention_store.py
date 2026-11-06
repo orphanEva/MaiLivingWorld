@@ -19,6 +19,7 @@ from .mysql_compat import MySQLCompatConnection
 from .owner import extract_sender, normalize_qq
 from .sql_logging import connect_sqlite
 from .activity_context import LOAD_STEP, load_view
+from .cognitive_workspace import INTENTS, REASONS, candidate_key, working_defaults
 
 
 def _json(value):
@@ -58,6 +59,7 @@ def _defaults(owner):
             "conversation": {"mode": "normal", "until": 0}, "latest_receipt": "",
             "engaged_until": 0, "lease_token": "", "lease_until": 0, "lease_revision": 0,
             "lease_focus": None, "lease_activity": None, "activity": {"load": 0., "at": 0.},
+            "workspace": working_defaults(), "capabilities": {},
             "last_finished": 0, "last_outcome": "",
             "budget_day": 0, "cycle_count": 0, "last_started": 0, "created": 0, "updated": 0}
 
@@ -106,15 +108,17 @@ class AttentionStore:
     def _decode(row):
         result = dict(row)
         result.update(json.loads(result.pop("payload")))
-        if "cycle_count" in result:
+        if "owner_id" in result and "cycle_count" in result:
             result.setdefault("activity", {"load": 0., "at": 0.})
             result.setdefault("lease_activity", None)
+            result.setdefault("workspace", working_defaults())
+            result.setdefault("capabilities", {})
         return result
 
     @staticmethod
     def _payload(row):
         return {key: row[key] for key in ("focus", "focus_streak", "conversation", "latest_receipt", "lease_focus",
-                                         "activity", "lease_activity")}
+                                         "activity", "lease_activity", "workspace", "capabilities")}
 
     def _read(self, sql, parameters=()):
         if isinstance(self.con, MySQLCompatConnection):
@@ -225,16 +229,18 @@ class AttentionStore:
             return False
         return self._capture_receipt(owner, receipt, seconds, now)
 
-    def capture_activity(self, message, *, owner_id, engagement_seconds=90, now=None):
+    def capture_activity(self, message, *, owner_id, engagement_seconds=90, now=None, workspace_intent=None):
         """Interrupt for trusted owner activity, without accepting it as model text."""
         owner, now = _owner(owner_id), _now(now)
         seconds = _int(engagement_seconds, 1, 3600)
+        if workspace_intent is not None and (not isinstance(workspace_intent, str) or workspace_intent not in INTENTS):
+            raise ValueError("invalid_workspace_intent")
         receipt = self._activity_receipt(message, owner)
         if receipt is None:
             return False
-        return self._capture_receipt(owner, receipt, seconds, now)
+        return self._capture_receipt(owner, receipt, seconds, now, workspace_intent)
 
-    def _capture_receipt(self, owner, receipt, seconds, now):
+    def _capture_receipt(self, owner, receipt, seconds, now, workspace_intent=None):
         with self.con:
             row = self._lock(owner, now)
             previous = self.con.execute("SELECT body_digest FROM attention_receipts WHERE id=?", (receipt[0],)).fetchone()
@@ -245,6 +251,9 @@ class AttentionStore:
             row["revision"] += 1
             row["engaged_until"] = max(row["engaged_until"], now+seconds)
             row["latest_receipt"] = receipt[0]
+            if workspace_intent is not None:
+                row["workspace"].update(receipt=receipt[0], intent=workspace_intent,
+                                        pause_reason="owner_message", updated=now)
             if row["conversation"]["mode"] == "repair":
                 row["conversation"] = {"mode": "normal", "until": 0}
             self.con.execute("INSERT INTO attention_receipts(id,owner_id,body_digest,revision,created) VALUES (?,?,?,?,?)",
@@ -275,6 +284,8 @@ class AttentionStore:
             if mode != "normal" and not now < until <= now+86400:
                 raise ValueError("invalid_expiry")
             row["conversation"] = {"mode": mode, "until": until}
+            if row["workspace"].get("receipt") == receipt[0]:
+                row["workspace"].update(intent="conversation" if mode == "normal" else mode, updated=now)
             row["revision"] += 1
             self.con.execute("UPDATE attention_receipts SET mode_hash=? WHERE id=?", (_hash(mode, until), receipt[0]))
             self._save(row, now)
@@ -313,13 +324,23 @@ class AttentionStore:
         return candidates[0]
 
     def claim(self, owner_id, *, candidates, day_start, daily_limit, interval_seconds, lease_seconds=180, now=None,
-              activity_awareness=False):
+              activity_awareness=False, integrated_workspace=False, assessment=None):
         owner, now, day = _owner(owner_id), _now(now), _now(day_start)
         limit, interval = _int(daily_limit, 0, 1000), _int(interval_seconds, 0, 86400)
         seconds = _int(lease_seconds, 1, 3600)
-        if type(activity_awareness) is not bool:
+        if type(activity_awareness) is not bool or type(integrated_workspace) is not bool:
             raise ValueError("invalid_activity_mode")
         candidates = self._candidates(candidates)
+        if assessment is not None:
+            if not isinstance(assessment, dict) or set(assessment) != {candidate_key(c) for c in candidates}:
+                raise ValueError("invalid_assessment")
+            for value in assessment.values():
+                if (not isinstance(value, dict) or set(value) != {"score", "reasons"}
+                        or type(value["score"]) not in (int, float) or not math.isfinite(value["score"])
+                        or not -10 <= value["score"] <= 10 or not isinstance(value["reasons"], list)
+                        or len(value["reasons"]) > 6 or any(not isinstance(r, str) or r not in REASONS for r in value["reasons"])):
+                    raise ValueError("invalid_assessment")
+            candidates.sort(key=lambda c: -assessment[candidate_key(c)]["score"])
         # Accept a civil day spanning a clock change; the host supplies its start.
         if day > now or now-day > 172800:
             raise ValueError("invalid_day")
@@ -349,8 +370,19 @@ class AttentionStore:
             row["lease_until"] = now+seconds
             row["lease_revision"] = row["revision"]
             row["budget_day"], row["cycle_count"], row["last_started"] = day, count+1, now
+            selection = {}
+            if assessment:
+                chosen_value = assessment[candidate_key(chosen)]
+                reasons = list(chosen_value["reasons"])
+                if chosen != candidates[0]:
+                    reasons = (reasons+["alternative"])[-6:]
+                selection = {"assessment": {"score": chosen_value["score"], "reasons": reasons}}
+            if integrated_workspace:
+                row["workspace"].update(focus=dict(chosen), pending=candidates[:8], pause_reason="",
+                    reasons=selection.get("assessment", {}).get("reasons", []), updated=now)
             self._save(row, now)
-            self._event(owner, "claim", {"focus": chosen, "revision": row["revision"], "lease_until": row["lease_until"]}, now)
+            self._event(owner, "claim", {"focus": chosen, "revision": row["revision"],
+                                        "lease_until": row["lease_until"], **selection}, now)
             return {"token": row["lease_token"], "focus": dict(chosen), "revision": row["revision"]}
 
     def start_activity(self, owner_id, token, *, proof, signature, now=None):
@@ -383,13 +415,14 @@ class AttentionStore:
         return bool(lease["token"] == token and lease["until"] > now
                     and lease["revision"] == state["revision"] and state["engaged_until"] <= now)
 
-    def finish(self, owner_id, token, *, outcome, now=None, activity_awareness=False, activity_proof=None):
+    def finish(self, owner_id, token, *, outcome, now=None, activity_awareness=False, activity_proof=None,
+               learn_capabilities=False):
         owner, now = _owner(owner_id), _now(now)
         if not isinstance(outcome, str) or outcome not in {"progress", "blocked", "interrupted", "failed"}:
             raise ValueError("invalid_outcome")
         if not isinstance(token, str) or not token:
             return False
-        if type(activity_awareness) is not bool or (activity_proof is not None and (
+        if type(activity_awareness) is not bool or type(learn_capabilities) is not bool or (activity_proof is not None and (
                 not isinstance(activity_proof, str) or not re.fullmatch(r"[0-9a-f]{64}", activity_proof))):
             raise ValueError("invalid_activity_finish")
         with self.con:
@@ -403,6 +436,18 @@ class AttentionStore:
             if outcome == "progress":
                 row["focus_streak"] = min(2, row["focus_streak"]+1)
             activity = row["lease_activity"]
+            current = (row["lease_revision"] == row["revision"] and row["lease_until"] > now
+                       and row["engaged_until"] <= now)
+            if learn_capabilities and not current:
+                outcome = "interrupted"
+            if learn_capabilities and current and activity and activity_proof and outcome != "interrupted":
+                kind = row["lease_focus"]["kind"]
+                history = row["capabilities"].get(kind, [])
+                # Completion and history share the lease transaction. A retry,
+                # competing worker or owner interruption cannot count twice.
+                row["capabilities"][kind] = (history + [{"outcome": outcome, "at": now,
+                    "focus": row["lease_focus"], "proof": activity_proof, "start_proof": activity["proof"],
+                    "signature": activity["signature"], "receipt": activity["token_hash"]}])[-24:]
             if activity_awareness and activity and outcome == "progress" and activity_proof:
                 load = load_view(row["activity"], now)
                 row["activity"] = {"load": min(1., round(load["load"]+LOAD_STEP, 8)), "at": max(load["at"], now)}

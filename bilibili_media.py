@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 from io import BytesIO
 import json
+import math
 import re
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -119,7 +121,7 @@ def _empty():
             "title": "", "description": "", "canonical_url": "", "page": 1, "subtitle_excerpt": ""}
 
 
-def _read(link):
+def _read(link, *, positions=None, timeline=False, include_audio=False):
     deadline = time.monotonic() + 17
 
     def get(url, hosts, limit, per_request=5):
@@ -177,13 +179,24 @@ def _read(link):
         return info, None
     try:
         shots = api("/x/player/videoshot", {**args, "index": 1})
-        frames = _storyboard(shots, get)
+        frames = _storyboard(shots, get, positions=positions, timeline=timeline)
+        if timeline:
+            info.update(frame_times=frames["frame_times"])
+            frames = frames["frames"]
         if frames:
             info.update(status="frames", basis="storyboard", frames=frames)
     except _BROKEN:
         pass
+    try:
+        player = api("/x/player/v2", args)
+        tracks = (player.get("subtitle") or {}).get("subtitles") if isinstance(player.get("subtitle"), dict) else []
+        info["subtitle_excerpt"] = _subtitles(tracks, get, positions=positions, timeline=timeline)
+    except _BROKEN:
+        pass
+    if info["subtitle_excerpt"] and info["status"] == "metadata":
+        info.update(basis="subtitles", status="subtitles")
     video = None
-    if not info["frames"]:
+    if not info["frames"] or include_audio and not info["subtitle_excerpt"]:
         try:
             play = api("/x/player/playurl", {**args, "qn": 16, "fnver": 0, "fnval": 1, "platform": "html5"})
             files = play.get("durl")
@@ -192,38 +205,39 @@ def _read(link):
                 video = get(_secure_url(files[0]["url"]), _CDN, _MAX_VIDEO, 8)
         except _BROKEN:
             pass
-    try:
-        player = api("/x/player/v2", args)
-        tracks = (player.get("subtitle") or {}).get("subtitles") if isinstance(player.get("subtitle"), dict) else []
-        info["subtitle_excerpt"] = _subtitles(tracks, get)
-    except _BROKEN:
-        pass
-    if info["subtitle_excerpt"] and info["status"] == "metadata":
-        info.update(basis="subtitles", status="subtitles")
     return info, video
 
 
-def _storyboard(shots, get):
+def _storyboard(shots, get, *, positions=None, timeline=False):
     from PIL import Image
     cols, rows, w, h = [shots.get(k) for k in ("img_x_len", "img_y_len", "img_x_size", "img_y_size")]
     imgs, stamps = shots.get("image"), shots.get("index")
+    empty = {"frames": [], "frame_times": []} if timeline else []
     if (any(type(n) is not int or n <= 0 for n in (cols, rows, w, h))
             or w > 640 or h > 480 or cols * rows * w * h > 8_000_000
             or not isinstance(imgs, list) or not 1 <= len(imgs) <= 512
             or not isinstance(stamps, list) or not 2 <= len(stamps) <= min(50000, cols * rows * len(imgs) + 1)):
-        return []
+        return empty
+    if (any(type(n) not in (int, float) or not math.isfinite(n) or not 0 <= n <= 86400 for n in stamps)
+            or any(a >= b for a, b in zip(stamps, stamps[1:]))):
+        return empty
     count = len(stamps) - 1
-    picks = sorted({min(count-1, count*n//6) for n in (1, 3, 5)})
+    if positions is not None:
+        from .chat_media import sample_positions
+        targets = sample_positions(stamps[-1], positions)
+        picks = sorted({bisect.bisect_right(stamps, n)-1 for n in targets if n >= stamps[0]})
+    else:
+        picks = sorted({min(count-1, count*n//6) for n in (1, 3, 5)})
     frames = []
     for sheet in sorted({n // (cols * rows) for n in picks}):
         raw = get(_secure_url(imgs[sheet]), _STILLS, 2 * 1024 * 1024)
         try:
             opened = Image.open(BytesIO(raw), formats=("JPEG", "PNG", "WEBP"))
         except Image.DecompressionBombError:
-            return []
+            return empty
         with opened as image:
             if image.size != (cols*w, rows*h):
-                return []
+                return empty
             for index in picks:
                 if index // (cols * rows) == sheet:
                     y, x = divmod(index % (cols * rows), cols)
@@ -231,10 +245,10 @@ def _storyboard(shots, get):
                         encoded = BytesIO()
                         crop.save(encoded, format="JPEG", quality=82)
                         frames.append(encoded.getvalue())
-    return frames
+    return {"frames": frames, "frame_times": [stamps[n] for n in picks]} if timeline else frames
 
 
-def _subtitles(tracks, get):
+def _subtitles(tracks, get, *, positions=None, timeline=False):
     if not isinstance(tracks, list):
         return ""
     tracks = [t for t in tracks[:32] if isinstance(t, dict) and isinstance(t.get("subtitle_url"), str) and t["subtitle_url"]]
@@ -245,21 +259,41 @@ def _subtitles(tracks, get):
     body = raw.get("body") if isinstance(raw, dict) else None
     if not isinstance(body, list):
         return ""
-    lines = [_clean(line.get("content"), 100) for line in body[:4000] if isinstance(line, dict)]
+    entries = [line for line in body[:4000] if isinstance(line, dict)]
+    if timeline:
+        timed = [line for line in entries if type(line.get("from")) in (int, float)
+                 and type(line.get("to")) in (int, float) and 0 <= line["from"] < line["to"] <= 86400]
+        if positions is not None:
+            timed = [line for line in timed if any(line["from"]-5 <= n <= line["to"]+5 for n in positions)]
+            entries = timed
+        elif timed:
+            entries = timed
+        lines = [(f"{line['from']:.1f}–{line['to']:.1f}秒 " if timed else "") + _clean(line.get("content"), 100)
+                 for line in entries if _clean(line.get("content"), 100)]
+    else:
+        lines = [_clean(line.get("content"), 100) for line in entries]
     lines = [line for line in lines if line]
     return " … ".join(lines[i] for i in sorted({0, len(lines)//2, len(lines)-1})) if lines else ""
 
 
-async def read_bilibili_link(link):
+async def read_bilibili_link(link, *, positions=None, timeline=False, include_audio=False):
     """Return only viewer evidence and its basis. Raw streams and signed URLs stay transient."""
     try:
-        info, video = await asyncio.wait_for(asyncio.to_thread(_read, link), timeout=20)
+        info, video = await asyncio.wait_for(asyncio.to_thread(
+            _read, link, positions=positions, timeline=timeline, include_audio=include_audio), timeout=20)
     except TimeoutError:
         return _empty()
-    if video:
+    if video and include_audio:
+        info["audio_bytes"] = video
+    if video and not info["frames"]:
         from .chat_media import sample_video
         try:
-            frames = await sample_video(video)
+            if timeline:
+                sampled = await sample_video(video, positions=positions, timeline=True)
+                info.update(frame_times=sampled["frame_times"])
+                frames = sampled["frames"]
+            else:
+                frames = await sample_video(video)
             if frames:
                 info.update(status="frames", basis="sampled_video", frames=frames)
         except (ValueError, OSError, RuntimeError, TimeoutError):

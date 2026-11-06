@@ -550,3 +550,86 @@ def annotate_interest_changes(records: list[dict], history: list[dict]) -> list[
                 break
         result.append(changed)
     return result
+
+
+def annotate_experience_timeline(records: list[dict], history: list[dict]) -> list[dict]:
+    """Link up to three audited learning events for each validated current conclusion.
+
+    The timeline describes stored adjustments and their reference sets. Original
+    event chronology and causal explanations still come from the underlying sources.
+    A reference-generation change stops the chain, including interest renewal.
+    """
+    categories = {"interest": "interests", "belief": "beliefs", "knowledge": "knowledge", "question": "questions"}
+    entries = [entry for entry in history[:100] if isinstance(entry, dict)
+               and entry.get("kind") == "growth" and entry.get("rolled_back") is False
+               and isinstance(entry.get("before"), dict) and isinstance(entry.get("after"), dict)
+               and type(entry.get("revision")) is int and entry["revision"] > 0
+               and type(entry.get("created")) in (int, float) and math.isfinite(entry["created"])
+               and entry["created"] >= 0]
+    entries.sort(key=lambda entry: -entry["revision"])
+    result = []
+    for record in records:
+        category = categories.get(record.get("kind"))
+        if (record.get("source") != "growth" or record.get("evidence_status") != "inferred"
+                or not category or not isinstance(record.get("sources"), list)):
+            result.append(record)
+            continue
+        expected = None
+        timeline = []
+        for entry in entries:
+            items = entry["after"].get(category, [])
+            prior = entry["before"].get(category, [])
+            if not isinstance(items, list) or not isinstance(prior, list):
+                continue
+            matches = [item for item in items[:32] if isinstance(item, dict)
+                       and record.get("id") == "growth:" + record["kind"] + ":" + str(item.get("key"))]
+            if len(matches) != 1:
+                continue
+            current = matches[0]
+            if expected is None:
+                if any(record.get(field) != current.get(field) for field in ("revision", "topic", "sources")):
+                    continue
+            elif current != expected:
+                continue
+            refs = current.get("sources")
+            if (not isinstance(refs, list) or not refs or any(ref not in record["sources"] for ref in refs)
+                    or type(current.get("revision")) is not int or current["revision"] < 1):
+                break
+            if record["kind"] == "interest":
+                weight = current.get("weight")
+                if type(weight) not in (int, float) or not math.isfinite(weight) or not -1 <= weight <= 1:
+                    break
+                summary = f"偏好强度 {weight:+.2f}"
+            else:
+                summary = current.get("text")
+                if not isinstance(summary, str) or not summary or len(summary) > 280:
+                    break
+                if record["kind"] == "question":
+                    summary = ("已解决的问题记录" if current.get("status") == "resolved" else "待探索的问题") + "“" + summary + "”"
+                else:
+                    summary = ("当时的看法" if record["kind"] == "belief" else "当时的学习结论") + "“" + summary + "”"
+            old_items = [item for item in prior[:32] if isinstance(item, dict) and item.get("key") == current.get("key")]
+            if len(old_items) > 1:
+                break
+            previous = old_items[0] if old_items else None
+            if previous == current:
+                continue
+            timeline.append({"history_revision": entry["revision"], "item_revision": current["revision"],
+                             "recorded_at": entry["created"], "summary": summary,
+                             "source_ids": [ref["id"] for ref in refs]})
+            if (len(timeline) == 3 or previous is None or not isinstance(previous.get("sources"), list)
+                    or not previous["sources"] or any(ref not in record["sources"] for ref in previous["sources"])
+                    or previous.get("revision") != current["revision"] - 1):
+                break
+            expected = previous
+        if len(timeline) < 2:
+            result.append(record)
+            continue
+        timeline.reverse()
+        text = record["text"] + "；按成长记录的先后顺序：" + " → ".join(item["summary"] for item in timeline)
+        if len(text) > MAX_TEXT_CHARS:
+            result.append(record)
+            continue
+        result.append({**record, "text": text, "experience_timeline": timeline,
+                       "sensitivity": "confidential" if _CONFIDENTIAL.search(text) else record["sensitivity"]})
+    return result

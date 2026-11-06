@@ -165,6 +165,96 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.prepare()
         self.assertEqual(len(self.runtime.store.items(OWNER)), 1)
 
+    async def test_adaptive_plan_resumes_with_new_evidence_and_stops_on_retraction(self):
+        self.bot.config.projects.adaptive_plans = True
+        row = await self.gathered()
+        first = self.runtime.store.get(OWNER, row["id"])["evidence_refs"][0]
+
+        async def generate(prompt, **options):
+            if "UNTRUSTED_PROJECT_REVIEW" in prompt:
+                return {"response": '{"supported":true}'}
+            raw = prompt.split("UNTRUSTED_PROJECT_EVIDENCE\n", 1)[1].split("\n", 1)[0]
+            record = json.loads(raw)["records"][0]
+            return {"response": json.dumps({"outcome": "insufficient", "conclusion": "现有资料只说明旅途主题。",
+                "quotes": [{"source_id": record["id"], "quote": record["text"][:80]}],
+                "next_step": {"question": "森林旅人的对话如何描写旅途？", "evidence_needed": "需要实际对话片段"}}, ensure_ascii=False)}
+
+        self.bot.ctx.llm.generate.side_effect = generate
+        self.assertTrue((await self.tick_later())["success"])
+        planned = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual((planned["status"], planned["stage"]), ("active", "gather"))
+        self.assertEqual(len(planned["plan"]["rounds"]), 1)
+        progress = self.runtime.records("森林旅人")
+        self.assertEqual(len(progress), 1)
+        self.assertIn("需要实际对话片段", progress[0]["text"])
+        self.assertEqual(progress[0]["sensitivity"], "personal")
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        self.bot.config.projects.adaptive_plans = True
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["plan"], planned["plan"])
+        followup = self.bot._ensure_tool_store().put_observation("pixiv", "novel:followup",
+            "森林旅人中的对话说明旅途中人物不断交流。", "private:"+OWNER, subject_id=OWNER)
+        self.bot._research_tools = AsyncMock(return_value={"success": True, "records": [followup]})
+        self.assertTrue((await self.tick_later())["success"])
+        reviewed = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual({ref["id"] for ref in reviewed["evidence_refs"]}, {first["id"], followup["id"]})
+        self.assertEqual(reviewed["plan"]["latest_refs"][0]["id"], followup["id"])
+        with patch.object(self.bot, "_resolve_roots", return_value={}):
+            self.assertIsNone(await self.tick_later())
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "paused")
+
+    async def test_legacy_twenty_sources_review_then_fill_remaining_capacity(self):
+        from MaiLivingWorld.projects_runtime import _ref
+        from MaiLivingWorld.mcp_runtime import day_start
+        self.bot.config.projects.adaptive_plans = True
+        row = self.runtime.prepare()
+        originals = [self.bot._tool_store.put_observation("pixiv", "legacy-project:"+str(index),
+            "森林旅人的旧资料描述了旅途线索第"+str(index)+"项。", "private:"+OWNER, subject_id=OWNER)
+            for index in range(20)]
+        claimed = self.runtime.store.claim(OWNER, [row["id"]], day_start=day_start(self.bot.config.general.timezone),
+                                          interval_seconds=300)
+        self.assertTrue(self.runtime.store.finish(OWNER, row["id"], claimed["lease_token"], claimed["revision"],
+                                                 action="gathered", evidence_refs=[_ref(record) for record in originals]))
+        seen = []
+        async def generate(prompt, **options):
+            if "UNTRUSTED_PROJECT_REVIEW" in prompt:
+                return {"response": '{"supported":true}'}
+            records = json.loads(prompt.split("UNTRUSTED_PROJECT_EVIDENCE\n", 1)[1].split("\n", 1)[0])["records"]
+            seen.append(records)
+            record = records[0]
+            return {"response": json.dumps({"outcome": "insufficient", "conclusion": "这些资料仍只提供有限的旅途线索。",
+                "quotes": [{"source_id": record["id"], "quote": record["text"]}],
+                "next_step": {"question": "还需哪些旅途正文线索？", "evidence_needed": "进一步的正文材料"}}, ensure_ascii=False)}
+        self.bot.ctx.llm.generate.side_effect = generate
+        self.assertTrue((await self.tick_later())["success"])
+        self.assertEqual(len(seen[0]), 8)
+        self.assertEqual(len(self.runtime.store.get(OWNER, row["id"])["evidence_refs"]), 20)
+        new_records = [self.bot._tool_store.put_observation("pixiv", "followup-project:"+str(index),
+            "森林旅人的新材料补充了旅途对话第"+str(index)+"项。", "private:"+OWNER, subject_id=OWNER)
+            for index in range(8)]
+        self.bot._research_tools = AsyncMock(return_value={"success": True, "records": new_records})
+        self.assertTrue((await self.tick_later())["success"])
+        full = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual(len(full["evidence_refs"]), 24)
+        self.assertEqual(len(full["plan"]["latest_refs"]), 4)
+        self.assertTrue((await self.tick_later())["success"])
+        final = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual((final["status"], final["reason"]), ("unresolved", "plan_needs_help"))
+        self.assertTrue({record["id"] for record in new_records[:4]} <= {record["id"] for record in seen[-1]})
+        self.assertEqual(len(final["plan"]["rounds"]), 2)
+
+    async def test_exception_after_owner_interrupt_keeps_project_failure_count(self):
+        row = self.runtime.prepare()
+        async def interrupted_gather(*args, **kwargs):
+            self.runtime.capture(message(mid="owner-interrupt", text="先陪我聊聊"))
+            raise RuntimeError("simulated concurrent transport failure")
+        self.runtime._gather = interrupted_gather
+        result = await self.runtime.tick(project_id=row["id"])
+        current = self.runtime.store.get(OWNER, row["id"])
+        self.assertFalse(result["success"])
+        self.assertEqual(current["reason"], "interrupted")
+        self.assertEqual(current["failures"], 0)
+
     async def test_public_question_reaches_attention_and_projects_without_pixiv(self):
         b = self.bot
         b.config.mcp_pixiv.enabled = False
