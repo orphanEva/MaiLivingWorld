@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .mcp_client import MCPError
 from .mcp_policy import CATALOG, PUBLIC_PROVIDERS, PolicyError, check_public_query, clean_result, observation, permitted, normalize_arguments, validate_arguments
+from .tool_store import PUBLIC_READ_ATTEMPT_SUMMARIES
 
 
 def digest(value) -> str:
@@ -133,6 +134,9 @@ class MCPBridge:
             return {"success": False, "code": "tool_not_permitted"}
         call = None
         sent = False
+        read_in_flight = False
+        track_public_read = autonomous_read and record_observations and (provider, tool) in {
+            ("news", "news_read"), ("news", "web_read"), ("reference", "reference_read")}
         try:
             # A failed process launch also consumes budget; malformed JSON never launches it.
             arguments = normalize_arguments(provider, tool, arguments, config)
@@ -158,7 +162,9 @@ class MCPBridge:
             if on_dispatch is not None and (not valid() or not permitted(provider, tool, config, context, owner)):
                 raise PolicyError("context_changed")
             sent = True
+            read_in_flight = True
             result = await client.call_tool(tool, args)
+            read_in_flight = False
             # Bind returned jobs to their actual origin even if the waiting audience changed.
             self._bind_tasks(provider, tool, args, result, context, task_source_signature)
             if not valid():
@@ -170,8 +176,7 @@ class MCPBridge:
                 public = provider in PUBLIC_PROVIDERS
                 saved = self.store.put_observation(provider=provider, **item, scope="public:"+provider if public else context["scope"],
                     subject_id="" if public else context["speaker_id"], sensitivity="public" if public else "personal")
-                if autonomous_read and (provider, tool) in {
-                        ("news", "news_read"), ("news", "web_read"), ("reference", "reference_read")}:
+                if track_public_read:
                     from .social_discovery import browse_receipt
                     summary = browse_receipt(saved)
             elif provider == "pixiv" and result.get("pixiv_id") == args.get("pixiv_id") and (
@@ -182,24 +187,40 @@ class MCPBridge:
                 self.store.retract_origin(provider, "work:"+kind+":"+str(args["pixiv_id"]))
                 result = {"available": False, "reason": "source_unavailable"}
             result = self._filter_task_list(provider, tool, result, context)
+            if track_public_read and saved is None:
+                summary = PUBLIC_READ_ATTEMPT_SUMMARIES["unreadable"]
             self.store.complete_call(call["id"], "succeeded", summary)
             self.last_status = "succeeded"
-            return {"success": True, "data": result, "arguments": args, "call_id": call["id"], "observation": saved}
+            response = {"success": True, "data": result, "arguments": args, "call_id": call["id"], "observation": saved}
+            if track_public_read and saved is None:
+                response["read_attempt"] = "unreadable"
+            return response
         except asyncio.CancelledError:
             if call and call["allowed"]:
                 self.store.complete_call(call["id"], "uncertain" if sent else "failed")
             raise
-        except (PolicyError, MCPError, ValueError, TypeError, RecursionError) as exc:
-            code = exc.code if isinstance(exc, MCPError) else str(exc) if isinstance(exc, PolicyError) else "invalid_tool_arguments"
+        except Exception as exc:
+            if isinstance(exc, MCPError):
+                code = exc.code
+            elif isinstance(exc, PolicyError):
+                code = str(exc)
+            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
+                code = "invalid_tool_arguments"
+            else:
+                code = "tool_failed"
+            # A completed remote response followed by a local parsing or storage
+            # error must remain retryable without blaming the selected source.
+            failed_read = (track_public_read and read_in_flight and valid()
+                           and not isinstance(exc, PolicyError)
+                           and code not in {"queue_full", "invalid_request", "closed", "sdk_unavailable", "invalid_config"})
+            summary = PUBLIC_READ_ATTEMPT_SUMMARIES["read_failed"] if failed_read else ""
             if call and call["allowed"]:
-                self.store.complete_call(call["id"], "uncertain" if sent else "failed")
+                self.store.complete_call(call["id"], "uncertain" if sent else "failed", summary)
             self.last_status = code
-            return {"success": False, "code": code}
-        except Exception:
-            if call and call["allowed"]:
-                self.store.complete_call(call["id"], "uncertain" if sent else "failed")
-            self.last_status = "tool_failed"
-            return {"success": False, "code": "tool_failed"}
+            response = {"success": False, "code": code}
+            if failed_read:
+                response.update(call_id=call["id"], read_attempt="read_failed")
+            return response
 
 
 def outward_result(result: dict) -> dict:

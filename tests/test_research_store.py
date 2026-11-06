@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from MaiLivingWorld.mcp_runtime import digest
 from MaiLivingWorld.social_discovery import browse_receipt
-from MaiLivingWorld.tool_store import ToolStore
+from MaiLivingWorld.tool_store import PUBLIC_READ_ATTEMPT_SUMMARIES, ToolStore
 from MaiLivingWorld.tests import test_tool_mysql_live as db_fixture
 
 
@@ -269,6 +269,139 @@ class ResearchStoreChecks:
                 future.result(timeout=50)
         self.assertEqual(db.new_research_candidates(OWNER, QUESTION, {URL: digest(20)}, now=21), set())
         self.assertEqual(db.new_research_candidates(OWNER, QUESTION, {URL: digest(12)}, now=21), {URL})
+
+    def attempt(self, db, *, now=10, outcome="unreadable", provider="news", tool="news_read"):
+        arguments = digest({"id": "synthetic-article", "at": now})
+        call = db.reserve_call(provider, tool, arguments, "research", "private:"+OWNER, OWNER,
+                               0, 100, now=now)
+        db.complete_call(call["id"], "succeeded" if outcome == "unreadable" else "uncertain",
+                         PUBLIC_READ_ATTEMPT_SUMMARIES[outcome], now=now+1)
+        return {"provider": provider, "tool": tool, "args_digest": arguments,
+                "call_id": call["id"], "outcome": outcome}
+
+    def test_unreadable_and_failed_attempts_survive_restart_and_expire_from_call_time(self):
+        db = self.store()
+        for index, (outcome, delay) in enumerate((("unreadable", 21600), ("read_failed", 7200))):
+            question = digest(outcome)
+            ticket = self.attempt(db, now=10+index, outcome=outcome)
+            self.assertTrue(db.mark_research_attempt(OWNER, question, URL, VERSION, **ticket, now=30))
+            before = db._read("SELECT * FROM tool_research ORDER BY question_key")
+            self.assertTrue(db.mark_research_attempt(OWNER, question, URL, VERSION, **ticket, now=40))
+            self.assertEqual(db._read("SELECT * FROM tool_research ORDER BY question_key"), before)
+            restarted = self.store()
+            self.assertEqual(restarted.research_candidate_status(OWNER, question, {URL: VERSION}, now=41),
+                             {"available": set(), "deferred": {URL}, "retrying": {}})
+            self.assertEqual(restarted.new_research_candidates(OWNER, question, {URL: VERSION}, now=41), set())
+            for stamp in (10, 11+index+delay, 100000):
+                self.assertEqual(restarted.research_candidate_status(OWNER, question, {URL: VERSION}, now=stamp),
+                                 {"available": {URL}, "deferred": set(), "retrying": {URL: 11+index} if stamp > 10 else {}})
+        self.assertEqual(db.observations(), [])
+
+    def test_retry_window_is_bound_to_owner_question_and_listing(self):
+        db = self.store()
+        ticket = self.attempt(db)
+        self.assertTrue(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **ticket, now=12))
+        for owner, question, version in ((OTHER, QUESTION, VERSION), (OWNER, digest("revised"), VERSION),
+                                         (OWNER, QUESTION, digest("new listing"))):
+            self.assertEqual(db.research_candidate_status(owner, question, {URL: version}, now=13),
+                             {"available": {URL}, "deferred": set(), "retrying": {}})
+        other_url = "https://observatory.example/next"
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: VERSION, other_url: VERSION}, now=13),
+                         {"available": {other_url}, "deferred": {URL}, "retrying": {}})
+
+    def test_attempt_requires_matching_completed_autonomous_read_receipt(self):
+        db = self.store()
+        ticket = self.attempt(db)
+        for change in ({"args_digest": digest("other arguments")}, {"provider": "reference", "tool": "reference_read"},
+                       {"tool": "web_read"}, {"outcome": "read_failed"}, {"call_id": "tool:call:"+digest("absent")}):
+            with self.subTest(change=change):
+                self.assertFalse(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **{**ticket, **change}, now=12))
+        self.assertFalse(db.mark_research_attempt(OTHER, QUESTION, URL, VERSION, **ticket, now=12))
+        for stamp in (10, 72):
+            self.assertFalse(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **ticket, now=stamp))
+        for index, (status, summary) in enumerate((("failed", PUBLIC_READ_ATTEMPT_SUMMARIES["read_failed"]),
+                ("uncertain", ""), ("succeeded", ""), ("succeeded", "untrusted source text"))):
+            args = digest(index)
+            call = db.reserve_call("news", "news_read", args, "research", "private:"+OWNER, OWNER, 0, 100, now=20)
+            db.complete_call(call["id"], status, summary, now=21)
+            outcome = "read_failed" if status in {"failed", "uncertain"} else "unreadable"
+            self.assertFalse(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION,
+                **{**ticket, "call_id": call["id"], "args_digest": args, "outcome": outcome}, now=22))
+        reserved = db.reserve_call("news", "news_read", digest("reserved"), "research", "private:"+OWNER,
+                                   OWNER, 0, 100, now=23)
+        self.assertFalse(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION,
+            **{**ticket, "call_id": reserved["id"], "args_digest": digest("reserved")}, now=24))
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: VERSION}, now=25),
+                         {"available": {URL}, "deferred": set(), "retrying": {}})
+
+    def test_attempt_input_validation_and_all_three_public_readers(self):
+        db = self.store()
+        ticket = self.attempt(db)
+        for change in ({"provider": "cap"}, {"tool": "news_search"}, {"outcome": "unknown"},
+                       {"outcome": []}, {"args_digest": "raw arguments"}, {"call_id": "invalid"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **{**ticket, **change}, now=12)
+        for index, (provider, tool) in enumerate((("news", "web_read"), ("reference", "reference_read"))):
+            ticket = self.attempt(db, now=20+index, provider=provider, tool=tool)
+            self.assertTrue(db.mark_research_attempt(OWNER, digest(tool), URL, VERSION, **ticket, now=25))
+            self.assertEqual(db.research_candidate_status(OWNER, digest(tool), {URL: VERSION}, now=26)["deferred"], {URL})
+
+    def test_concurrent_attempts_keep_latest_receipt_and_success_replaces_cooldown(self):
+        db = self.store()
+        tickets = [self.attempt(db, now=stamp) for stamp in (10, 20)]
+        barrier = threading.Barrier(2)
+        def mark(index):
+            connection = self.store()
+            try:
+                barrier.wait(timeout=30)
+                return connection.mark_research_attempt(OWNER, QUESTION, URL, digest(index), **tickets[index], now=30)
+            finally:
+                self.stores.remove(connection)
+                connection.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(mark, index) for index in range(2)]
+            self.assertTrue(all(future.result(timeout=50) for future in futures))
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: digest(1)}, now=31)["deferred"], {URL})
+        self.assertEqual(db.new_research_candidates(OWNER, QUESTION, {URL: digest(0)}, now=31), {URL})
+        record, call = self.read(db, now=32)
+        self.assertTrue(db.mark_research_read(OWNER, QUESTION, URL, VERSION, record, call_id=call, now=34))
+        self.assertTrue(db.mark_research_attempt(OWNER, QUESTION, URL, digest(1), **tickets[1], now=35))
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: VERSION}, now=36),
+                         {"available": set(), "deferred": set(), "retrying": {}})
+        rows = db._read("SELECT next_attempt FROM tool_research WHERE question_key LIKE ?", ("__tool_research_read__:%",))
+        self.assertEqual([row["next_attempt"] for row in rows], [0])
+
+    def test_attempt_write_failure_rolls_back_and_allows_retry(self):
+        db = self.store()
+        ticket = self.attempt(db)
+        with patch.object(db, "_prune_research_markers", side_effect=RuntimeError("synthetic prune failure")):
+            with self.assertRaisesRegex(RuntimeError, "synthetic prune failure"):
+                db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **ticket, now=12)
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: VERSION}, now=13),
+                         {"available": {URL}, "deferred": set(), "retrying": {}})
+        self.assertTrue(db.mark_research_attempt(OWNER, QUESTION, URL, VERSION, **ticket, now=14))
+        self.assertEqual(db.research_candidate_status(OWNER, QUESTION, {URL: VERSION}, now=15)["deferred"], {URL})
+
+    def test_success_and_attempt_markers_share_one_bounded_reserved_namespace(self):
+        db = self.store()
+        record, call = self.read(db)
+        ticket = self.attempt(db, now=11)
+        for index in range(258):
+            question = digest(index)
+            if index % 2:
+                self.assertTrue(db.mark_research_attempt(OWNER, question, URL, VERSION, **ticket, now=13))
+            else:
+                self.assertTrue(db.mark_research_read(OWNER, question, URL, VERSION, record, call_id=call, now=13))
+        rows = db._read("SELECT question_key,status,lease_token FROM tool_research WHERE question_key>=? AND question_key<?",
+                       ("__tool_research_read__:", "__tool_research_read__:~"))
+        self.assertEqual(len(rows), 256)
+        self.assertTrue(any(row["status"].startswith("unreadable:") for row in rows))
+        self.assertTrue(any(not row["status"].startswith("unreadable:") for row in rows))
+        self.assertTrue(all(len(row[field]) <= 191 for row in rows for field in row))
+        with self.assertRaises(ValueError):
+            self.claim(db, 14, key=rows[0]["question_key"])
+        with self.assertRaises(ValueError):
+            db.next_local_question([rows[0]["question_key"]])
 
 
 class ResearchSQLiteTests(ResearchStoreChecks, unittest.TestCase):

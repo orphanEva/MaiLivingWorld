@@ -59,15 +59,20 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
     searches = [("news", "web_search" if web else "news_search"), ("reference", "reference_search")]
     original_urls = {record["url"] for record in checked["records"]}
     row = None
+    retry_candidate = None
     complete_searches = True
     for provider, search in searches:
         found = await call(provider, search, {"query": topic, "limit": 3})
-        if not found.get("success") or not valid():
+        if not valid():
             return {"success": False, "records": []}
         data = found.get("data")
         rows = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return {"success": False, "records": []}
+        if not found.get("success") or not isinstance(rows, list):
+            if retry_candidate is None:
+                return {"success": False, "records": []}
+            break
+        if "unavailable_sources" in data and data["unavailable_sources"] != []:
+            complete_searches = False
         candidates = []
         seen = set(original_urls)
         for item in rows[:3]:
@@ -85,11 +90,25 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
             # Search-service handles are ephemeral. Use the public page and listing
             # version so restarting the service does not reread the same result.
             candidates.append((item, url, digest([provider, *fields])))
-        unread = store.new_research_candidates(owner, question_digest, {url: version for _, url, version in candidates})
-        selected = next((item for item in candidates if item[1] in unread), None)
+        status = store.research_candidate_status(owner, question_digest,
+                                                 {url: version for _, url, version in candidates})
+        if status["deferred"]:
+            complete_searches = False
+        available = [item for item in candidates if item[1] in status["available"]]
+        selected = next((item for item in available if item[1] not in status["retrying"]), None)
         row = selected[0] if selected else None
         if row is not None:
             break
+        # Give fresh results from the next provider a chance before retrying a
+        # page that has already failed. Once all have been tried, rotate oldest first.
+        retry = min(available, key=lambda item: status["retrying"][item[1]], default=None)
+        if retry is not None:
+            attempted_at = status["retrying"][retry[1]]
+            if retry_candidate is None or attempted_at < retry_candidate[0]:
+                retry_candidate = (attempted_at, provider, retry)
+    if row is None and retry_candidate is not None:
+        _, provider, selected = retry_candidate
+        row = selected[0]
     if row is None:
         result = {"success": True, "records": []}
         if complete_searches:
@@ -100,7 +119,13 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
     else:
         tool, args = ("web_read" if web else "news_read"), {"id": row.get("id")}
     detail = await call(provider, tool, args)
-    if not valid() or not detail.get("success"):
+    if not valid():
+        return {"success": False, "records": []}
+    attempt = detail.get("read_attempt")
+    if attempt in {"unreadable", "read_failed"}:
+        store.mark_research_attempt(owner, question_digest, selected[1], selected[2],
+            provider=provider, tool=tool, args_digest=digest(args), call_id=detail["call_id"], outcome=attempt)
+    if not detail.get("success"):
         return {"success": False, "records": []}
     record = detail.get("observation")
     if not record or not _public_source_url(record):

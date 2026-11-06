@@ -23,6 +23,9 @@ _CONTROL = "__tool_control__"
 _LOCAL = "__tool_local__"
 _SOCIAL = "__tool_social__:"
 _RESEARCH_READ = "__tool_research_read__:"
+PUBLIC_READ_ATTEMPT_SUMMARIES = {"unreadable": "public_read_unavailable:v1",
+                                 "read_failed": "public_read_failed:v1"}
+_PUBLIC_READ_RETRY_SECONDS = {"unreadable": 21600, "read_failed": 7200}
 _SOCIAL_HELP = frozenset({"social_setup_required", "social_auth_failed", "social_permission_required",
                          "social_search_key_required", "social_reply_uncertain"})
 _RANK = {"public": 0, "personal": 1, "unknown": 2, "confidential": 3}
@@ -570,6 +573,10 @@ class ToolStore:
 
     def new_research_candidates(self, owner, question_digest, candidates, now=None):
         """Skip recently enqueued versions for this exact question, preserving alternative sources."""
+        return self.research_candidate_status(owner, question_digest, candidates, now)["available"]
+
+    def research_candidate_status(self, owner, question_digest, candidates, now=None):
+        """Distinguish considered material from temporarily unreadable candidates."""
         from .growth_store import source_fingerprint
         from .unified_expression import _public_source_url
         _social_article_inputs(owner, candidates)
@@ -577,23 +584,69 @@ class ToolStore:
         if len(candidates) > 3:
             raise ValueError("invalid_research_candidates")
         if not candidates:
-            return set()
+            return {"available": set(), "deferred": set(), "retrying": {}}
         stamp = _now(now)
         prefix = _RESEARCH_READ + _digest(owner, question_digest) + ":"
         slots = {prefix + _digest(url): url for url in candidates}
         marks = ",".join("?" for _ in slots)
-        rows = self._read("SELECT question_key,status,lease_token,updated FROM tool_research "
-                          "WHERE question_key IN (" + marks + ") AND updated>? AND updated<=?",
-                          (*slots, stamp-86400, stamp))
-        records = {r["id"]: r for r in self.resolve([row["lease_token"] for row in rows])}
-        blocked = set()
+        rows = self._read("SELECT question_key,status,lease_token,updated,next_attempt FROM tool_research "
+                          "WHERE question_key IN (" + marks + ") AND updated<=?", (*slots, stamp))
+        records = {r["id"]: r for r in self.resolve([row["lease_token"] for row in rows
+                                                    if row["updated"] > stamp-86400
+                                                    and re.fullmatch(r"[0-9a-f]{64}", row["status"])])}
+        blocked, deferred, retrying = set(), set(), {}
         for row in rows:
             url = slots[row["question_key"]]
+            for outcome, delay in _PUBLIC_READ_RETRY_SECONDS.items():
+                if (row["status"] == outcome + ":" + candidates[url]
+                        and row["updated"] < row["next_attempt"] <= row["updated"] + delay):
+                    if stamp < row["next_attempt"]:
+                        deferred.add(url)
+                    else:
+                        retrying[url] = row["updated"]
             record = records.get(row["lease_token"])
             if (record and _public_source_url(record) == url
                     and row["status"] == _digest(candidates[url], source_fingerprint(record))):
                 blocked.add(url)
-        return set(candidates) - blocked
+        return {"available": set(candidates) - blocked - deferred, "deferred": deferred, "retrying": retrying}
+
+    def mark_research_attempt(self, owner, question_digest, url, version, *, provider, tool,
+                              args_digest, call_id, outcome, now=None):
+        """Keep a short retry window only for a verified autonomous read receipt."""
+        _social_article_inputs(owner, {url: version})
+        _social_digest(question_digest)
+        _social_digest(args_digest)
+        if ((provider, tool) not in (("news", "news_read"), ("news", "web_read"), ("reference", "reference_read"))
+                or not isinstance(outcome, str) or outcome not in PUBLIC_READ_ATTEMPT_SUMMARIES):
+            raise ValueError("invalid_research_attempt")
+        if not isinstance(call_id, str) or not re.fullmatch(r"tool:call:[0-9a-f]{64}", call_id):
+            raise ValueError("invalid_call")
+        stamp = _now(now)
+        status = "succeeded" if outcome == "unreadable" else "uncertain"
+        slot = _RESEARCH_READ + _digest(owner, question_digest) + ":" + _digest(url)
+        with self.con:
+            self._lock()
+            call = self.con.execute("SELECT payload,updated FROM tool_calls WHERE id=? AND status=? "
+                                    "AND scope=? AND subject_id=? AND provider=? AND tool=? AND args_digest=? "
+                                    "AND updated BETWEEN ? AND ?",
+                                    (call_id, status, "private:"+owner, owner, provider, tool, args_digest,
+                                     stamp-60, stamp)).fetchone()
+            if call is None:
+                return False
+            try:
+                payload = json.loads(call["payload"])
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(payload, dict) or payload.get("summary") != PUBLIC_READ_ATTEMPT_SUMMARIES[outcome]:
+                return False
+            completed = call["updated"]
+            self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+            self.con.execute("UPDATE tool_research SET status=?,lease_token=?,updated=?,next_attempt=? "
+                             "WHERE question_key=? AND updated<=?",
+                             (outcome+":"+version, call_id, completed,
+                              completed+_PUBLIC_READ_RETRY_SECONDS[outcome], slot, completed))
+            self._prune_research_markers()
+        return True
 
     def mark_research_read(self, owner, question_digest, url, version, record, *, call_id, now=None):
         """Called after durable growth enqueue; retain at most 256 source-version markers."""
@@ -629,14 +682,17 @@ class ToolStore:
         with self.con:
             self._lock()
             self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
-            self.con.execute("UPDATE tool_research SET status=?,lease_token=?,updated=? "
+            self.con.execute("UPDATE tool_research SET status=?,lease_token=?,updated=?,next_attempt=0 "
                              "WHERE question_key=? AND updated<=?", (version, record["id"], stamp, slot, stamp))
-            oldest = self.con.execute("SELECT question_key FROM tool_research WHERE question_key>=? AND question_key<? "
-                                      "ORDER BY updated DESC,question_key DESC LIMIT 1 OFFSET 256",
-                                      (_RESEARCH_READ, _RESEARCH_READ + "~")).fetchone()
-            if oldest:
-                self.con.execute("DELETE FROM tool_research WHERE question_key=?", (oldest["question_key"],))
+            self._prune_research_markers()
         return True
+
+    def _prune_research_markers(self):
+        oldest = self.con.execute("SELECT question_key FROM tool_research WHERE question_key>=? AND question_key<? "
+                                  "ORDER BY updated DESC,question_key DESC LIMIT 1 OFFSET 256",
+                                  (_RESEARCH_READ, _RESEARCH_READ + "~")).fetchone()
+        if oldest:
+            self.con.execute("DELETE FROM tool_research WHERE question_key=?", (oldest["question_key"],))
 
     def status(self):
         # Dedicated reads are side-effect free even on a new empty database.

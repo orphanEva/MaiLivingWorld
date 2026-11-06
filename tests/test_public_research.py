@@ -1,4 +1,5 @@
 """Public questions reuse the real research quota, source ledger and growth review."""
+import asyncio
 import copy
 from contextlib import ExitStack
 from datetime import datetime
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from MaiLivingWorld.growth_model import empty_growth, MAX_RECORDS
 from MaiLivingWorld.growth_store import source_fingerprint
+from MaiLivingWorld.mcp_client import MCPError
 from MaiLivingWorld.mcp_policy import observation
 from MaiLivingWorld.mcp_runtime import digest
 from MaiLivingWorld.public_research import public_question
@@ -92,6 +94,10 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
     def research_row(self):
         key = self.bot._growth_snapshot()["questions"][0]["key"]
         return self.bot._tool_store._read("SELECT * FROM tool_research WHERE question_key=?", (key,))[0]
+
+    def retry_rows(self):
+        return self.bot._tool_store._read(
+            "SELECT * FROM tool_research WHERE status LIKE 'unreadable:%' OR status LIKE 'read_failed:%'")
 
     def clock(self, stamp):
         day = datetime.fromtimestamp(stamp, ZoneInfo(self.bot.config.general.timezone)).replace(
@@ -209,6 +215,206 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._research_tools()
         self.assertEqual(self.calls()[-1][0], "news_read")
 
+    async def test_empty_news_body_gives_way_to_another_candidate_after_restart(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"},
+                        {"id": "un:2026:11:1143148", "url": "https://news.un.org/zh/story/2026/11/1143148"}]
+        async def unreadable(name, arguments):
+            if name == "news_read" and arguments["id"] == self.results[0]["id"]:
+                return {**self.results[0], "text": "", "basis": "unavailable"}
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = unreadable
+        stamp = time.time()
+        with self.clock(stamp):
+            first = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(first, {"success": True, "records": []})
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(len(self.retry_rows()), 1)
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+        self.assertEqual(self.bot._tool_store.recent_social_reads(OWNER), [])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            second = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(second["records"][0]["url"], self.results[1]["url"])
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "news_read"])
+        self.assertEqual(self.calls()[-1][1], {"id": self.results[1]["id"]})
+        self.bot.ctx.llm.generate.assert_not_awaited()
+
+    async def test_failed_web_read_rotates_despite_new_handle_then_retries_after_two_hours(self):
+        os.environ["MLW_BRAVE_SEARCH_KEY"] = "fixture-secret-key"
+        self.results = [{"id": "web_first", "url": "https://observatory.example/first", "title": "观测资料"},
+                        {"id": "web_second", "url": "https://observatory.example/second", "title": "另一份资料"}]
+        async def failed(name, arguments):
+            if name == "web_read" and arguments["id"] == self.results[0]["id"]:
+                raise MCPError("tool_error")
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = failed
+        stamp = time.time()
+        with self.clock(stamp):
+            self.assertFalse(await self.bot._research_tools())
+        self.assertEqual(len(self.retry_rows()), 1)
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+        self.results[0]["id"] = "web_restarted_handle"
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            second = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(second["records"][0]["url"], self.results[1]["url"])
+        self.assertEqual(self.calls()[-1], ("web_read", {"id": "web_second"}))
+        async def recovered(name, arguments):
+            return {"items": []} if name == "reference_search" else await self.respond(name, arguments)
+        self.client.call_tool.side_effect = recovered
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+7200):
+            retried = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(retried["records"][0]["url"], self.results[0]["url"])
+        self.assertEqual(self.calls()[-1], ("web_read", {"id": "web_restarted_handle"}))
+        self.assertEqual([name for name, _ in self.calls()], ["web_search", "reference_search", "web_read"])
+        self.assertEqual(self.retry_rows(), [])
+
+    async def test_changed_listing_retries_an_unreadable_candidate_before_expiry(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147",
+                         "title": "旧标题"}]
+        async def unreadable(name, arguments):
+            return {} if name == "news_read" else await self.respond(name, arguments)
+        self.client.call_tool.side_effect = unreadable
+        stamp = time.time()
+        with self.clock(stamp):
+            await self.bot._research_tools()
+        self.results[0]["title"] = "补充正文后的标题"
+        self.client.call_tool.side_effect = self.respond
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["url"], self.results[0]["url"])
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "news_read"])
+
+    async def test_failed_reference_read_gives_way_to_another_page(self):
+        pages = [{"page_id": 42, "language": "zh", "url": REFERENCE["url"]},
+                 {"page_id": 43, "language": "zh", "url": "https://zh.wikipedia.org/wiki/Telescope"}]
+        async def reference(name, arguments):
+            if name == "reference_search":
+                return {"items": pages}
+            if name == "reference_read":
+                if arguments["page_id"] == 42:
+                    raise MCPError("tool_error")
+                return {**REFERENCE, **pages[1], "text": "望远镜的分辨率受口径影响。"}
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = reference
+        stamp = time.time()
+        with self.clock(stamp):
+            self.assertFalse(await self.bot._research_tools())
+        self.assertEqual(len(self.calls()), 3)
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["url"], pages[1]["url"])
+        self.assertEqual(self.calls()[-1], ("reference_read", {"page_id": 43, "language": "zh"}))
+        self.assertEqual(len(self.calls()), 3)
+
+    async def test_repeated_failures_try_every_source_before_rotating_oldest_retry(self):
+        self.results = [{"id": f"un:2026:11:114314{index}",
+                         "url": f"https://news.un.org/zh/story/2026/11/114314{index}"}
+                        for index in (7, 8, 9)]
+        async def failed(name, arguments):
+            if name.endswith("_read"):
+                raise MCPError("tool_error")
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = failed
+        stamp = time.time()
+        attempts = ((0, "news_read", {"id": self.results[0]["id"]}),
+                    (3600, "news_read", {"id": self.results[1]["id"]}),
+                    (10800, "news_read", {"id": self.results[2]["id"]}),
+                    (25200, "reference_read", {"page_id": 42, "language": "zh"}),
+                    (54000, "news_read", {"id": self.results[0]["id"]}),
+                    (111600, "news_read", {"id": self.results[1]["id"]}),
+                    (226800, "news_read", {"id": self.results[2]["id"]}))
+        for offset, tool, args in attempts:
+            with self.subTest(offset=offset):
+                self.client.call_tool.reset_mock()
+                with self.clock(stamp+offset):
+                    self.assertFalse(await self.bot._research_tools())
+                self.assertEqual(self.calls()[-1], (tool, args))
+                self.assertLessEqual(len(self.calls()), 3)
+                self.assertEqual(sum(name.endswith("_read") for name, _ in self.calls()), 1)
+        self.assertEqual(self.research_row()["failures"], len(attempts))
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+
+    async def test_ready_retry_survives_a_later_search_failure(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"}]
+        async def failed_read(name, arguments):
+            if name == "news_read":
+                raise MCPError("tool_error")
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = failed_read
+        stamp = time.time()
+        with self.clock(stamp):
+            self.assertFalse(await self.bot._research_tools())
+        async def failed_search(name, arguments):
+            if name == "reference_search":
+                raise MCPError("tool_error")
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = failed_search
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+7200):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["url"], self.results[0]["url"])
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "reference_search", "news_read"])
+        self.assertEqual(self.retry_rows(), [])
+
+    async def test_all_unreadable_candidates_wait_without_counting_empty_research_then_retry(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"}]
+        async def unreadable(name, arguments):
+            return {} if name.endswith("_read") else await self.respond(name, arguments)
+        self.client.call_tool.side_effect = unreadable
+        stamp = time.time()
+        for offset, expected in ((0, ["news_search", "news_read"]),
+                                 (3600, ["news_search", "reference_search", "reference_read"]),
+                                 (7200, ["news_search", "reference_search"]),
+                                 (21600, ["news_search", "reference_search", "news_read"])):
+            with self.subTest(offset=offset):
+                self.client.call_tool.reset_mock()
+                with self.clock(stamp+offset):
+                    self.assertEqual(await self.bot._research_tools(with_evidence=True),
+                                     {"success": True, "records": []})
+                self.assertEqual([name for name, _ in self.calls()], expected)
+                row = self.research_row()
+                self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("succeeded", 0, 0))
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+        self.assertEqual(self.bot._growth_snapshot()["questions"][0]["status"], "open")
+
+    async def test_read_budget_refusal_does_not_cool_down_the_candidate(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"}]
+        self.bot.config.mcp.max_daily_calls = 1
+        stamp = time.time()
+        with self.clock(stamp):
+            self.assertFalse(await self.bot._research_tools())
+        self.assertEqual([name for name, _ in self.calls()], ["news_search"])
+        self.assertEqual(self.retry_rows(), [])
+        self.bot.config.mcp.max_daily_calls = 20
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["url"], self.results[0]["url"])
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "news_read"])
+
+    async def test_cancelled_read_does_not_cool_down_the_candidate(self):
+        self.results = [{"id": "un:2026:11:1143147", "url": "https://news.un.org/zh/story/2026/11/1143147"}]
+        async def cancelled(name, arguments):
+            if name == "news_read":
+                raise asyncio.CancelledError()
+            return await self.respond(name, arguments)
+        self.client.call_tool.side_effect = cancelled
+        stamp = time.time()
+        with self.clock(stamp), self.assertRaises(asyncio.CancelledError):
+            await self.bot._research_tools()
+        self.assertEqual(self.retry_rows(), [])
+        self.client.call_tool.side_effect = self.respond
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3600):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result["records"][0]["url"], self.results[0]["url"])
+
     async def test_web_handle_change_keeps_read_progress_then_falls_back_to_reference(self):
         os.environ["MLW_BRAVE_SEARCH_KEY"] = "fixture-secret-key"
         self.results = [{"id": "web_original", "url": "https://public.example/new", "title": "观测记录"}]
@@ -277,6 +483,7 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"success": False, "records": []})
         self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
         self.assertEqual(len(self.bot._tool_store.observations()), 1)
+        self.assertEqual(self.retry_rows(), [])
 
     async def test_empty_wikipedia_result_is_not_evidence(self):
         async def empty(name, arguments):
@@ -374,6 +581,15 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.bot._research_tools())
         row = self.research_row()
         self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("succeeded", 0, 0))
+
+    async def test_partial_search_coverage_does_not_accumulate_empty_rounds(self):
+        async def partial(name, arguments):
+            return {"items": [], "unavailable_sources": ["un"] if name == "news_search" else []}
+        self.client.call_tool.side_effect = partial
+        self.assertTrue(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("succeeded", 0, 0))
+        self.assertEqual([name for name, _ in self.calls()], ["news_search", "reference_search"])
 
     async def test_missing_search_items_do_not_count_as_an_empty_search(self):
         self.client.call_tool.side_effect = None

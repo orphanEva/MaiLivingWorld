@@ -163,6 +163,46 @@ def assert_belief_revision_restore(case, store, expected):
     case.assertEqual(store.status()["consumed"], 1)
 
 
+def seed_research_attempts(store):
+    from MaiLivingWorld.mcp_runtime import digest
+    owner, question = "12345678", digest("backup research question")
+    cases = [
+        ("news_read", {"id": "ithome:875123"}, "https://www.ithome.com/0/875/123.htm",
+         "unreadable", "succeeded", "public_read_unavailable:v1", 21600),
+        ("web_read", {"id": "web_"+"a"*32}, "https://public.example/research",
+         "read_failed", "uncertain", "public_read_failed:v1", 7200),
+    ]
+    expected = {"owner": owner, "question": question, "candidates": {}, "deadlines": {}}
+    for tool, arguments, url, outcome, status, summary, delay in cases:
+        version = digest([tool, "listing"])
+        call = store.reserve_call("news", tool, digest(arguments), "backup-"+tool,
+                                  "private:"+owner, owner, 0, 100, now=100)
+        store.complete_call(call["id"], status, summary, now=101)
+        assert store.mark_research_attempt(owner, question, url, version, provider="news", tool=tool,
+            args_digest=digest(arguments), call_id=call["id"], outcome=outcome, now=102)
+        expected["candidates"][url] = version
+        expected["deadlines"][url] = 101+delay
+    expected["rows"] = {table: store._read("SELECT * FROM "+table+" ORDER BY "+key)
+                        for table, key in (("tool_calls", "id"), ("tool_research", "question_key"))}
+    return expected
+
+
+def assert_research_attempts_restore(case, store, expected):
+    from MaiLivingWorld.mcp_runtime import digest
+    for table, rows in expected["rows"].items():
+        key = "id" if table == "tool_calls" else "question_key"
+        case.assertEqual(store._read("SELECT * FROM "+table+" ORDER BY "+key), rows)
+    options = (expected["owner"], expected["question"], expected["candidates"])
+    case.assertEqual(store.research_candidate_status(*options, now=103),
+                     {"available": set(), "deferred": set(expected["candidates"]), "retrying": {}})
+    for url, deadline in expected["deadlines"].items():
+        version = expected["candidates"][url]
+        case.assertEqual(store.new_research_candidates(*options[:2], {url: version}, now=deadline), {url})
+        case.assertEqual(store.new_research_candidates(*options[:2], {url: digest("new listing")}, now=103), {url})
+    case.assertEqual(store.new_research_candidates(expected["owner"], digest("new question"),
+        expected["candidates"], now=103), set(expected["candidates"]))
+
+
 def seed_long_interest(growth, tools):
     from MaiLivingWorld.growth_store import MAX_INTEREST_SOURCES
     roots = [tools.put_observation("news", f"interest-backup-{index:03d}",
@@ -839,7 +879,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.37")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.38")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -868,6 +908,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V36_LEDGERS, backup.V35_LEDGERS)
         self.assertEqual(backup.V37_LEDGERS, backup.V36_LEDGERS)
         self.assertIsNot(backup.V37_LEDGERS, backup.V36_LEDGERS)
+        self.assertEqual(backup.V38_LEDGERS, backup.V37_LEDGERS)
+        self.assertIsNot(backup.V38_LEDGERS, backup.V37_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -888,7 +930,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37", "v0.38"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1290,6 +1332,13 @@ class SQLiteBackupTests(unittest.TestCase):
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (21, []))
 
+    def test_v37_archive_restores_with_the_current_schema(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.37")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.37", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
     def test_long_interest_and_original_tool_material_survive_restore_and_retraction(self):
         from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.tool_store import ToolStore
@@ -1297,6 +1346,7 @@ class SQLiteBackupTests(unittest.TestCase):
         stores = [cls(self.source/(name+".sqlite3")) for name, cls in classes]
         try:
             expected = seed_long_interest(*stores)
+            attempts = seed_research_attempts(stores[1])
         finally:
             for store in stores:
                 store.close()
@@ -1304,6 +1354,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.restore_now()
         stores = [cls(self.target/(name+".sqlite3")) for name, cls in classes]
         try:
+            assert_research_attempts_restore(self, stores[1], attempts)
             assert_long_interest_restore(self, *stores, expected)
         finally:
             for store in stores:
@@ -1420,7 +1471,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.37")
+        self.assertEqual(current["catalog"], "v0.38")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1875,7 +1926,7 @@ class MySQLBackupTests(unittest.TestCase):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
         current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36"):
+        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35", "v0.36", "v0.37"):
             with self.subTest(catalog=catalog):
                 archive = Path(self.temp.name)/(catalog+".zip")
                 with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
@@ -1946,11 +1997,12 @@ class BackupMySQLLiveTests(unittest.TestCase):
                 stores = [cls(directory/(name+".sqlite3"), mysql_settings=settings) for name, cls in classes]
                 try:
                     expected = seed_long_interest(*stores)
+                    attempts = seed_research_attempts(stores[1])
                 finally:
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.37")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.38")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v35_backup_"+table+"`")
@@ -1959,6 +2011,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                 self.assertEqual(result["tables"], 82)
                 stores = [cls(directory/(name+".sqlite3"), mysql_settings=settings) for name, cls in classes]
                 try:
+                    assert_research_attempts_restore(self, stores[1], attempts)
                     assert_long_interest_restore(self, *stores, expected)
                 finally:
                     for store in stores:
@@ -2000,7 +2053,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.37")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.38")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

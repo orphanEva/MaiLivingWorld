@@ -13,7 +13,7 @@ from unittest.mock import patch
 from MaiLivingWorld.mcp_client import MCPError
 from MaiLivingWorld.mcp_policy import CATALOG, GROUP_READS, PolicyError, clean_result, permitted, validate_arguments
 from MaiLivingWorld.mcp_runtime import MCPBridge, outward_result
-from MaiLivingWorld.tool_store import ToolStore
+from MaiLivingWorld.tool_store import PUBLIC_READ_ATTEMPT_SUMMARIES, ToolStore
 
 
 OWNER = "12345678"
@@ -51,6 +51,9 @@ SCHEMAS = {
 SCHEMAS.update({name: schema({"task_id": STRING}, ["task_id"])
                 for name in ("jm_get_download_status", "jm_retry_task")})
 SCHEMAS.update({
+    "news_read": schema({"id": STRING}, ["id"]),
+    "web_read": schema({"id": STRING}, ["id"]),
+    "reference_read": schema({"page_id": INTEGER, "language": STRING}, ["page_id"]),
     "jm_receive_pdf": schema({"download_url": STRING}, ["download_url"]),
     "jm_list_tasks": schema({"limit": INTEGER, "state": {"type": ["string", "null"]}}),
     "get_library_work": schema(WORK, WORK),
@@ -191,6 +194,132 @@ class MCPBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.store = ToolStore(self.path)
         self.bridge = MCPBridge(self.store)
+
+    def last_call(self):
+        return self.store._read("SELECT * FROM tool_calls ORDER BY created DESC,id DESC LIMIT 1")[0]
+
+    async def test_unavailable_autonomous_public_read_has_durable_attempt_receipt(self):
+        for provider, tool, args in (("news", "news_read", {"id": "ithome:0:875:123"}),
+                                     ("news", "web_read", {"id": "web-example"}),
+                                     ("reference", "reference_read", {"page_id": 42})):
+            with self.subTest(tool=tool):
+                self.next_message()
+                result = await self.execute(provider, tool, args, autonomous_read=True)
+                self.assertTrue(result["success"])
+                self.assertIsNone(result["observation"])
+                self.assertEqual(result["read_attempt"], "unreadable")
+                self.restart()
+                row = self.last_call()
+                self.assertEqual((row["id"], row["status"]), (result["call_id"], "succeeded"))
+                self.assertEqual(json.loads(row["payload"])["summary"], PUBLIC_READ_ATTEMPT_SUMMARIES["unreadable"])
+        self.assertEqual(self.store.observations(), [])
+
+    async def test_successful_autonomous_public_read_keeps_original_browse_receipt(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        self.client.response = {"id": "ithome:0:875:123", "url": "https://www.ithome.com/0/875/123.htm",
+            "source": "IT之家", "title": "望远镜观测", "text": "比较两组照片中的星云轮廓。", "basis": "article"}
+        result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+        self.assertTrue(result["success"])
+        self.assertNotIn("read_attempt", result)
+        self.assertEqual(json.loads(self.last_call()["payload"])["summary"], browse_receipt(result["observation"]))
+
+    async def test_remote_public_read_failure_records_attempt_without_replaying(self):
+        for error, code in ((MCPError("tool_error"), "tool_error"), (MCPError("timeout"), "timeout"),
+                            (MCPError("disconnected"), "disconnected"), (RuntimeError("remote failure"), "tool_failed")):
+            with self.subTest(code=code):
+                self.next_message()
+                self.client.error = error
+                result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+                self.assertEqual(result["code"], code)
+                self.assertFalse(result["success"])
+                self.assertEqual(result["read_attempt"], "read_failed")
+                row = self.last_call()
+                self.assertEqual((row["id"], row["status"]), (result["call_id"], "uncertain"))
+                self.assertEqual(json.loads(row["payload"])["summary"], PUBLIC_READ_ATTEMPT_SUMMARIES["read_failed"])
+                before = len(self.client.calls)
+                replay = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+                self.assertEqual(replay["code"], "uncertain")
+                self.assertNotIn("read_attempt", replay)
+                self.assertEqual(len(self.client.calls), before)
+
+    async def test_client_rejection_and_policy_error_have_no_source_failure_marker(self):
+        for error in (*[MCPError(code) for code in ("queue_full", "invalid_request", "closed", "sdk_unavailable", "invalid_config")],
+                      PolicyError("context_changed")):
+            with self.subTest(error=str(error)):
+                self.next_message()
+                self.client.error = error
+                result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+                self.assertNotIn("read_attempt", result)
+                self.assertNotIn("call_id", result)
+                self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
+
+    async def test_public_read_preflight_and_budget_rejections_do_not_mark_candidates(self):
+        async def unavailable():
+            raise MCPError("timeout")
+        self.client.on_list = unavailable
+        result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+        self.assertNotIn("read_attempt", result)
+        self.assertEqual(self.last_call()["status"], "failed")
+        self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
+        self.client.on_list = None
+        self.next_message()
+        result = await self.execute("news", "news_read", {"id": 12}, autonomous_read=True)
+        self.assertEqual(result["code"], "invalid_tool_arguments")
+        self.assertNotIn("read_attempt", result)
+        self.next_message()
+        result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True,
+                                    on_dispatch=lambda: False)
+        self.assertEqual(result["code"], "context_changed")
+        self.assertNotIn("read_attempt", result)
+        self.next_message()
+        self.config.max_daily_calls = 0
+        result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+        self.assertEqual(result["code"], "budget_exhausted")
+        self.assertNotIn("read_attempt", result)
+        self.assertEqual(self.client.calls, [])
+
+    async def test_cancelled_or_invalidated_public_read_has_no_attempt_marker(self):
+        self.client.error = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+        self.assertEqual(self.last_call()["status"], "uncertain")
+        self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
+        self.next_message()
+        live = [True]
+        async def invalidate():
+            live[0] = False
+        self.client.on_call = invalidate
+        self.client.error = MCPError("tool_error")
+        result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True,
+                                    valid=lambda: live[0])
+        self.assertNotIn("read_attempt", result)
+        self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
+
+    async def test_public_read_local_parsing_or_storage_errors_are_not_source_failures(self):
+        self.client.response = {"id": "ithome:0:875:123", "url": "https://www.ithome.com/0/875/123.htm",
+            "source": "IT之家", "title": "望远镜观测", "text": "比较两组照片中的星云轮廓。", "basis": "article"}
+        for failed in (patch("MaiLivingWorld.mcp_runtime.observation", side_effect=ValueError("local parse")),
+                       patch.object(self.store, "put_observation", side_effect=OSError("database busy"))):
+            self.next_message()
+            with failed:
+                result = await self.execute("news", "news_read", {"id": "ithome:0:875:123"}, autonomous_read=True)
+            self.assertNotIn("read_attempt", result)
+            self.assertNotIn("call_id", result)
+            self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
+
+    async def test_ordinary_or_unremembered_calls_keep_their_previous_result_contract(self):
+        for provider, tool, args, options in (
+            ("news", "news_read", {"id": "ithome:0:875:123"}, {}),
+            ("news", "news_read", {"id": "ithome:0:875:123"}, {"autonomous_read": True, "record_observations": False}),
+            ("cap", "jm_get_album", {"jm_id": "123"}, {"autonomous_read": True}),
+        ):
+            for error in (None, MCPError("tool_error")):
+                with self.subTest(tool=tool, options=options, error=error):
+                    self.next_message()
+                    self.client.error = error
+                    result = await self.execute(provider, tool, args, **options)
+                    self.assertNotIn("read_attempt", result)
+                    self.assertEqual(json.loads(self.last_call()["payload"])["summary"], "")
 
     async def test_catalog_intersects_static_allowlist_and_uses_local_descriptions(self):
         result = await self.bridge.catalog("cap", config=self.config, context=self.context, owner=OWNER,
