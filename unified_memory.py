@@ -483,3 +483,63 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
     for identity in duplicates:
         ranked.pop(identity, None)
     return sorted(ranked.values(), key=lambda item: (-item["score"], -item["timestamp"], item["id"]))[:min(limit, MAX_RESULTS)]
+
+
+def annotate_interest_changes(records: list[dict], history: list[dict]) -> list[dict]:
+    """Attach a bounded, source-preserving comparison to a current validated interest.
+
+    The caller first resolves every source through ``derived_memories``. Historical
+    state is only a comparison with that exact current item, never extra evidence
+    or an independent memory to disclose. New interests and administrative edits
+    do not establish a natural preference change.
+    """
+    changes = []
+    for entry in history[:20]:
+        if (not isinstance(entry, dict) or entry.get("kind") != "growth"
+                or entry.get("rolled_back") is not False):
+            continue
+        before, after = entry.get("before"), entry.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            continue
+        old_items, new_items = before.get("interests"), after.get("interests")
+        if not isinstance(old_items, list) or not isinstance(new_items, list):
+            continue
+        for current in new_items[:32]:
+            if not isinstance(current, dict):
+                continue
+            previous = [item for item in old_items[:32] if isinstance(item, dict)
+                        and item.get("key") == current.get("key")]
+            duplicates = sum(isinstance(item, dict) and item.get("key") == current.get("key")
+                             for item in new_items[:32])
+            if len(previous) != 1 or duplicates != 1:
+                continue
+            old = previous[0]
+            old_weight, weight = old.get("weight"), current.get("weight")
+            if (any(type(value) not in (int, float) or not -1 <= value <= 1 for value in (old_weight, weight))
+                    or old_weight == weight or type(old.get("revision")) is not int
+                    or old["revision"] < 1 or old.get("topic") != current.get("topic")
+                    or current.get("revision") != old["revision"] + 1
+                    or not isinstance(old.get("sources"), list) or not old["sources"]
+                    or not isinstance(current.get("sources"), list)
+                    or any(ref not in current["sources"] for ref in old["sources"])):
+                continue
+            changes.append((current, old_weight))
+    result = []
+    for record in records:
+        changed = record
+        if (record.get("source") == "growth" and record.get("kind") == "interest"
+                and record.get("evidence_status") == "inferred"):
+            for current, previous_weight in changes:
+                if (record.get("id") != "growth:interest:" + str(current.get("key"))
+                        or any(record.get(field) != current.get(field)
+                               for field in ("topic", "weight", "revision", "sources"))):
+                    continue
+                previous = ("更愿意了解这个方向" if previous_weight > 0
+                            else "不太感兴趣" if previous_weight < 0 else "没有明显喜恶")
+                direction = "有所回升" if current["weight"] > previous_weight else "有所减弱"
+                text = record["text"] + f"；此前{previous}，最近一次有记录的调整中兴趣{direction}"
+                if len(text) <= MAX_TEXT_CHARS:
+                    changed = {**record, "text": text}
+                break
+        result.append(changed)
+    return result

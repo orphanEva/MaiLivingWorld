@@ -325,10 +325,15 @@ class AttentionRuntime:
                         row["version"], row["status"], row["source_refs"]])})
         if (b._research_available() and b.config.growth.enabled and b.config.growth.mode == "active"):
             state = b._growth_snapshot()
-            interests = set().union(*(_terms(x.get("topic", "")) for x in state.get("interests", [])))
+            interests = [(set(_terms(item.get("topic", ""))), item.get("weight", 0))
+                         for item in state.get("interests", []) if item.get("status") in (None, "active")]
             questions = [q for q in state.get("questions", []) if q["status"] == "open"
                          and q["key"] not in occupied_questions and b._research_available(q)]
-            questions.sort(key=lambda q: (-len(set(_terms(q.get("topic", ""))) & interests), q["key"]))
+            def research_priority(question):
+                topic = set(_terms(question.get("topic", "")))
+                preference = sum(weight*len(topic & terms) for terms, weight in interests)
+                return -round(preference, 8), question["key"]
+            questions.sort(key=research_priority)
             rows += [{"kind": "research", "key": q["key"], "version": digest(q)} for q in questions[:100]]
             if state.get("traits", {}).get("curiosity", .5) >= .55:
                 rows.sort(key=lambda r: r["kind"] != "research")

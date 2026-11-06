@@ -91,6 +91,29 @@ class GrowthMySQLLiveTests(unittest.TestCase):
         self.assertEqual(second.status()["consumed"], 6)
         self.assertEqual(second.history()[0]["kind"], "rollback")
 
+    def test_interest_change_history_survives_reconnect_and_honors_rollback(self):
+        from MaiLivingWorld.growth_store import source_fingerprint
+        from MaiLivingWorld.unified_memory import annotate_interest_changes, derived_memories
+        db = self.store()
+        roots = [{**row, "id": "brain:event:history"+str(index)}
+                 for index, row in enumerate(evidence("history"))]
+        for index in range(2):
+            source = roots[index]
+            stamp = 100 + index*10
+            job_id = db.enqueue([source], now=stamp)
+            job = db.claim(now=stamp)
+            candidate = {"interests": [{"topic": "编程", "delta": 0.1, "evidence_ids": [source["id"]]}]}
+            db.complete(job_id, job["token"], candidate, [source], now=stamp+1)
+        reopened = self.store()
+        resolved = {root["id"]: root for root in roots}
+        records = derived_memories(reopened.state(now=120), resolved, fingerprint=source_fingerprint)
+        changed = annotate_interest_changes(records, reopened.history(limit=20))
+        self.assertIn("兴趣有所回升", changed[0]["text"])
+        self.assertEqual(changed[0]["sources"], records[0]["sources"])
+        db.rollback(2, now=121)
+        records = derived_memories(reopened.state(now=122), resolved, fingerprint=source_fingerprint)
+        self.assertEqual(annotate_interest_changes(records, reopened.history(limit=20)), records)
+
     def test_racing_claims_and_expired_lease_recovery(self):
         db = self.store()
         rows = evidence()

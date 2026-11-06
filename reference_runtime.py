@@ -27,17 +27,28 @@ _NEUTRAL = {"你好", "嗨", "在吗", "早上好", "晚上好", "早安", "晚�
 _QUESTION_PROGRESS = {"那个问题后来弄明白了吗", "之前那个问题后来弄明白了吗", "那个问题弄明白了吗",
                       "那个问题后来有答案了吗", "之前那个问题有答案了吗", "那个问题有答案了吗",
                       "刚才那个问题查明白了吗", "那个问题查得怎么样了", "之前那个问题查得怎么样了"}
+_OPINION_FOLLOWUPS = {"你现在怎么看这件事", "你现在怎么看这个", "你现在还是这么想吗", "你现在还这么想吗",
+                     "你的看法变了吗", "你对这件事的看法变了吗", "你对这个的看法变了吗",
+                     "你之前不是这么想的吗", "你之前也是这么想的吗", "你为什么改变看法", "你为什么改变看法了"}
 _CLARIFY = "[MaiLivingWorld:reference]\n这句短指代暂不能唯一对应仍有效的话题。先简短问清指的是哪件事，不猜对象或编造后续。"
 _CONTINUE = "[MaiLivingWorld:reference]\n这句短指代可承接最近实际提及且来源仍有效的同一话题。只依据本轮允许表达的记忆，不补猜新的进展。"
 _REACTION = ("主人在问你对刚才材料的看法。先说其中具体吸引你、让你犹豫或不认同的一点，"
              "把报道内容和自己的判断说清楚。只有本轮提供相关的既有兴趣、观点或感受时，"
              "才据此延续原来的态度；也可以说还没形成看法。问句预设的喜欢或不喜欢须以已有倾向为准，"
+             "过去的偏好或前后变化只有本轮历史依据明确时才能确认。缺少历史时可以说明无法确定，"
              "形成态度的原因缺少依据时可以直接说还不确定。不补写亲身经历、阅读进度或长久偏好。")
 _PROGRESS = ("主人在问先前提过的材料相关的问题进展。结合本轮问题状态和原始材料回应，保留来源中的限定。"
              "旧问题记录可能仍是原来的问句，标记解决本身不构成答案。按实际提供的材料解释具体内容，依据不足就保留疑问。"
              "先前提过材料不证明主人曾问过这个问题或你曾承诺研究，结题状态也不证明实际联网查阅；只按已有记录表达。")
 _NO_PROGRESS = "[MaiLivingWorld:reference]\n这份材料目前缺少可核验的问题进展记录。简短说明还无法确认，先问清具体问题。"
 _MANY_QUESTIONS = "[MaiLivingWorld:reference]\n这份材料关联多个仍有效的问题。先问清指的是哪个问题，再谈进展。"
+_OPINION = ("主人在问你对刚才材料的当前看法或看法变化。只按本轮获准表达的自身观点回应，保留暂时倾向、"
+            "分歧与待核对候选的限定。只有记录明确包含调整前后的看法时，才描述变化。"
+            "问句中的改变预设需要核实，缺少历史时可以说目前无法确认以前是否这样想。"
+            "原因只按获准表达的原始依据说明，材料存在本身不证明改变原因，不补写经历或学习过程。"
+            "曾提过材料不证明曾向主人说过这条观点，也不证明主人认同。")
+_NO_OPINION = "[MaiLivingWorld:reference]\n这份材料目前缺少可核验的自身观点记录。可以说明还没有明确的看法，先问清具体想讨论哪一点。"
+_MANY_OPINIONS = "[MaiLivingWorld:reference]\n这份材料关联多个仍有效的自身观点。先问清指的是哪一条看法，再谈是否改变。"
 _BOILERPLATE = re.compile(r"MaiLivingWorld|主人(?:原话|更正|自述)|未经?独立(?:核实|验证)|作品元数据|未阅读或观看正文|记录于|收到于", re.I)
 _END_PUNCTUATION = " \t\n\r。！？.!?"
 
@@ -47,11 +58,16 @@ def _short(text):
 
 
 def is_followup(text):
-    return _short(text) in _FOLLOWUPS or reading_reaction_question(text) or question_progress(text)
+    return (_short(text) in _FOLLOWUPS or reading_reaction_question(text)
+            or question_progress(text) or opinion_followup(text))
 
 
 def question_progress(text):
     return _short(text) in _QUESTION_PROGRESS
+
+
+def opinion_followup(text):
+    return _short(text) in _OPINION_FOLLOWUPS
 
 
 def _ref(row):
@@ -141,7 +157,7 @@ class ReferenceRuntime:
         parts, text = message.get("raw_message"), message.get("processed_plain_text")
         pure = not (isinstance(parts, list) and any(not isinstance(p, dict) or p.get("type") != "text" for p in parts)
                     or any(message.get(k) for k in ("is_picture", "is_voice", "is_emoji")))
-        if reading_reaction_question(text) or question_progress(text):
+        if reading_reaction_question(text) or question_progress(text) or opinion_followup(text):
             pure = pure and direct_message_text(message, self.owner()) == text
         control = bool(message.get("is_command") or isinstance(text, str) and text.startswith("/"))
         keep = bool(_short(text) not in _CLEAR and (not pure or control or is_followup(text) or _short(text) in _NEUTRAL))
@@ -240,7 +256,37 @@ class ReferenceRuntime:
             result.update(query=query+" "+records[0]["text"][:240], records=records, hint=hint, status="resolved")
             if question_progress(query):
                 return self._question_progress(result, records[0])
+            if opinion_followup(query):
+                return self._opinion_followup(result, records[0])
         return result
+
+    def _opinion_followup(self, result, focus):
+        b = self.bot
+        result = {**result, "opinion_followup": True, "records": [], "hint": _NO_OPINION, "status": "unavailable"}
+        if not (b.config.growth.enabled and b.config.growth.mode == "active" and b._ensure_growth()):
+            return result
+        # Check the full valid set before applying the reply limit. One visible
+        # source may support several opinions even when only one fits the prompt.
+        beliefs = [item for item in b._growth_snapshot().get("beliefs", [])
+                   if item.get("status") == "active" and any(ref["id"] == focus["id"] for ref in item["sources"])]
+        if len(beliefs) > 1:
+            return {**result, "hint": _MANY_OPINIONS, "status": "ambiguous"}
+        if not beliefs:
+            return result
+        roots = b._resolve_roots([ref["id"] for ref in beliefs[0]["sources"]])
+        opinions = derived_memories({"beliefs": beliefs}, roots, fingerprint=source_fingerprint,
+                                    query=result["query"], limit=1)
+        if len(opinions) != 1:
+            return result
+        others = sorted((row for row in roots.values() if row["id"] != focus["id"]),
+                        key=lambda row: (-row["timestamp"], row["id"]))
+        selected = ([focus]+others)[:b.config.unified_mind.recall_limit-1]
+        hint = _CONTINUE+"\n"+_OPINION
+        if not selected:
+            hint += "本轮未提供原文，形成或改变看法的具体原因需要保留不确定。"
+        elif len(selected) < len(roots):
+            hint += "本轮只提供有限原始材料，未提供的细节不能补猜。"
+        return {**result, "records": selected+opinions, "hint": hint, "status": "resolved"}
 
     def _question_progress(self, result, focus):
         b = self.bot

@@ -52,6 +52,30 @@ class AttentionRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def answer(self, mode, evidence, confidence=.95):
         return {"response": json.dumps({"mode": mode, "confidence": confidence, "evidence": evidence}, ensure_ascii=False)}
 
+    def test_research_priority_respects_signed_active_interests_without_excluding_questions(self):
+        self.bot.config.growth.enabled = True
+        self.bot.config.growth.mode = "active"
+        self.bot._research_available = lambda question=None: True
+        state = {"questions": [{"key": key, "topic": topic, "status": "open"} for key, topic in
+                               (("a-game", "游戏"), ("b-park", "公园"), ("c-poetry", "诗歌"), ("d-music", "音乐"))],
+                 "interests": [{"topic": "游戏", "weight": -.9}, {"topic": "音乐", "weight": .2},
+                               {"topic": "诗歌", "weight": 0}, {"topic": "公园", "weight": 1, "status": "retired"}],
+                 "traits": {"curiosity": .6}}
+        self.bot._growth_snapshot = lambda: state
+        runtime = self.bot._attention
+        rows = runtime.candidates()
+        self.assertEqual([row["key"] for row in rows], ["d-music", "b-park", "c-poetry", "a-game"])
+        previous = {row["key"]: row["version"] for row in rows}
+        for item in state["interests"][:3]:
+            item["status"] = None
+        self.assertEqual([row["key"] for row in runtime.candidates()], ["d-music", "b-park", "c-poetry", "a-game"])
+        state["interests"] = [{"topic": "游戏", "weight": .9}, {"topic": "音乐", "weight": .1}]
+        self.assertEqual([row["key"] for row in runtime.candidates()][:2], ["a-game", "d-music"])
+        state["interests"] = []
+        rows = runtime.candidates()
+        self.assertEqual([row["key"] for row in rows], ["a-game", "b-park", "c-poetry", "d-music"])
+        self.assertEqual({row["key"]: row["version"] for row in rows}, previous)
+
     async def test_literal_listen_uses_no_model_and_survives_new_session(self):
         await self.capture("先听我说就好")
         a = self.bot._attention
