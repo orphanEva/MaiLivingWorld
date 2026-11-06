@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
+from MaiLivingWorld.social_runtime import _public_interest_scores, _search_topic, public_interests
 
 
 PRIVATE = "主人私下提起的蓝信封"
@@ -81,8 +82,8 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "mcp": {"enabled": True, "public_sources_enabled": True, "social_mode": "参与讨论"},
             "general": {"dry_run": False}})
         bot._mcp_client = lambda provider: self.fixture
-        bot._derived_memories = lambda query="": [{"kind": "interest", "topic": PRIVATE + "里的天文摄影",
-                                                    "text": PRIVATE, "id": "private-source"}] if not query else []
+        bot._interest_memories = lambda: [{"kind": "interest", "topic": PRIVATE + "里的天文摄影",
+                                           "text": PRIVATE, "id": "private-source"}]
 
         async def model(prompt, **kwargs):
             self.prompts.append(prompt)
@@ -112,6 +113,27 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def calls(self, name):
         return [args for tool, args in self.fixture.calls if tool == name]
+
+    def learn(self, ident, *, interests=(), knowledge=()):
+        stamp = time.time()
+        brain = self.bot._ensure_brain()
+        with brain.con:
+            brain.con.execute("""INSERT INTO brain_events
+                (id,scope,actor_id,kind,summary,importance,happened,created)
+                VALUES (?,?,?,'experience',?,3,?,?)""",
+                (ident, "private:"+OWNER, OWNER, PRIVATE+ident, stamp, stamp))
+        source = "brain:event:"+ident
+        records = list(self.bot._resolve_roots([source]).values())
+        self.bot._ensure_growth()
+        store = self.bot._growth
+        store.enqueue(records)
+        job = store.claim()
+        proposal = {"interests": [{"topic": topic, "delta": weight, "evidence_ids": [source]}
+                                  for topic, weight in interests],
+                    "knowledge": [{"topic": topic, "statement": "已经记录的测试知识", "confidence": 0.8,
+                                   "evidence_ids": [source]} for topic in knowledge]}
+        store.complete(job["id"], job["token"], proposal, records)
+        return source
 
     async def next_window(self, hours=3):
         store = self.bot._ensure_tool_store()
@@ -288,14 +310,165 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(social.help_hint(OWNER), "")
 
     async def test_external_query_uses_positive_interests_and_respects_dislikes(self):
-        self.bot._derived_memories = lambda: [
+        self.bot._interest_memories = lambda: [
             {"kind": "interest", "topic": "游戏", "weight": -0.8},
             {"kind": "interest", "topic": PRIVATE + "的摄影", "weight": 0.3}]
         await self.tick()
         self.assertEqual(self.calls("web_search")[0]["query"], "摄影")
         self.assertEqual(self.calls("mastodon_search")[0]["query"], "摄影")
         self.assertNotIn(PRIVATE, repr(self.prompts) + repr(self.fixture.calls))
-        from MaiLivingWorld.social_runtime import public_interests
         self.assertNotIn("游戏", public_interests([{"kind": "interest", "topic": "游戏", "weight": -0.5}]))
         self.assertEqual(public_interests([{"kind": "interest", "topic": t, "weight": -1}
                                           for t in public_interests([])]), [])
+
+    async def test_all_disliked_topics_skip_outbound_search_but_can_consider_news(self):
+        self.bot._interest_memories = lambda: [
+            {"kind": "interest", "topic": topic, "weight": -0.3} for topic in public_interests([])]
+        self.pick = "不感兴趣"
+        await self.tick()
+        self.assertFalse(self.calls("mastodon_search") or self.calls("web_search"))
+        self.assertEqual(self.calls("news_search"), [{"limit": 10}])
+        self.assertFalse(self.calls("news_read") or self.calls("mastodon_reply"))
+        data = json.loads(self.prompts[0].rsplit("\n", 1)[-1])
+        self.assertEqual(data["公开兴趣方向"], [])
+        self.assertTrue(all(score == -0.3 for score in data["兴趣倾向"].values()))
+
+    async def test_learned_preference_ranks_candidates_before_the_four_item_limit(self):
+        self.bot._interest_memories = lambda: [
+            {"kind": "interest", "topic": PRIVATE+"的摄影", "weight": 0.4},
+            {"kind": "interest", "topic": "游戏", "weight": -0.8}]
+        underlying = self.fixture.call_tool
+        async def many_news(name, args):
+            if name == "news_search":
+                return {"items": [
+                    *({"id": f"game-{i}", "title": f"游戏报道{i}"} for i in range(4)),
+                    {"id": "new-interest", "title": "摄影观察"},
+                    {"id": "unknown", "title": "未知的公开报道"}]}
+            return await underlying(name, args)
+        self.fixture.call_tool = many_news
+        self.pick = "摄影观察"
+        await self.tick()
+        data = json.loads(self.prompts[0].rsplit("\n", 1)[-1])
+        news = [row["title"] for row in data["条目"] if row["title"] in
+                {"摄影观察", "未知的公开报道", *(f"游戏报道{i}" for i in range(4))}]
+        self.assertEqual(news, ["摄影观察", "未知的公开报道", "游戏报道0", "游戏报道1"])
+        self.assertEqual(self.calls("news_read"), [{"id": "new-interest"}])
+        self.assertEqual(data["兴趣倾向"]["游戏"], -0.8)
+        self.assertEqual(data["兴趣倾向"]["摄影"], 0.4)
+        self.assertNotIn(PRIVATE, repr(self.prompts) + repr(self.fixture.calls))
+
+    async def test_weighted_search_sequence_continues_after_restart(self):
+        interests = [{"kind": "interest", "topic": "天文", "weight": 0.9},
+                     {"kind": "interest", "topic": "摄影", "weight": 0.1}]
+        self.bot._interest_memories = lambda: interests
+        self.pick = "不感兴趣"
+        await self.tick()
+        await self.next_window()
+        await self.bot.on_unload()
+        self.bot = self.new_bot()
+        self.bot._interest_memories = lambda: interests
+        await self.next_window(hours=6)
+        self.assertEqual([call["query"] for call in self.calls("web_search")], ["天文", "摄影", "天文"])
+
+    async def test_changing_learned_weight_during_selection_discards_the_old_choice(self):
+        interests = [{"kind": "interest", "topic": "天文", "weight": 0.4}]
+        self.bot._interest_memories = lambda: interests
+        original = self.bot.ctx.llm.generate.side_effect
+        async def changed(prompt, **kwargs):
+            result = await original(prompt, **kwargs)
+            interests[0]["weight"] = -0.4
+            return result
+        self.bot.ctx.llm.generate.side_effect = changed
+        await self.tick()
+        self.assertFalse(self.calls("mastodon_read") or self.calls("news_read") or self.calls("mastodon_reply"))
+        self.bot.ctx.llm.generate.side_effect = original
+        self.pick = "不感兴趣"
+        await self.next_window()
+        self.assertEqual([call["query"] for call in self.calls("web_search")], ["天文", "摄影"])
+
+    async def test_all_32_persisted_interests_survive_unrelated_knowledge_and_restart(self):
+        del self.bot._interest_memories
+        self.bot.config.growth.enabled = True
+        self.bot.config.growth.mode = "active"
+        self.bot.config.brain_memory.enabled = True
+        topics = [("天文", 0.1), ("游戏", -0.1)] + [(f"偏好{i}", 0.1) for i in range(30)]
+        for index in range(0, 32, 2):
+            self.learn(f"interest-{index}", interests=topics[index:index+2])
+        for index in range(0, 14, 2):
+            self.learn(f"knowledge-{index}", knowledge=[f"知识{index}", f"知识{index+1}"])
+        self.assertFalse(any(row["kind"] == "interest" for row in self.bot._derived_memories()))
+        before = self.bot._interest_memories()
+        self.assertEqual(len(before), 32)
+        self.assertEqual(public_interests(before), ["天文"])
+        self.pick = "不感兴趣"
+        await self.tick()
+        self.assertEqual(self.calls("web_search")[0]["query"], "天文")
+        await self.bot.on_unload()
+        self.bot = self.new_bot()
+        del self.bot._interest_memories
+        self.bot.config.growth.enabled = True
+        self.bot.config.growth.mode = "active"
+        self.bot.config.brain_memory.enabled = True
+        self.assertEqual(self.bot._interest_memories(), before)
+        brain = self.bot._ensure_brain()
+        with brain.con:
+            brain.con.execute("DELETE FROM brain_events WHERE id='interest-0'")
+        self.assertEqual(len(self.bot._interest_memories()), 30)
+        self.bot.config.growth.mode = "observe"
+        self.assertEqual(self.bot._interest_memories(), [])
+
+    async def test_changed_original_interest_source_during_read_prevents_public_reply(self):
+        del self.bot._interest_memories
+        self.bot.config.growth.enabled = True
+        self.bot.config.growth.mode = "active"
+        self.bot.config.brain_memory.enabled = True
+        self.learn("astronomy", interests=[("天文", 0.1)])
+        def change_source():
+            brain = self.bot._ensure_brain()
+            with brain.con:
+                brain.con.execute("UPDATE brain_events SET summary=? WHERE id='astronomy'", ("修正后的经历",))
+        self.fixture.after_read = change_source
+        await self.tick()
+        self.assertEqual(len(self.calls("mastodon_read")), 1)
+        self.assertEqual(self.bot._interest_memories(), [])
+        self.assertFalse(self.calls("mastodon_reply"))
+
+    async def test_source_revision_change_preserving_score_still_discards_selection(self):
+        interests = [{"kind": "interest", "id": "growth:interest:one", "topic": "天文", "weight": 0.4,
+                      "revision": 1, "sources": [{"id": "original", "digest": "old-version"}]}]
+        self.bot._interest_memories = lambda: interests
+        original = self.bot.ctx.llm.generate.side_effect
+        async def changed(prompt, **kwargs):
+            result = await original(prompt, **kwargs)
+            interests[0]["sources"][0]["digest"] = "new-version"
+            return result
+        self.bot.ctx.llm.generate.side_effect = changed
+        await self.tick()
+        self.assertFalse(self.calls("mastodon_read") or self.calls("news_read") or self.calls("mastodon_reply"))
+
+
+class InterestProjectionTests(unittest.TestCase):
+    def test_weighted_rotation_keeps_weak_interests_and_stays_bounded(self):
+        scores = _public_interest_scores([
+            {"kind": "interest", "topic": "天文", "weight": 0.9},
+            {"kind": "interest", "topic": "摄影", "weight": 0.1},
+            {"kind": "interest", "topic": "游戏", "weight": -0.1}])
+        cycle = [_search_topic(scores, sequence) for sequence in range(1, 11)]
+        self.assertEqual(cycle.count("天文"), 9)
+        self.assertEqual(cycle.count("摄影"), 1)
+        self.assertNotIn("游戏", cycle)
+        self.assertEqual(cycle, [_search_topic(scores, sequence) for sequence in range(11, 21)])
+        scores = _public_interest_scores([
+            {"kind": "interest", "topic": "天文", "weight": 0.9},
+            {"kind": "interest", "topic": "摄影", "weight": 0.00000001}])
+        self.assertIn("摄影", [_search_topic(scores, sequence) for sequence in range(1, 11)])
+
+    def test_tiny_dislikes_do_not_become_neutral_and_conflicts_cancel(self):
+        scores = _public_interest_scores([
+            {"kind": "interest", "topic": "游戏", "weight": -0.00000001},
+            {"kind": "interest", "topic": "天文", "weight": 0.3},
+            {"kind": "interest", "topic": "天文", "weight": -0.1},
+            {"kind": "interest", "topic": "天文", "weight": -0.2}])
+        self.assertLess(scores["游戏"], 0)
+        self.assertEqual(scores["天文"], 0)
+        self.assertNotIn("游戏", [_search_topic(scores, sequence) for sequence in range(1, 101)])

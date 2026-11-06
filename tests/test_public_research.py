@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from MaiLivingWorld.growth_model import empty_growth, MAX_RECORDS
 from MaiLivingWorld.growth_store import source_fingerprint
 from MaiLivingWorld.mcp_policy import observation
+from MaiLivingWorld.mcp_runtime import digest
 from MaiLivingWorld.public_research import public_question
 from MaiLivingWorld.public_news import _article_url
 from MaiLivingWorld.tests.test_growth_runtime import model_response, review
@@ -87,6 +88,10 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
 
     def calls(self):
         return [call.args for call in self.client.call_tool.await_args_list]
+
+    def research_row(self):
+        key = self.bot._growth_snapshot()["questions"][0]["key"]
+        return self.bot._tool_store._read("SELECT * FROM tool_research WHERE question_key=?", (key,))[0]
 
     def clock(self, stamp):
         day = datetime.fromtimestamp(stamp, ZoneInfo(self.bot.config.general.timezone)).replace(
@@ -279,6 +284,120 @@ class PublicResearchTests(unittest.IsolatedAsyncioTestCase):
         self.client.call_tool.side_effect = empty
         self.assertEqual(await self.bot._research_tools(with_evidence=True), {"success": True, "records": []})
         self.assertEqual(len(self.calls()), 2)
+        row = self.research_row()
+        self.assertEqual((row["status"], row["failures"], row["daily_count"]), ("no_evidence", 0, 1))
+
+    async def test_empty_public_search_wait_persists_then_increases_after_restart(self):
+        self.client.call_tool.side_effect = None
+        self.client.call_tool.return_value = {"items": []}
+        stamp = time.time()
+        with self.clock(stamp):
+            self.assertTrue(await self.bot._research_tools())
+        self.assertEqual(self.research_row()["next_attempt"], stamp+7200)
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3700):
+            self.assertIsNone(await self.bot._research_tools())
+        self.assertEqual(self.calls(), [])
+        with self.clock(stamp+7200):
+            self.assertTrue(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"], row["next_attempt"]),
+                         ("no_evidence", 2, 0, stamp+21600))
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+
+    async def test_new_public_evidence_clears_empty_wait_and_reaches_growth(self):
+        self.client.call_tool.side_effect = None
+        self.client.call_tool.return_value = {"items": []}
+        stamp = time.time()
+        with self.clock(stamp):
+            await self.bot._research_tools()
+        self.client.call_tool.side_effect = self.respond
+        with self.clock(stamp+7200):
+            result = await self.bot._research_tools(with_evidence=True)
+        self.assertTrue(result["records"])
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"], row["next_attempt"]),
+                         ("succeeded", 0, 0, stamp+10800))
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 1)
+
+    async def test_transport_failure_clears_empty_wait_and_uses_failure_backoff(self):
+        self.client.call_tool.side_effect = None
+        self.client.call_tool.return_value = {"items": []}
+        stamp = time.time()
+        with self.clock(stamp):
+            await self.bot._research_tools()
+        self.client.call_tool.side_effect = RuntimeError("offline")
+        with self.clock(stamp+7200):
+            self.assertFalse(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"], row["next_attempt"]),
+                         ("failed", 0, 1, stamp+10800))
+        self.assertEqual(self.bot._growth.status()["jobs"]["pending"], 0)
+
+    async def test_growth_revised_question_reopens_research_after_global_interval(self):
+        self.client.call_tool.side_effect = None
+        self.client.call_tool.return_value = {"items": []}
+        stamp = time.time()
+        with self.clock(stamp):
+            await self.bot._research_tools()
+        original = self.bot._growth_snapshot()["questions"][0]
+        source = self.bot._tool_store.put_observation("news", "new-observations",
+            "望远镜观测需要同时核对波长和大气条件。", "public:news", sensitivity="public",
+            url="https://news.un.org/zh/story/2026/11/1143147")
+        self.bot._growth.enqueue([self.source, source], mode="active")
+        data = empty_growth()
+        data["questions"] = [{"topic": TOPIC, "question": "望远镜口径、波长和大气条件怎样共同影响观测",
+                              "status": "open", "evidence_ids": [source["id"]]}]
+        self.bot.ctx.llm.generate.side_effect = [model_response(data), model_response(review(data))]
+        await self.bot._grow()
+        current = self.bot._growth_snapshot()["questions"][0]
+        self.assertEqual(current["key"], original["key"])
+        self.assertNotEqual(digest(current), digest(original))
+        self.assertIsNotNone(public_question(current, self.bot._resolve_roots))
+        self.client.call_tool.reset_mock()
+        with self.clock(stamp+3599):
+            self.assertIsNone(await self.bot._research_tools())
+        self.assertEqual(self.calls(), [])
+        with self.clock(stamp+3600):
+            self.assertTrue(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["daily_count"], row["lease_token"], row["next_attempt"]),
+                         (1, digest(current), stamp+10800))
+
+    async def test_malformed_search_results_do_not_accumulate_empty_rounds(self):
+        async def malformed(name, arguments):
+            return {"items": [{}] if name == "news_search" else []}
+        self.client.call_tool.side_effect = malformed
+        self.assertTrue(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("succeeded", 0, 0))
+
+    async def test_missing_search_items_do_not_count_as_an_empty_search(self):
+        self.client.call_tool.side_effect = None
+        self.client.call_tool.return_value = {}
+        self.assertFalse(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("failed", 0, 1))
+        self.assertEqual(len(self.calls()), 1)
+
+    async def test_non_object_search_data_does_not_count_as_an_empty_search(self):
+        self.bot._ensure_tool_store()
+        with patch.object(self.bot._mcp_bridge, "execute", return_value={"success": True, "data": []}):
+            self.assertFalse(await self.bot._research_tools())
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("failed", 0, 1))
+
+    async def test_unusable_read_does_not_accumulate_empty_rounds(self):
+        async def no_article(name, arguments):
+            return {} if name == "reference_read" else await self.respond(name, arguments)
+        self.client.call_tool.side_effect = no_article
+        result = await self.bot._research_tools(with_evidence=True)
+        self.assertEqual(result, {"success": True, "records": []})
+        row = self.research_row()
+        self.assertEqual((row["status"], row["daily_count"], row["failures"]), ("succeeded", 0, 0))
 
     async def test_disabled_flags_and_zero_quota_never_dispatch(self):
         for section, field, value in (("mcp", "research_enabled", False), ("mcp", "remember_results", False),

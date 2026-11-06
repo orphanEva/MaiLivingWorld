@@ -168,7 +168,7 @@ class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_reference_revision_is_preserved_and_updates_same_excerpt_identity(self):
         from MaiLivingWorld.growth_store import source_fingerprint
         records = []
-        for revision in (98, 99):
+        for revision in (123456789, 123456790):
             self.client.call_tool.return_value = {**REFERENCE, "revision_id": revision}
             event = await self.capture("revision-"+str(revision), "请读木卫二百科")
             result = await self.call(event, "reference", "reference_read", {"page_id": 42})
@@ -180,6 +180,23 @@ class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["origin_key"], records[1]["origin_key"])
         self.assertEqual(records[0]["url"], records[1]["url"])
         self.assertNotEqual(source_fingerprint(records[0]), source_fingerprint(records[1]))
+
+    async def test_realistic_reference_revision_survives_normal_reply_after_restart(self):
+        from MaiLivingWorld.tests.test_unified_runtime import kwargs, response
+        event = await self.capture("read-long-revision", "请读木卫二百科")
+        self.client.call_tool.return_value = {**REFERENCE, "revision_id": 123456789}
+        self.assertTrue((await self.call(event, "reference", "reference_read", {"page_id": 42}))["success"])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.unified_mind.min_interval_seconds = 0
+        record, = self.bot._ensure_tool_store().observations()
+        await self.capture("recall-long-revision", "木卫二百科介绍了什么？", group=GROUP, uid=OTHER, sid="other-group")
+        self.bot.ctx.llm.generate.return_value = response([{"id": record["id"], "mode": "say"}])
+        hint = await self.bot.brain_reply_hint(**kwargs("other-group", "recall-long-revision"))
+        reply = json.dumps(hint, ensure_ascii=False)
+        self.assertIn("冰壳中可见线状裂纹", reply)
+        self.assertIn(REFERENCE["url"], reply)
+        self.assertIn("123456789", reply)
 
     async def test_reference_without_verified_revision_cannot_create_memory(self):
         for index, revision in enumerate((None, True, False, 0, -1, "98", 98.0)):

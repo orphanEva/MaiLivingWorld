@@ -25,7 +25,23 @@ _REACTION_QUESTIONS = {
     "你怎么看刚才读的", "你怎么看刚才那篇", "你对刚才那篇有什么看法",
     "刚才那篇你怎么看", "刚才那篇哪里让你感兴趣", "你为什么对它感兴趣",
     "你喜欢它什么", "你喜欢刚才那篇的什么", "你最喜欢它哪一点",
+    "你为什么喜欢这个", "你为什么喜欢它", "你为什么不喜欢这个", "你为什么不喜欢它",
 }
+_INTEREST_QUESTIONS = {
+    "positive": {"你喜欢什么", "你最近喜欢什么", "你现在喜欢什么", "你有什么爱好", "你平时有什么爱好",
+                 "你最近有什么爱好", "你对什么感兴趣", "你最近对什么感兴趣", "你现在对什么感兴趣"},
+    "negative": {"你不喜欢什么", "你最近不喜欢什么", "你现在不喜欢什么", "你有什么不喜欢的",
+                 "你有没有不喜欢的", "有没有不喜欢的", "你对什么不感兴趣", "有没有不喜欢的东西",
+                 "你有没有不喜欢的东西", "你有什么不喜欢的东西"},
+    "mixed": {"你的喜好是什么", "你有什么喜好", "你最近有什么喜好", "你的兴趣爱好是什么"},
+}
+
+
+def interest_question(text):
+    if not isinstance(text, str) or len(text) > 80:
+        return ""
+    text = unicodedata.normalize("NFKC", text).strip().rstrip("?？!！。~～").strip()
+    return next((direction for direction, questions in _INTEREST_QUESTIONS.items() if text in questions), "")
 
 
 def reading_reaction_question(text):

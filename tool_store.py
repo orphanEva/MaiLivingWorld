@@ -469,7 +469,8 @@ class ToolStore:
         rows = self._read("SELECT provider,task_id,scope,subject_id,operation,created,updated FROM tool_tasks WHERE id=?", (identity,))
         return rows[0] if rows else None
 
-    def claim_research(self, question_keys, *, interval_seconds, daily_limit, day_start, now=None):
+    def claim_research(self, question_keys, *, interval_seconds, daily_limit, day_start, now=None,
+                       question_versions=None):
         timestamp = _now(now)
         day_start = _day(day_start, timestamp)
         interval_seconds = _integer(interval_seconds, 1, 31536000)
@@ -479,6 +480,11 @@ class ToolStore:
         keys = sorted({_text(key, 160, code="invalid_question") for key in question_keys})
         if any(_reserved_research_key(key) for key in keys):
             raise ValueError("invalid_question")
+        versions = {} if question_versions is None else question_versions
+        if (not isinstance(versions, dict) or not set(versions).issubset(keys)
+                or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in versions.values())):
+            raise ValueError("invalid_question_versions")
         if not keys or not daily_limit:
             return None
         with self.con:
@@ -491,27 +497,38 @@ class ToolStore:
             for key in keys:
                 self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (key,))
             rows = self.con.execute("SELECT * FROM tool_research WHERE question_key IN ("+
-                                    ",".join("?" for _ in keys)+") AND next_attempt<=? "
-                                    "AND (status<>'running' OR lease_until<=?) "
-                                    "ORDER BY last_attempt,attempts,question_key LIMIT 1", (*keys, timestamp, timestamp)).fetchall()
-            if not rows:
+                                    ",".join("?" for _ in keys)+") AND (status<>'running' OR lease_until<=?) "
+                                    "ORDER BY last_attempt,attempts,question_key", (*keys, timestamp)).fetchall()
+            chosen = None
+            for row in rows:
+                version = versions.get(row["question_key"])
+                revised = row["status"] == "no_evidence" and version is not None and row["lease_token"] != version
+                if row["next_attempt"] <= timestamp or revised:
+                    chosen = row
+                    break
+            if chosen is None:
                 return None
-            row, token = rows[0], uuid.uuid4().hex
+            row, token = chosen, uuid.uuid4().hex
+            empty_rounds = int(row["daily_count"]) if row["status"] == "no_evidence" and not revised else 0
             self.con.execute("UPDATE tool_research SET status='running',attempts=attempts+1,last_attempt=?,"
-                             "next_attempt=?,lease_token=?,lease_until=?,interval_seconds=?,updated=? WHERE question_key=?",
+                             "next_attempt=?,lease_token=?,lease_until=?,interval_seconds=?,daily_count=?,updated=? WHERE question_key=?",
                              (timestamp, timestamp+interval_seconds, token, timestamp+max(600, min(interval_seconds, 3600)),
-                              interval_seconds, timestamp, row["question_key"]))
+                              interval_seconds, empty_rounds, timestamp, row["question_key"]))
             self.con.execute("UPDATE tool_research SET attempts=attempts+1,last_attempt=?,"
                              "daily_count=CASE WHEN budget_day=? THEN daily_count+1 ELSE 1 END,budget_day=?,updated=? WHERE question_key=?",
                              (timestamp, day_start, day_start, timestamp, _CONTROL))
             return {"question_key": row["question_key"], "token": token, "attempted": int(row["attempts"])+1}
 
-    def finish_research(self, key, success, now=None, *, token=None):
+    def finish_research(self, key, success, now=None, *, token=None, no_evidence=False, question_version=None):
         key = _text(key, 160, code="invalid_question")
         if _reserved_research_key(key) or type(success) is not bool:
             raise ValueError("invalid_research_result")
         if token is not None and (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)):
             raise ValueError("invalid_token")
+        if (type(no_evidence) is not bool or (no_evidence and (not success or question_version is None or token is None))
+                or (question_version is not None and (not isinstance(question_version, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", question_version)))):
+            raise ValueError("invalid_research_result")
         timestamp = _now(now)
         with self.con:
             self._lock()
@@ -521,10 +538,16 @@ class ToolStore:
                 raise ValueError("research_lease_lost")
             failures = 0 if success else min(20, int(row["failures"])+1)
             delay = row["interval_seconds"] if success else min(7*86400, max(60, row["interval_seconds"])*2**min(10, failures-1))
+            status, empty_rounds, version = "succeeded" if success else "failed", 0, ""
+            if no_evidence:
+                # Ordinary question rows reuse the control row's count field for
+                # empty rounds, and the inactive lease slot for their source version.
+                status, empty_rounds, version = "no_evidence", min(20, int(row["daily_count"])+1), question_version
+                delay = min(max(row["interval_seconds"], 86400), row["interval_seconds"]*2**empty_rounds)
             self.con.execute("UPDATE tool_research SET status=?,failures=?,last_finish=?,next_attempt=?,"
-                             "lease_token='',lease_until=0,updated=? WHERE question_key=?",
-                             ("succeeded" if success else "failed", failures, timestamp,
-                              max(row["next_attempt"], timestamp+delay), timestamp, key))
+                             "lease_token=?,lease_until=0,daily_count=?,updated=? WHERE question_key=?",
+                             (status, failures, timestamp, max(row["next_attempt"], timestamp+delay),
+                              version, empty_rounds, timestamp, key))
 
     def next_local_question(self, question_keys):
         """Rotate local retrieval without consuming network or research budgets."""

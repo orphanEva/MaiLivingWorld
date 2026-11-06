@@ -35,6 +35,29 @@ def parse(raw, records, scope=GROUP, speaker=OWNER, owner=True):
 
 
 class UnifiedExpressionTests(unittest.TestCase):
+    def test_reference_revision_metadata_does_not_block_public_excerpt(self):
+        from MaiLivingWorld.unified_expression import _can_say, _records
+        record = memory("tool:observation:"+"a"*64,
+            text="百科节选(中文维基百科 修订123456789 2026-10-01T00:00:00Z)《木卫二》 冰壳中可见裂纹。",
+            source="tool", kind="observation", source_name="reference", origin_key="tool:reference:"+"b"*64,
+            evidence_status="encyclopedia_excerpt", scope="public:reference", subject_id="", sensitivity="public",
+            url="https://zh.wikipedia.org/wiki/Europa")
+        raw = response([{"id": record["id"], "mode": "say"}])
+        plan = parse(raw, [record])
+        row, = json.loads(expression_hint(plan).splitlines()[-1])
+        self.assertEqual(row["source_revision"], "123456789")
+        self.assertEqual(row["source_url"], record["url"])
+        self.assertNotIn("123456789", row["content"])
+        self.assertIn("冰壳中可见裂纹", row["content"])
+        self.assertIn("修订123456789", record["text"])
+        self.assertTrue(_can_say(_records([record])[record["id"]], GROUP, OWNER))
+        for change in ({"text": record["text"]+" 数字123456789。"}, {"url": "https://example.org/wiki/Europa"},
+                       {"source_name": "news"}, {"derived": True}, {"origin_key": "unverified"},
+                       {"text": record["text"].replace("中文维基百科", "用户备注")},
+                       {"text": record["text"]+" 密码保密。"}):
+            with self.subTest(change=change):
+                self.assertEqual(parse(raw, [{**record, **change}])["memories"], [])
+
     def test_verified_delivery_is_distinct_from_speaker_and_from_the_public_source(self):
         record = memory("story:demo", source="story", kind="story", evidence_status="source_metadata",
                         scope="public", sensitivity="public", subject_id="", previously_mentioned=True)
@@ -299,6 +322,17 @@ class OwnViewExpressionTests(unittest.TestCase):
 
     def visible(self, record, scope="private:" + OWNER):
         return parse(response([{"id": record["id"], "mode": "say"}]), [record], scope=scope)
+
+    def test_small_interest_retains_its_direction_without_disclosing_scores(self):
+        for weight, expected in ((0.00000001, "目前更愿意了解和接触"),
+                                 (-0.00000001, "目前不太感兴趣"), (0, "目前没有明显的喜欢或不喜欢")):
+            record = self.grown(weight=weight,
+                text=f"自我兴趣：轻音乐（偏好强度 {weight:+.2f}，负值表示不喜欢）")
+            with self.subTest(weight=weight):
+                hint = expression_hint(self.visible(record))
+                self.assertIn(expected, hint)
+                self.assertNotIn("weight", hint)
+                self.assertNotIn("偏好强度", hint)
 
     def test_own_interest_is_naturalized_only_after_permission(self):
         record = self.grown()

@@ -409,17 +409,17 @@ ALTER TABLE `mlw_tool_tasks`
 ALTER TABLE `mlw_tool_research`
   COMMENT = '跨重启研究轮转租约退避及独立预算，本地检索轮转不消耗网络额度',
   MODIFY COLUMN `question_key` VARCHAR(191) NOT NULL COMMENT '待研究问题键或内部控制行标识，不保存问题正文',
-  MODIFY COLUMN `status` VARCHAR(191) NOT NULL DEFAULT 'idle' COMMENT 'idle、running、succeeded或failed',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL DEFAULT 'idle' COMMENT '问题为idle、running、succeeded、failed或no_evidence，内部标记行另用状态或摘要',
   MODIFY COLUMN `attempts` BIGINT NOT NULL DEFAULT 0 COMMENT '研究领取次数，控制行记录全局次数',
   MODIFY COLUMN `failures` BIGINT NOT NULL DEFAULT 0 COMMENT '连续失败次数，用于指数退避',
   MODIFY COLUMN `last_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近领取时间，重启保留冷却和轮转顺序',
   MODIFY COLUMN `next_attempt` DOUBLE NOT NULL DEFAULT 0 COMMENT '允许下次研究该问题的时间，Unix秒',
   MODIFY COLUMN `last_finish` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近完成时间，Unix秒',
-  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '研究租约令牌，本地轮转控制行保存上一问题键',
+  MODIFY COLUMN `lease_token` VARCHAR(191) NOT NULL DEFAULT '' COMMENT '运行中研究租约；无新证据时为问题版本；内部标记可存上一问题键或来源编号',
   MODIFY COLUMN `lease_until` DOUBLE NOT NULL DEFAULT 0 COMMENT '研究租约截止时间，过期允许恢复',
   MODIFY COLUMN `interval_seconds` BIGINT NOT NULL DEFAULT 0 COMMENT '领取时的研究冷却秒数',
   MODIFY COLUMN `budget_day` DOUBLE NOT NULL DEFAULT 0 COMMENT '控制行的独立研究日预算起点',
-  MODIFY COLUMN `daily_count` BIGINT NOT NULL DEFAULT 0 COMMENT '控制行的当日研究预留次数，失败也计数',
+  MODIFY COLUMN `daily_count` BIGINT NOT NULL DEFAULT 0 COMMENT '控制行当日研究预留次数；普通问题行的连续无新证据轮数',
   MODIFY COLUMN `updated` DOUBLE NOT NULL DEFAULT 0 COMMENT '最近调度状态变化时间，Unix秒';
 
 ALTER TABLE `mlw_companion_control`

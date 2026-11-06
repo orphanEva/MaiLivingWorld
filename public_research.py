@@ -59,21 +59,27 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
     searches = [("news", "web_search" if web else "news_search"), ("reference", "reference_search")]
     original_urls = {record["url"] for record in checked["records"]}
     row = None
+    complete_searches = True
     for provider, search in searches:
         found = await call(provider, search, {"query": topic, "limit": 3})
         if not found.get("success") or not valid():
             return {"success": False, "records": []}
-        rows = found["data"].get("items", [])
+        data = found.get("data")
+        rows = data.get("items") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             return {"success": False, "records": []}
         candidates = []
         seen = set(original_urls)
         for item in rows[:3]:
             if not isinstance(item, dict):
+                complete_searches = False
                 continue
             url = _public_url(item.get("url"))
             fields = [item.get(key) for key in ("title", "summary", "published_at", "updated_at")]
-            if not url or len(url) > 1000 or url in seen or any(value is not None and not isinstance(value, str) for value in fields):
+            if not url or len(url) > 1000 or any(value is not None and not isinstance(value, str) for value in fields):
+                complete_searches = False
+                continue
+            if url in seen:
                 continue
             seen.add(url)
             # Search-service handles are ephemeral. Use the public page and listing
@@ -85,7 +91,10 @@ async def investigate(bot, question, context, valid, on_dispatch=None):
         if row is not None:
             break
     if row is None:
-        return {"success": True, "records": []}
+        result = {"success": True, "records": []}
+        if complete_searches:
+            result["outcome"] = "no_new_evidence"
+        return result
     if provider == "reference":
         tool, args = "reference_read", {"page_id": row.get("page_id"), "language": row.get("language", "zh")}
     else:

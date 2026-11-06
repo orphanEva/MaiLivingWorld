@@ -19,6 +19,155 @@ QUESTION, VERSION = digest("question"), digest("listing")
 
 
 class ResearchStoreChecks:
+    def claim(self, db, now, *, version=QUESTION, interval=3600, daily_limit=100, key="q:public"):
+        return db.claim_research([key], question_versions={key: version}, interval_seconds=interval,
+                                 daily_limit=daily_limit, day_start=int(now//86400)*86400, now=now)
+
+    def research_row(self, db, key="q:public"):
+        return db._read("SELECT * FROM tool_research WHERE question_key=?", (key,))[0]
+
+    def test_empty_research_waits_longer_after_restart_and_caps_at_one_day(self):
+        db, stamp = self.store(), 100
+        for round_number, delay in enumerate((7200, 14400, 28800, 57600, 86400, 86400), 1):
+            claim = self.claim(db, stamp)
+            self.assertIsNotNone(claim)
+            db.finish_research("q:public", True, now=stamp+1, token=claim["token"],
+                               no_evidence=True, question_version=QUESTION)
+            row = self.research_row(db)
+            self.assertEqual((row["status"], row["failures"], row["daily_count"], row["lease_token"]),
+                             ("no_evidence", 0, round_number, QUESTION))
+            self.assertEqual(row["next_attempt"], stamp+1+delay)
+            db = self.store()
+            stamp = row["next_attempt"]
+            self.assertIsNone(self.claim(db, stamp-1))
+
+    def test_empty_count_is_bounded_and_preserves_long_configured_intervals(self):
+        db, stamp = self.store(), 100
+        for index in range(21):
+            claim = self.claim(db, stamp, interval=1)
+            db.finish_research("q:public", True, now=stamp+0.5, token=claim["token"],
+                               no_evidence=True, question_version=QUESTION)
+            row = self.research_row(db)
+            self.assertEqual(row["daily_count"], min(20, index+1))
+            self.assertLessEqual(row["next_attempt"]-stamp-0.5, 86400)
+            stamp = row["next_attempt"]
+        stamp += 172800
+        claim = self.claim(db, stamp, interval=172800)
+        db.finish_research("q:public", True, now=stamp+1, token=claim["token"],
+                           no_evidence=True, question_version=QUESTION)
+        self.assertEqual(self.research_row(db)["next_attempt"], stamp+1+172800)
+
+    def test_evidence_and_failures_reset_empty_rounds_with_independent_failure_count(self):
+        db = self.store()
+        first = self.claim(db, 100)
+        db.finish_research("q:public", True, now=101, token=first["token"],
+                           no_evidence=True, question_version=QUESTION)
+        evidence = self.claim(db, 7301)
+        db.finish_research("q:public", True, now=7302, token=evidence["token"])
+        row = self.research_row(db)
+        self.assertEqual((row["status"], row["daily_count"], row["lease_token"], row["next_attempt"]),
+                         ("succeeded", 0, "", 10902))
+        empty = self.claim(db, 10902)
+        db.finish_research("q:public", True, now=10903, token=empty["token"],
+                           no_evidence=True, question_version=QUESTION)
+        failed = self.claim(db, 18103)
+        db.finish_research("q:public", False, now=18104, token=failed["token"])
+        row = self.research_row(db)
+        self.assertEqual((row["status"], row["failures"], row["daily_count"], row["next_attempt"]),
+                         ("failed", 1, 0, 21704))
+        failed = self.claim(db, 21704)
+        db.finish_research("q:public", False, now=21705, token=failed["token"])
+        self.assertEqual(self.research_row(db)["next_attempt"], 28905)
+        empty = self.claim(db, 28905)
+        db.finish_research("q:public", True, now=28906, token=empty["token"],
+                           no_evidence=True, question_version=QUESTION)
+        row = self.research_row(db)
+        self.assertEqual((row["failures"], row["daily_count"], row["next_attempt"]), (0, 1, 36106))
+
+    def test_revised_question_resets_empty_wait_after_global_interval_and_quota(self):
+        db = self.store()
+        first = self.claim(db, 100)
+        db.finish_research("q:public", True, now=101, token=first["token"],
+                           no_evidence=True, question_version=QUESTION)
+        revised = digest("new sources and question")
+        self.assertIsNone(self.claim(db, 3699, version=revised))
+        self.assertIsNone(self.claim(db, 3700, version=revised, daily_limit=1))
+        self.assertIsNone(self.claim(db, 3700))
+        claim = self.claim(db, 3700, version=revised)
+        self.assertIsNotNone(claim)
+        db.finish_research("q:public", True, now=3701, token=claim["token"],
+                           no_evidence=True, question_version=revised)
+        row = self.research_row(db)
+        self.assertEqual((row["daily_count"], row["lease_token"], row["next_attempt"]),
+                         (1, revised, 10901))
+        with self.assertRaisesRegex(ValueError, "research_lease_lost"):
+            db.finish_research("q:public", False, now=3702, token=first["token"])
+        self.assertEqual(self.research_row(db), row)
+
+    def test_version_change_keeps_live_lease_and_expired_finish_cannot_override_reclaim(self):
+        db = self.store()
+        old = self.claim(db, 100, interval=60)
+        revised = digest("new question")
+        self.assertIsNone(self.claim(db, 160, version=revised, interval=60))
+        new = self.claim(db, 700, version=revised, interval=60)
+        self.assertIsNotNone(new)
+        with self.assertRaisesRegex(ValueError, "research_lease_lost"):
+            db.finish_research("q:public", True, now=701, token=old["token"],
+                               no_evidence=True, question_version=QUESTION)
+        self.assertEqual(self.research_row(db)["lease_token"], new["token"])
+        db.finish_research("q:public", True, now=702, token=new["token"],
+                           no_evidence=True, question_version=revised)
+        self.assertEqual(self.research_row(db)["daily_count"], 1)
+
+    def test_legacy_research_call_still_uses_ordinary_success_interval(self):
+        db = self.store()
+        first = db.claim_research(["q:legacy"], interval_seconds=60, daily_limit=10, day_start=0, now=100)
+        db.finish_research("q:legacy", True, now=101)
+        row = self.research_row(db, "q:legacy")
+        self.assertEqual((row["status"], row["daily_count"], row["next_attempt"]), ("succeeded", 0, 161))
+        self.assertIsNotNone(first)
+        second = db.claim_research(["q:legacy"], interval_seconds=60, daily_limit=10, day_start=0, now=161)
+        self.assertIsNotNone(second)
+
+    def test_research_versions_and_empty_outcomes_are_validated(self):
+        db = self.store()
+        for versions in ([], {"q:other": QUESTION}, {"q:public": "raw question"}, {"q:public": None}):
+            with self.assertRaisesRegex(ValueError, "invalid_question_versions"):
+                db.claim_research(["q:public"], interval_seconds=60, daily_limit=10,
+                                  day_start=0, now=100, question_versions=versions)
+        claim = self.claim(db, 100)
+        row = self.research_row(db)
+        for success, options in ((False, {"no_evidence": True, "question_version": QUESTION}),
+                                 (True, {"no_evidence": True}),
+                                 (True, {"no_evidence": 1, "question_version": QUESTION}),
+                                 (True, {"question_version": "raw question"})):
+            with self.assertRaisesRegex(ValueError, "invalid_research_result"):
+                db.finish_research("q:public", success, now=101, token=claim["token"], **options)
+        with self.assertRaisesRegex(ValueError, "invalid_research_result"):
+            db.finish_research("q:public", True, now=101, no_evidence=True, question_version=QUESTION)
+        self.assertEqual(self.research_row(db), row)
+
+    def test_concurrent_revised_question_claims_consume_one_slot(self):
+        db = self.store()
+        first = self.claim(db, 100)
+        db.finish_research("q:public", True, now=101, token=first["token"],
+                           no_evidence=True, question_version=QUESTION)
+        barrier = threading.Barrier(2)
+        def claim():
+            connection = self.store()
+            try:
+                barrier.wait(timeout=30)
+                return self.claim(connection, 3700, version=digest("revised question"))
+            finally:
+                self.stores.remove(connection)
+                connection.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(claim) for _ in range(2)]
+            results = [future.result(timeout=50) for future in futures]
+        self.assertEqual(sum(result is not None for result in results), 1)
+        row = self.research_row(db)
+        self.assertEqual((row["attempts"], row["daily_count"], row["status"]), (2, 0, "running"))
+
     def read(self, db, *, provider="news", text="报道节选：望远镜", now=10):
         url = URL if provider == "news" else "https://zh.wikipedia.org/wiki/Telescope"
         record = db.put_observation(provider, "article", text, "public:"+provider,

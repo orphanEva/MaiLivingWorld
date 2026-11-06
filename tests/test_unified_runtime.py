@@ -48,6 +48,16 @@ def rendered(result):
 
 
 class UnifiedRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_expression_cache_version_tracks_preference_and_source_metadata(self):
+        from MaiLivingWorld.unified_runtime import _memory_version
+        record = {"id": "test", "text": "unchanged", "timestamp": 1, "weight": 0.00000001,
+                  "url": "https://zh.wikipedia.org/wiki/Europa", "source_name": "reference", "origin_key": "original"}
+        before = _memory_version([record])
+        for field, value in (("weight", 0.00000002), ("url", "https://zh.wikipedia.org/wiki/Moon"),
+                             ("source_name", "unverified"), ("origin_key", "replaced")):
+            with self.subTest(field=field):
+                self.assertNotEqual(before, _memory_version([{**record, field: value}]))
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.bot = self.make_bot()

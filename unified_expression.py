@@ -56,6 +56,9 @@ _GROWTH_INTEREST = re.compile(
     r"自我兴趣：(?P<topic>.{1,180})（偏好强度 (?P<weight>[+-][01]\.\d{2})，负值表示不喜欢）"
     r"(?P<detail>；.*)?"
 )
+_REFERENCE_REVISION = re.compile(
+    r"\A百科节选\((?:中文维基百科|English Wikipedia)(?P<metadata> 修订(?P<revision>[1-9][0-9]{0,18}))(?= )"
+)
 PERSPECTIVES = {"source_memory", "self_preference", "self_opinion", "self_emotion", "general_knowledge"}
 
 
@@ -139,6 +142,14 @@ def _records(memories: Any, *, include_mention_history: bool = False, include_pu
         if ident in records:
             duplicates.add(ident)
             continue
+        source_url = _public_source_url(item)
+        revision = None
+        if source_url and item.get("source_name") == "reference":
+            revision = _REFERENCE_REVISION.match(text)
+            if revision:
+                # Reader-generated version metadata remains attributable without
+                # granting numeric identifiers in the article body a disclosure bypass.
+                text = text[:revision.start("metadata")] + text[revision.end("metadata"):]
         records[ident] = {
             "id": ident, "text": text,
             "scope": str(item.get("scope", ""))[:100],
@@ -148,6 +159,10 @@ def _records(memories: Any, *, include_mention_history: bool = False, include_pu
             "sensitivity": sensitivity,
             "evidence_status": str(item.get("evidence_status", "unknown"))[:60],
         }
+        weight = item.get("weight")
+        if (item.get("source") == "growth" and item.get("kind") == "interest"
+                and type(weight) in (int, float) and -1 <= weight <= 1):
+            records[ident]["weight"] = weight
         if item.get("recently_asked") is True:
             records[ident]["recently_asked"] = True
         if include_mention_history and item.get("previously_mentioned") is True and not item.get("derived"):
@@ -160,14 +175,14 @@ def _records(memories: Any, *, include_mention_history: bool = False, include_pu
                     records[ident]["previously_mentioned"] = True
         if correction_id:
             records[ident]["correction_id"] = correction_id
-        if include_public_links or (include_browse_dates and item.get("browse_date")):
-            source_url = _public_source_url(item)
-            if source_url:
-                if include_public_links:
-                    records[ident]["source_url"] = source_url
-                if (include_browse_dates and item.get("source_name") in ("news", "reference") and isinstance(item.get("browse_date"), str)
-                        and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", item["browse_date"])):
-                    records[ident]["browse_date"] = item["browse_date"]
+        if revision:
+            records[ident]["source_revision"] = revision.group("revision")
+        if source_url:
+            if include_public_links:
+                records[ident]["source_url"] = source_url
+            if (include_browse_dates and isinstance(item.get("browse_date"), str)
+                    and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", item["browse_date"])):
+                records[ident]["browse_date"] = item["browse_date"]
     for ident in duplicates:
         records.pop(ident, None)
     return records
@@ -283,6 +298,9 @@ def _approved_self_view(record: dict[str, Any]) -> tuple[str, str]:
         match = _GROWTH_INTEREST.fullmatch(text)
         if match:
             weight = float(match["weight"])
+            precise = record.get("weight")
+            if type(precise) in (int, float) and f"{precise:+.2f}" == match["weight"]:
+                weight = precise
             if -1 <= weight <= 1:
                 if weight > 0:
                     preference = "目前更愿意了解和接触"
@@ -351,6 +369,8 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
                 direct["attribution"] = "public_material"
             if record.get("source_url"):
                 direct.update(attribution="public_material", source_url=record["source_url"])
+                if record.get("source_revision"):
+                    direct["source_revision"] = record["source_revision"]
                 if owner_reply and record.get("browse_date"):
                     direct["browse_date"] = record["browse_date"]
             if (is_owner is True and record.get("recently_asked") is True
@@ -454,6 +474,9 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
                     visible[-1]["attribution"] = "来自查到的公开资料。转述时保留资料的说法，阅读或观看进度另需依据。"
                     if item.get("source_url"):
                         visible[-1]["source_url"] = item["source_url"]
+                        revision = item.get("source_revision")
+                        if isinstance(revision, str) and re.fullmatch(r"[1-9][0-9]{0,18}", revision):
+                            visible[-1]["source_revision"] = revision
                     if item.get("browse_date"):
                         visible[-1]["reading"] = item["browse_date"] + " 自主浏览时亲自选中并读到这份材料。日期是阅读时间。"
                 elif item.get("attribution") == "owner_correction" and corrected:

@@ -37,7 +37,7 @@ from .brain_runtime import BRAIN_MARKER, evidence_from_qq, parse_proposal, build
 from .self_state import SelfState
 from .unified_memory import collect_memories, resolve_memories, derived_memories
 from .unified_runtime import UnifiedRuntime, _memory_version
-from .growth_store import GrowthStore, source_fingerprint
+from .growth_store import GrowthStore, MAX_ITEMS as MAX_GROWTH_ITEMS, source_fingerprint
 from .growth_runtime import GrowthRuntime, style_hint
 from .tool_store import ToolStore
 from .mcp_client import StdioMCPClient, MCPError
@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.32.0",
+        default="0.33.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.32.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.33.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1206,20 +1206,42 @@ class MaiLivingWorld(MaiBotPlugin):
                     discovery_turn = bool(before and before.get("discovery_period")
                                           and before["speaker_id"] == normalize_qq(self.config.owner.qq)
                                           and before["scope"] == "private:" + before["speaker_id"])
+                    interest_turn = bool(before and before.get("interest_question")
+                                         and before["speaker_id"] == normalize_qq(self.config.owner.qq)
+                                         and before["scope"] == "private:" + before["speaker_id"])
                     def recall(query):
-                        nonlocal recalled, discovery_turn
+                        nonlocal recalled, discovery_turn, interest_turn
                         resolved = reference.resolve(kwargs) if reference else None
                         context = runtime.context(kwargs)
                         discovery_turn = False
+                        interest_turn = False
                         if resolved and resolved["status"] in {"ambiguous", "unavailable"}:
                             records = []
                         elif resolved and resolved["status"] == "resolved":
+                            from .social_discovery import reading_reaction_question
                             focus = resolved["records"]
                             ids = {row["id"] for row in focus}
-                            related = [] if resolved.get("question_progress") else [row for row in self._collect_unified(resolved["query"])
+                            candidates = [] if resolved.get("question_progress") else self._collect_unified(resolved["query"])
+                            if reading_reaction_question(query):
+                                candidates = self._interest_memories() + candidates
+                            related = [row for row in candidates
                                        if row["id"] not in ids and any(
                                            ref.get("id") in ids for ref in row.get("sources", []) if isinstance(ref, dict))]
-                            records = (focus + related)[:self.config.unified_mind.recall_limit]
+                            combined = {row["id"]: row for row in focus + related}
+                            records = list(combined.values())[:self.config.unified_mind.recall_limit]
+                        elif context and context.get("interest_question"):
+                            owner = normalize_qq(self.config.owner.qq)
+                            interest_turn = (context["speaker_id"] == owner and context["scope"] == "private:"+owner)
+                            direction = context["interest_question"]
+                            interests = self._interest_memories() if interest_turn else []
+                            interests = [row for row in interests if direction == "mixed"
+                                         or (direction == "positive" and row["weight"] > 0)
+                                         or (direction == "negative" and row["weight"] < 0)]
+                            limit = self.config.unified_mind.recall_limit
+                            selected = interests[:max(1, min(3, limit // 2))]
+                            source_ids = list(dict.fromkeys(ref["id"] for row in selected for ref in row["sources"]))
+                            roots = self._resolve_roots(source_ids) if source_ids else {}
+                            records = (selected + list(roots.values()))[:limit]
                         elif context and context.get("discovery_period"):
                             from .social_discovery import dated_reads
                             owner = normalize_qq(self.config.owner.qq)
@@ -1248,6 +1270,11 @@ class MaiLivingWorld(MaiBotPlugin):
                     if discovery_turn and runtime.context(kwargs) == before:
                         hints["discovery"] = ("主人在问你这段时间自己逛到的见闻。只从本轮获准提及且标明亲自选读的资料里挑想聊的一件，"
                                               "分清节选与摘要。缺少对应记录就自然说明，不补写发帖、与人互动或受托查询的经历。")
+                    if interest_turn and runtime.context(kwargs) == before:
+                        hints["interests"] = ("主人在问你自己的喜好。只从本轮获准表达的自身兴趣里挑一两项自然聊，"
+                                              "区分愿意了解、不太感兴趣和没有明显倾向。缺少对应记录时可以说还没形成明确的偏好。"
+                                              "解释时只用本轮获准表达的原始依据，材料本身不证明喜欢或不喜欢的原因。原因不清楚就保留不确定。"
+                                              "不把主人的爱好说成自己的，不补写童年、线下经历或一直如此的性格。")
                     social = self._social_runtime()
                     if (social and before and before["scope"] == "private:"+before["speaker_id"]
                             and runtime.context(kwargs) == before):
@@ -1625,6 +1652,16 @@ class MaiLivingWorld(MaiBotPlugin):
                 ref["id"] in resolved and source_fingerprint(resolved[ref["id"]]) == ref["digest"]
                 for ref in item["sources"])]
         return state
+
+    def _interest_memories(self) -> list[dict]:
+        if not (self.config.growth.enabled and self.config.growth.mode == "active" and self._ensure_growth()):
+            return []
+        state = {"interests": self._growth.state()["interests"]}
+        refs = list(dict.fromkeys(ref["id"] for item in state["interests"] for ref in item["sources"]))
+        resolved = {}
+        for offset in range(0, len(refs), 128):
+            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        return derived_memories(state, resolved, fingerprint=source_fingerprint, limit=MAX_GROWTH_ITEMS)
 
     def _derived_memories(self, query="") -> list[dict]:
         if not (self.config.growth.enabled and self.config.growth.mode == "active" and self._ensure_growth()):
@@ -2399,8 +2436,10 @@ class MaiLivingWorld(MaiBotPlugin):
         if external_valid is not None and not external_valid():
             return False
         store = self._ensure_tool_store()
+        question_versions = {key: tool_digest(value) for key, value in questions.items()}
         claim = store.claim_research(list(questions), interval_seconds=cfg.research_interval_seconds,
-            daily_limit=cfg.research_daily_limit, day_start=tool_day_start(self.config.general.timezone))
+            daily_limit=cfg.research_daily_limit, day_start=tool_day_start(self.config.general.timezone),
+            question_versions=question_versions)
         if not claim:
             return
         owner = self._self_state.state()["owner_id"]
@@ -2417,11 +2456,12 @@ class MaiLivingWorld(MaiBotPlugin):
                     and self.config.growth.mode == "active" and self.config.unified_mind.enabled
                     and any(item == questions[claim["question_key"]]
                             for item in self._growth_snapshot()["questions"]))
-        success, evidence = False, []
+        success, evidence, no_evidence = False, [], False
         try:
             if public:
                 result = await investigate(self, question, context, valid, on_dispatch)
                 success, evidence = result["success"], result["records"]
+                no_evidence = result.get("outcome") == "no_new_evidence"
                 if success and evidence and valid():
                     # Old question roots accompany the new source so the existing
                     # proposal and independent review can reassess the same question.
@@ -2457,7 +2497,8 @@ class MaiLivingWorld(MaiBotPlugin):
             success = False
         finally:
             success = success and valid()
-            store.finish_research(claim["question_key"], success, token=claim["token"])
+            store.finish_research(claim["question_key"], success, token=claim["token"],
+                no_evidence=no_evidence and success, question_version=question_versions[claim["question_key"]])
         return {"success": bool(success), "records": evidence if success else []} if with_evidence else success
 
     @API("living_world_growth_status", description="管理员查看成长状态和恢复队列的计数，不返回私人正文", public=False)

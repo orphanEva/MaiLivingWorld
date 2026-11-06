@@ -358,17 +358,17 @@ CREATE TABLE IF NOT EXISTS `mlw_tool_tasks` (
 
 CREATE TABLE IF NOT EXISTS `mlw_tool_research` (
     question_key VARCHAR(191) PRIMARY KEY COMMENT '待研究问题键或内部控制行标识，不保存问题正文',
-    status VARCHAR(191) NOT NULL DEFAULT 'idle' COMMENT 'idle、running、succeeded或failed',
+    status VARCHAR(191) NOT NULL DEFAULT 'idle' COMMENT '问题为idle、running、succeeded、failed或no_evidence，内部标记行另用状态或摘要',
     attempts BIGINT NOT NULL DEFAULT 0 COMMENT '研究领取次数，控制行记录全局次数',
     failures BIGINT NOT NULL DEFAULT 0 COMMENT '连续失败次数，用于指数退避',
     last_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '最近领取时间，重启保留冷却和轮转顺序',
     next_attempt DOUBLE NOT NULL DEFAULT 0 COMMENT '允许下次研究该问题的时间，Unix秒',
     last_finish DOUBLE NOT NULL DEFAULT 0 COMMENT '最近完成时间，Unix秒',
-    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '研究租约令牌，本地轮转控制行保存上一问题键',
+    lease_token VARCHAR(191) NOT NULL DEFAULT '' COMMENT '运行中研究租约；无新证据时为问题版本；内部标记可存上一问题键或来源编号',
     lease_until DOUBLE NOT NULL DEFAULT 0 COMMENT '研究租约截止时间，过期允许恢复',
     interval_seconds BIGINT NOT NULL DEFAULT 0 COMMENT '领取时的研究冷却秒数',
     budget_day DOUBLE NOT NULL DEFAULT 0 COMMENT '控制行的独立研究日预算起点',
-    daily_count BIGINT NOT NULL DEFAULT 0 COMMENT '控制行的当日研究预留次数，失败也计数',
+    daily_count BIGINT NOT NULL DEFAULT 0 COMMENT '控制行当日研究预留次数；普通问题行的连续无新证据轮数',
     updated DOUBLE NOT NULL DEFAULT 0 COMMENT '最近调度状态变化时间，Unix秒'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='跨重启研究轮转租约退避及独立预算，本地检索轮转不消耗网络额度';
 

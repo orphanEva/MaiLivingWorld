@@ -27,7 +27,7 @@ _AUTH_ERRORS = {"mastodon_not_configured": "social_setup_required", "mastodon_un
                 "mastodon_invalid_config": "social_setup_required", "mastodon_forbidden": "social_permission_required"}
 
 
-def public_interests(memories):
+def _public_interest_scores(memories):
     scores = dict.fromkeys(_TOPICS, 0.0)
     for record in memories:
         if record.get("kind") != "interest" or not isinstance(record.get("topic"), str):
@@ -38,8 +38,34 @@ def public_interests(memories):
         for topic in _TOPICS:
             if topic in record["topic"]:
                 scores[topic] += weight
+    return {topic: round(max(-1.0, min(1.0, score)), 8) for topic, score in scores.items()}
+
+
+def public_interests(memories):
+    scores = _public_interest_scores(memories)
     likes = [topic for topic in _TOPICS if scores[topic] > 0]
     return likes or [topic for topic in _TOPICS if scores[topic] == 0]
+
+
+def _search_topic(scores, sequence):
+    topics = [topic for topic in _TOPICS if scores[topic] > 0]
+    if not topics:
+        topics = [topic for topic in _TOPICS if scores[topic] == 0]
+    tickets = {topic: max(1, round(scores[topic] * 10)) for topic in topics}
+    # At most 100 stable slots, using the existing persisted browsing sequence.
+    schedule = [topic for turn in range(10) for topic in topics if tickets[topic] > turn]
+    return schedule[(sequence-1) % len(schedule)] if schedule else ""
+
+
+def _interest_signature(memories):
+    versions = [{field: record.get(field) for field in ("id", "topic", "weight", "sources", "revision")}
+                for record in memories]
+    return digest([_public_interest_scores(memories), versions])
+
+
+def _candidate_interest(row, scores):
+    text = str(row.get("title") or row.get("text") or "")[:200] + str(row.get("summary") or "")[:140]
+    return sum(weight for topic, weight in scores.items() if topic in text)
 
 
 def public_reply_text(value):
@@ -119,17 +145,18 @@ class SocialRuntime:
         except Exception:
             return {}
 
-    async def _choose(self, choices, topics, valid, *, article=None):
+    async def _choose(self, choices, topics, valid, *, interest_scores=None, article=None):
         menu = [{"number": i, "source": provider, "title": str(row.get("title") or row.get("text") or "")[:200],
                  "excerpt": str(row.get("summary") or "")[:140]} for i, (provider, _, row) in enumerate(choices, 1)]
         if not menu:
             return None
-        data = {"公开兴趣方向": topics, "条目": menu}
-        instruction = "按自己的兴趣判断有没有真正想打开的条目。公开提及也可以跳过。"
+        data = {"公开兴趣方向": topics, "兴趣倾向": interest_scores or {}, "条目": menu}
+        instruction = "按自己的兴趣判断有没有真正想打开的条目。未知方向可以了解，公开提及也可以跳过。"
         if article is not None:
             data["读过的公开文章"] = article
             instruction = "只选与这篇文章讨论同一件具体事情、值得加入的对话。仅仅属于同一兴趣领域时选0。"
-        decision = await self._model(instruction + '只返回 {"number":整数}，0表示跳过。', data, valid)
+        decision = await self._model(instruction + '兴趣倾向为-1到1，正值越高越感兴趣，负值表示目前不喜欢，优先略过。'
+                                     '只返回 {"number":整数}，0表示跳过。', data, valid)
         n = decision.get("number")
         return choices[n-1] if set(decision) == {"number"} and type(n) is int and 1 <= n <= len(choices) else None
 
@@ -145,16 +172,20 @@ class SocialRuntime:
         if not seq:
             return
         generation = bot._mcp_generation
+        interests = bot._interest_memories()
+        interest_signature = _interest_signature(interests)
+        scores = _public_interest_scores(interests)
         signature = (bot._mcp_signature("mastodon"), bot._mcp_source_signature("mastodon"),
                      bot._mcp_source_signature("news"), bot.config.general.dry_run)
         def valid():
             return (self.owner() == owner and bot._mcp_generation == generation and signature ==
                     (bot._mcp_signature("mastodon"), bot._mcp_source_signature("mastodon"),
-                     bot._mcp_source_signature("news"), bot.config.general.dry_run))
+                     bot._mcp_source_signature("news"), bot.config.general.dry_run)
+                    and interest_signature == _interest_signature(bot._interest_memories()))
         # A private person or memory must never become an outbound search query.
         # Project interests onto a small public vocabulary; descriptions stay here.
-        topics = public_interests(bot._derived_memories())
-        topic = topics[(seq-1) % len(topics)] if topics else ""
+        topics = public_interests(interests)
+        topic = _search_topic(scores, seq)
         context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "social-exploration",
                    "mid": f"{key}:{seq}", "query": topic, "public_search_terms": [topic]}
         account = ""
@@ -203,7 +234,8 @@ class SocialRuntime:
                 unread = store.new_social_articles(owner, versions)
                 batch = {ref: row for ref, row in batch.items()
                          if not articles[ref] or articles[ref][0] in unread}
-            for ref, row in list(batch.items())[:4]:
+            ranked = sorted(batch.items(), key=lambda item: _candidate_interest(item[1], scores), reverse=True)
+            for ref, row in ranked[:4]:
                 seen.add(ref)
                 choices.append((provider, tool, row))
 
@@ -224,7 +256,7 @@ class SocialRuntime:
             add("news", "news_read", await read("news", "news_search", {"limit": 10}))
             if topic and os.environ.get("MLW_BRAVE_SEARCH_KEY"):
                 add("news", "web_read", await read("news", "web_search", {"query": topic, "limit": 5}))
-        choice = await self._choose(choices, topics, valid)
+        choice = await self._choose(choices, topics, valid, interest_scores=scores)
         if not choice or not valid():
             return
         provider, tool, selected = choice
@@ -245,7 +277,7 @@ class SocialRuntime:
                 target = linked[1]
             else:
                 related = [c for c in choices if c[0] == "mastodon"]
-                reference = await self._choose(related, topics, valid, article={
+                reference = await self._choose(related, topics, valid, interest_scores=scores, article={
                     "标题": str(original.get("title", ""))[:160], "节选": article, "材料类型": original.get("basis")})
                 if not reference:
                     return
@@ -266,9 +298,10 @@ class SocialRuntime:
                 parent_text = str(parent.get("text") or "")[:650]
         decision = await self._model('这是一个真实的公开讨论。只有想接住原帖、能提出具体问题或有内容可说时才回复。'
             '不要认同无依据的报道，不冒充亲历、人工用户或实际账号操作，不拉人、不加链接。'
-            '如材料不相关、对方不欢迎机器人或不想接话，返回 {"reply":""}。否则仅返回 {"reply":"简短回复正文"}。',
+            '兴趣倾向的负值表示目前不喜欢，可以略过。如材料不相关、对方不欢迎机器人或不想接话，'
+            '返回 {"reply":""}。否则仅返回 {"reply":"简短回复正文"}。',
             {"原帖": str(original["text"])[:1400], "对方引用的账号本人公开原话": parent_text,
-             "另一个来源的节选": article, "兴趣方向": topics}, valid)
+             "另一个来源的节选": article, "兴趣方向": topics, "兴趣倾向": scores}, valid)
         text = public_reply_text(decision.get("reply")) if set(decision) == {"reply"} else ""
         if text and valid():
             await self.post(original["id"], text, identity, owner, valid)

@@ -114,7 +114,8 @@ class SocialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         visible = await self.ask("read-recall", "你最近读过什么？")
         self.assertIn(REFERENCE["url"], visible)
         self.assertIn(AUTONOMOUS, visible)
-        self.assertIn("修订98", visible)
+        self.assertIn("source_revision", visible)
+        self.assertNotIn("修订98", visible)
         self.mode = "omit"
         hidden = await self.ask("read-hidden", "你最近读过什么？")
         self.assertNotIn(REFERENCE["url"], hidden)

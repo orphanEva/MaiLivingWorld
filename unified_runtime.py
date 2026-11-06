@@ -30,7 +30,8 @@ def _memory_version(items):
         [{key: memory.get(key) for key in (
             "id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
             "timestamp", "source", "kind", "sources", "revision", "correction_id",
-            "recently_asked", "previously_mentioned", "derived", "browse_date")}
+            "recently_asked", "previously_mentioned", "derived", "browse_date", "weight",
+            "url", "source_name", "origin_key")}
          for memory in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -102,12 +103,15 @@ class UnifiedRuntime:
         if requests:
             self._contexts[key]["public_search_terms"] = requests
         if sender.kind == "private":
-            from .social_discovery import discovery_period
+            from .social_discovery import discovery_period, interest_question
             period = discovery_period(text)
-            if period or text.startswith("公开回复 "):
+            interest = interest_question(text)
+            if period or interest or text.startswith("公开回复 "):
                 direct = direct_message_text(message, self.state.state()["owner_id"])
                 if direct and period and direct == text:
                     self._contexts[key]["discovery_period"] = period
+                elif direct and interest and direct == text:
+                    self._contexts[key]["interest_question"] = interest
                 elif direct and direct.startswith("公开回复 "):
                     self._contexts[key]["public_reply_digest"] = hashlib.sha256(direct.encode()).hexdigest()
             self._private[sender.stream_id] = sender.message_id
