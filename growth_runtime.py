@@ -115,7 +115,7 @@ class GrowthRuntime:
                         available.get(ref["id"]) == ref["digest"] for ref in item["sources"])]
                 result = await request(build_growth_prompt(records, state, review_beliefs=review_beliefs,
                     emotional_episodes=emotional_episodes), budget.min_interval_seconds)
-                proposal = parse_growth(result, records, review_beliefs=review_beliefs, state=state if review_beliefs else None,
+                proposal = parse_growth(result, records, review_beliefs=review_beliefs, state=state,
                     emotional_episodes=emotional_episodes)
                 if proposal is None:
                     raise ValueError("invalid_proposal")

@@ -53,6 +53,27 @@ def public_reply_text(value):
     return text
 
 
+def article_candidate(tool, row):
+    from .public_news import _article_url
+    from .public_web_search import _public_url
+    url, title = row.get("url"), row.get("title")
+    if (not isinstance(title, str) or not title.strip() or not isinstance(url, str)
+            or len(url) > 1000 or _public_url(url) != url):
+        return None
+    if tool == "news_read":
+        try:
+            if _article_url(row.get("id"))[1] != url:
+                return None
+        except ValueError:
+            return None
+    elif tool != "web_read":
+        return None
+    fields = [row.get(key) for key in ("title", "summary", "published_at")]
+    if any(value is not None and not isinstance(value, str) for value in fields):
+        return None
+    return url, digest([tool, *fields])
+
+
 class SocialRuntime:
     def __init__(self, bot):
         self.bot = bot
@@ -141,7 +162,7 @@ class SocialRuntime:
         def post_version(row):
             return digest([row.get("text", ""), row.get("spoiler_text", "")])
 
-        async def read(provider, tool, args):
+        async def read(provider, tool, args, *, article=None):
             if not valid() or not bot._mcp_provider_enabled(provider):
                 return {}
             result = await bot._mcp_bridge.execute(provider, tool, args, config=cfg, context=context, owner=owner,
@@ -152,6 +173,9 @@ class SocialRuntime:
             if result.get("code") in _AUTH_ERRORS:
                 store.social_help(key, _AUTH_ERRORS[result["code"]])
             data = result.get("data", {}) if result.get("success") else {}
+            if (article and data.get("id") == args.get("id") and data.get("text")
+                    and data.get("url") == article[0] and data.get("basis") in {"article", "web_excerpt"}):
+                store.mark_social_article_read(owner, *article, call_id=result["call_id"])
             if (account and provider == "mastodon" and tool == "mastodon_read"
                     and data.get("id") == args.get("id") and data.get("text")
                     and data.get("visibility") == "public" and data.get("account_id") != identity.get("account_id")):
@@ -173,6 +197,12 @@ class SocialRuntime:
                 versions = {digest([account, row["id"]]): post_version(row) for row in batch.values()}
                 unread = store.new_social_posts(account, versions) if account else set()
                 batch = {ref: row for ref, row in batch.items() if digest([account, row["id"]]) in unread}
+            elif provider == "news" and cfg.remember_results:
+                articles = {ref: article_candidate(tool, row) for ref, row in batch.items()}
+                versions = dict(candidate for candidate in articles.values() if candidate)
+                unread = store.new_social_articles(owner, versions)
+                batch = {ref: row for ref, row in batch.items()
+                         if not articles[ref] or articles[ref][0] in unread}
             for ref, row in list(batch.items())[:4]:
                 seen.add(ref)
                 choices.append((provider, tool, row))
@@ -191,14 +221,15 @@ class SocialRuntime:
         elif cfg.social_mode == "参与讨论" or not cfg.public_sources_enabled:
             store.social_help(key, "social_setup_required")
         if cfg.public_sources_enabled:
-            add("news", "news_read", await read("news", "news_search", {"limit": 4}))
+            add("news", "news_read", await read("news", "news_search", {"limit": 10}))
             if topic and os.environ.get("MLW_BRAVE_SEARCH_KEY"):
-                add("news", "web_read", await read("news", "web_search", {"query": topic, "limit": 4}))
+                add("news", "web_read", await read("news", "web_search", {"query": topic, "limit": 5}))
         choice = await self._choose(choices, topics, valid)
         if not choice or not valid():
             return
         provider, tool, selected = choice
-        original = await read(provider, tool, {"id": selected["id"]})
+        candidate = article_candidate(tool, selected) if provider == "news" and cfg.remember_results else None
+        original = await read(provider, tool, {"id": selected["id"]}, article=candidate)
         if original.get("id") != selected["id"] or not original.get("text") or not valid():
             return
         if not identity.get("account_id") or cfg.social_mode != "参与讨论" or bot.config.general.dry_run:

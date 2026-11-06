@@ -50,7 +50,7 @@ required = (
     "repair_store.py", "repair_model.py", "repair_runtime.py",
     "belief_revision.py", "emotion_episodes.py", "memory_archive.py",
     "visual_model.py", "chat_media.py", "bilibili_media.py", "media_http.py", "visual_runtime.py",
-    "public_mcp_server.py", "public_news.py", "public_reference.py", "public_web_search.py", "mastodon_api.py", "social_runtime.py", "social_discovery.py",
+    "public_mcp_server.py", "public_news.py", "public_reference.py", "public_web_search.py", "public_research.py", "mastodon_api.py", "social_runtime.py", "social_discovery.py",
     "scripts/evaluate_companion.py", "evaluations/companion_scenarios.json", "deploy/EVALUATION.md",
     "scripts/backup_state.py", "scripts/migrate_all_sqlite_to_mysql.py", "scripts/migrate_sqlite_to_mysql.py",
     "sql/mysql.sql", "sql/mysql_comments_existing.sql", "deploy/BACKUP.md",

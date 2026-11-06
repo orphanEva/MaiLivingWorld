@@ -20,6 +20,19 @@ _QUESTION = re.compile(
 )
 RECEIPT_PREFIX = "autobrowse:v1:"
 _RECEIPT = re.compile(RECEIPT_PREFIX + r"(tool:observation:[0-9a-f]{64}):([0-9a-f]{64})")
+_REACTION_QUESTIONS = {
+    "你觉得它哪里有意思", "你觉得它怎么样", "你觉得刚才那篇怎么样",
+    "你怎么看刚才读的", "你怎么看刚才那篇", "你对刚才那篇有什么看法",
+    "刚才那篇你怎么看", "刚才那篇哪里让你感兴趣", "你为什么对它感兴趣",
+    "你喜欢它什么", "你喜欢刚才那篇的什么", "你最喜欢它哪一点",
+}
+
+
+def reading_reaction_question(text):
+    if not isinstance(text, str) or len(text) > 80:
+        return False
+    text = unicodedata.normalize("NFKC", text).strip().rstrip("?？!！。~～").strip()
+    return text in _REACTION_QUESTIONS
 
 
 def discovery_period(text):

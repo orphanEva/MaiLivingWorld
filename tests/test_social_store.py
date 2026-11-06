@@ -21,6 +21,57 @@ ACCOUNT = fingerprint("instance,verified account")
 
 
 class SocialStoreChecks:
+    def test_article_freshness_requires_recent_autonomous_body_and_matching_listing(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        owner, url = "12345678", "https://www.ithome.com/0/875/123.htm"
+        db = self.store()
+        listing, revised = fingerprint("title,summary,date"), fingerprint("updated-title,summary,date")
+        source = db.put_observation("news", "article", "报道节选：天文观测", "public:news",
+                                    sensitivity="public", url=url, now=10)
+        self.assertFalse(db.mark_social_article_read(owner, url, listing,
+                                                   call_id="tool:call:"+fingerprint("missing"), now=11))
+        call = db.reserve_call("news", "news_read", fingerprint("article"), "window", "private:"+owner, owner, 0, 20, now=12)
+        db.complete_call(call["id"], "succeeded", browse_receipt(source), now=13)
+        self.assertTrue(db.mark_social_article_read(owner, url, listing, call_id=call["id"], now=14))
+        second = self.store()
+        candidates = {url: listing, **{f"https://observatory.example/article/{i}": listing for i in range(9)}}
+        with patch.object(second, "_read", wraps=second._read) as reads:
+            self.assertEqual(second.new_social_articles(owner, candidates, now=15), set(candidates)-{url})
+            self.assertEqual(reads.call_count, 3)
+        self.assertEqual(second.new_social_articles(owner, {url: revised}, now=15), {url})
+        self.assertEqual(second.new_social_articles("87654321", {url: listing}, now=15), {url})
+        self.assertEqual(second.new_social_articles(owner, {url: listing}, now=14+86400), {url})
+        self.assertEqual(second.new_social_articles(owner, {url: listing}, now=12), {url})
+        # This call cannot borrow the previous call's valid body receipt.
+        incomplete = db.reserve_call("news", "news_read", fingerprint("next"), "window", "private:"+owner,
+                                     owner, 0, 20, now=15)
+        db.complete_call(incomplete["id"], "succeeded", now=15)
+        self.assertFalse(db.mark_social_article_read(owner, url, revised, call_id=incomplete["id"], now=15))
+        self.assertEqual(second.new_social_articles(owner, {url: revised}, now=15), {url})
+        # A manual reread that changes the source invalidates the old autonomous receipt.
+        db.put_observation("news", "article", "报道节选：更正后的观测", "public:news",
+                           sensitivity="public", url=url, now=16)
+        self.assertEqual(second.new_social_articles(owner, {url: listing}, now=17), {url})
+        self.assertFalse(second.mark_social_article_read(owner, url, listing, call_id=call["id"], now=17))
+
+    def test_summary_failed_read_or_retracted_article_does_not_suppress_candidate(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        owner, url, listing = "12345678", "https://www.ithome.com/0/875/123.htm", fingerprint("listing")
+        db = self.store()
+        source = db.put_observation("news", "summary", "订阅摘要：天文观测", "public:news",
+                                    sensitivity="public", url=url, now=10)
+        call = db.reserve_call("news", "news_read", fingerprint("summary"), "window", "private:"+owner, owner, 0, 20, now=11)
+        db.complete_call(call["id"], "succeeded", browse_receipt(source), now=12)
+        self.assertFalse(db.mark_social_article_read(owner, url, listing, call_id=call["id"], now=13))
+        self.assertEqual(db.new_social_articles(owner, {url: listing}, now=14), {url})
+        db.retract_observation("news", "summary", now=15)
+        self.assertEqual(db.new_social_articles(owner, {url: listing}, now=16), {url})
+        for invalid in ({url+"?token=secret": listing}, {"https://127.0.0.1/a": listing}, {url: "raw-title"}):
+            with self.assertRaises(ValueError):
+                db.new_social_articles(owner, invalid, now=16)
+        with self.assertRaises(ValueError):
+            db.new_social_articles(owner, {url+str(i): listing for i in range(11)}, now=16)
+
     def test_recent_discoveries_require_same_owner_current_source_and_completed_read(self):
         from MaiLivingWorld.social_discovery import browse_receipt
         owner = "12345678"

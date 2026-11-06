@@ -115,6 +115,39 @@ class EmotionPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(APPRECIATION, result)
         self.assertEqual(self.bot.ctx.llm.generate.await_count, 1)
 
+    async def test_reaction_question_reuses_mentioned_source_and_its_grounded_emotions(self):
+        await self.learn()
+        self.bot.config.reference.enabled = True
+        await self.reply()
+        with patch("time.time", return_value=self.now):
+            await self.bot.reference_send_feedback(sent=True, message=message(
+                mid="reaction-topic-sent", uid="99999999", text=EVENT))
+        self.assertTrue(self.bot._reference.store.state(OWNER)["active"])
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        self.bot.config.reference.enabled = True
+
+        async def expression(prompt, **options):
+            data = json.loads(prompt.rsplit("UNTRUSTED_INPUT_JSON\n", 1)[1])
+            return response({"behavior": "neutral", "decisions": [
+                {"id": row["id"], "mode": "say"} for row in data["memories"]]})
+        self.bot.ctx.llm.generate.side_effect = expression
+        for enabled, mid in ((True, "reaction-current"), (False, "reaction-without-episodes")):
+            self.bot.config.growth.emotional_episodes = enabled
+            event = message(mid=mid, text="你觉得它哪里有意思？", sid="new-private")
+            event["raw_message"] = [{"type": "text", "data": event["processed_plain_text"]}]
+            with patch("time.time", return_value=self.now):
+                await self.bot.capture_unified(message=event)
+                output = await self.bot.brain_reply_hint(
+                    session_id="new-private", reply_message_id=mid,
+                    messages=[{"role": "system", "content": "宿主提示"}])
+            visible = json.dumps(output, ensure_ascii=False)
+            self.assertIn(EVENT, visible)
+            self.assertIn("自己的判断", visible)
+            self.assertEqual(APPRECIATION in visible, enabled)
+            self.assertEqual(DISAPPOINTMENT in visible, enabled)
+            self.assertEqual("self_emotion" in visible, enabled)
+
     async def test_private_reactions_do_not_become_group_or_other_person_facts(self):
         await self.learn()
         for mid, args in (("group", {"group": GROUP, "sid": "group-one"}),

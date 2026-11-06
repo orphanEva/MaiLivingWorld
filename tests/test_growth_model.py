@@ -10,6 +10,7 @@ from MaiLivingWorld.growth_model import (
     build_growth_prompt, build_growth_review_prompt, empty_growth,
     parse_growth, review_growth,
 )
+from MaiLivingWorld.growth_store import source_fingerprint
 
 
 def record(ident="event:one", *, source="brain_event", scope="private:12345678", **extra):
@@ -214,6 +215,45 @@ class GrowthModelTests(unittest.TestCase):
         self.assertEqual(len(data["source_records"]), 1)
         self.assertNotIn("不要传递无关的私人内容", prompt)
         self.assertEqual(sources, before)
+
+    def test_resolved_review_includes_original_question_and_its_verified_roots(self):
+        original = record("event:original", text="原始测量中输入规模不同。")
+        answer = record("event:answer", text="控制相同输入规模后再比较性能。")
+        private = record("event:unrelated", text="无关的私人事情。")
+        ref = {"id": original["id"], "digest": source_fingerprint(original)}
+        question = {"topic": "性能测量", "text": "怎样排除输入规模造成的测量误差？", "status": "open", "sources": [ref]}
+        state = {"questions": [question, {"topic": "其他事情", "text": "无关的私人问题。", "status": "open", "sources": []}]}
+        proposal = empty_growth()
+        proposal["questions"] = [{"topic": "性能测量", "question": "使用相同输入规模进行比较", "status": "resolved",
+                                   "evidence_ids": [answer["id"]]}]
+        sources = [original, answer, private]
+        before = copy.deepcopy((proposal, state, sources))
+        prompt = build_growth_review_prompt(proposal, sources, state=state)
+        data = json.loads(prompt.split("UNTRUSTED_GROWTH_REVIEW\n", 1)[1])
+        self.assertEqual(data["previous_questions"], [{"topic": "性能测量", "text": question["text"], "status": "open",
+                                                       "evidence_ids": [original["id"]]}])
+        self.assertEqual({row["id"] for row in data["source_records"]}, {original["id"], answer["id"]})
+        self.assertNotIn("无关的私人", prompt)
+        self.assertEqual((proposal, state, sources), before)
+
+    def test_resolved_review_excludes_missing_changed_or_out_of_budget_roots(self):
+        original = record("event:original", text="旧问题的原始材料。")
+        answer = record("event:answer", text="后续公开材料。")
+        question = {"topic": "性能测量", "text": "旧私人问题不可凭猜测显示", "status": "open",
+                    "sources": [{"id": original["id"], "digest": source_fingerprint(original)}]}
+        proposal = empty_growth()
+        proposal["questions"] = [{"topic": "性能测量", "question": "使用相同输入规模进行比较", "status": "resolved",
+                                   "evidence_ids": [answer["id"]]}]
+        over_budget = [answer]+[record("event:filler"+str(i)) for i in range(11)]+[original]
+        for sources in ([answer], [answer, original | {"text": "来源已被更正"}], over_budget):
+            with self.subTest(source_count=len(sources)):
+                prompt = build_growth_review_prompt(proposal, sources, state={"questions": [question]})
+                self.assertEqual(prompt, "")
+                self.assertIsNone(parse_growth(json.dumps(proposal), sources, state={"questions": [question]}))
+        for state in ({}, {"questions": [question | {"status": "resolved"}]},
+                      {"questions": [question | {"topic": "另一个问题"}]}):
+            self.assertIsNone(parse_growth(json.dumps(proposal), [original, answer], state=state))
+        self.assertIsNotNone(parse_growth(json.dumps(proposal), [answer]))
 
 
 if __name__ == "__main__":

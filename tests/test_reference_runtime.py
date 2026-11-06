@@ -96,6 +96,47 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.resolve(kwargs), resolved)
         self.assertEqual(self.runtime.store.state(OWNER), before)
 
+    async def test_reading_reaction_preserves_only_a_verified_mentioned_source(self):
+        await self.focus()
+        self.runtime.close()
+        self.runtime = ReferenceRuntime(self.bot)
+        for index, text in enumerate(("你觉得它哪里有意思？", "你怎么看刚才读的？")):
+            event = message("reaction-"+str(index), sid="return-private", text=text)
+            event["raw_message"] = [{"type": "text", "data": text}]
+            result = self.runtime.resolve(self.capture_event(event))
+            self.assertEqual(result["status"], "resolved")
+            self.assertEqual([r["id"] for r in result["records"]], [self.first["id"]])
+            self.assertIn("还没形成看法", result["hint"])
+            self.assertIn("自己的判断", result["hint"])
+        self.source("first", "此前的来源已经修订。")
+        event = message("after-change", text="你怎么看刚才读的？")
+        event["raw_message"] = [{"type": "text", "data": event["processed_plain_text"]}]
+        self.assertEqual(self.runtime.resolve(self.capture_event(event))["status"], "unavailable")
+
+    async def test_reaction_does_not_infer_an_unmentioned_ambiguous_or_quoted_subject(self):
+        text = "你觉得它哪里有意思"
+        def event(mid):
+            return {**message(mid, text=text), "raw_message": [{"type": "text", "data": text}]}
+        self.assertEqual(self.runtime.resolve(self.capture_event(event("no-focus")))["status"], "unavailable")
+        await self.focus(records=[self.first, self.second])
+        self.assertEqual(self.runtime.resolve(self.capture_event(event("two-focus")))["status"], "ambiguous")
+        for kind in ("forward", "reply", "different", "missing"):
+            context = self.capture(mid="new-focus-"+kind)
+            self.runtime.stage(context, [self.first])
+            self.assertTrue(await self.sent(self.first["text"], mid="new-sent-"+kind))
+            quoted = event("quoted-"+kind)
+            if kind == "forward":
+                quoted["raw_message"] = [{"type": "forward", "data": text}]
+            elif kind == "reply":
+                quoted["reply_to"] = "earlier-message"
+            elif kind == "different":
+                quoted["raw_message"] = [{"type": "text", "data": "主人引用了别人的问句"}]
+            else:
+                quoted.pop("raw_message")
+            result = self.runtime.resolve(self.capture_event(quoted))
+            self.assertEqual(result["status"], "unavailable", kind)
+            self.assertNotIn("自己的判断", result["hint"])
+
     async def test_multiple_mentions_require_clarification_without_source_text(self):
         await self.focus(records=[self.first, self.second])
         result = self.runtime.resolve(self.capture(mid="later", text="那件事呢"))
@@ -370,7 +411,8 @@ class ReferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.sent(self.first["text"], mid="new-approval"))
 
     def test_only_self_contained_short_followups_match(self):
-        for text in ("那件事", "后来呢？", "继续说。", "上次那件事"):
+        for text in ("那件事", "后来呢？", "继续说。", "上次那件事", "你觉得它哪里有意思？", "你怎么看刚才读的"):
             self.assertTrue(is_followup(text))
-        for text in ("你觉得那件事里的角色名字怎么样", "他说：后来呢", "别继续说", "那件事和旅游哪个好"):
+        for text in ("你觉得那件事里的角色名字怎么样", "他说：后来呢", "别继续说", "那件事和旅游哪个好",
+                     "她问你怎么看刚才读的", "“你觉得它哪里有意思”", "你怎么看刚才读的那本新书", "你觉得茶叶怎么泡"):
             self.assertFalse(is_followup(text))

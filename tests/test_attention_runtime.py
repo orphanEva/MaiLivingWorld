@@ -212,6 +212,27 @@ class AttentionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(a.store.state(OWNER)["last_outcome"], "progress")
         self.assertFalse(a.snapshot()["focus_available"])
 
+    async def test_public_reader_configuration_change_invalidates_running_focus(self):
+        a = self.bot._attention
+        a.candidates = lambda: [{"kind": "research", "key": "question", "version": "a"*64}]
+        activity_signature = a._activity_signature()
+        async def research(**kwargs):
+            self.assertTrue(kwargs["external_valid"]())
+            self.bot.config.mcp.public_sources_enabled = True
+            self.assertFalse(kwargs["external_valid"]())
+            return True
+        self.bot._research_tools = AsyncMock(side_effect=research)
+        await a.tick()
+        self.assertNotEqual(a._activity_signature(), activity_signature)
+        self.assertEqual(a.store.state(OWNER)["last_outcome"], "interrupted")
+
+    async def test_activity_source_signature_survives_runtime_generation(self):
+        attention = self.bot._attention
+        activity_signature, running_signature = attention._activity_signature(), attention.signature()
+        self.bot._mcp_generation += 1
+        self.assertEqual(attention._activity_signature(), activity_signature)
+        self.assertNotEqual(attention.signature(), running_signature)
+
     async def test_group_reply_target_remains_exact(self):
         await self.capture("一起聊聊", "owner-group", group=GROUP, sid="group-one")
         await self.capture("我是主人", "other-group", group=GROUP, uid=OTHER, sid="group-one")

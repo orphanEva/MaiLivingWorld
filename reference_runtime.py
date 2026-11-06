@@ -10,8 +10,9 @@ import time
 from .delivery import verify_owner_delivery
 from .growth_store import source_fingerprint
 from .mcp_runtime import digest
-from .owner import extract_sender, normalize_qq
+from .owner import direct_message_text, extract_sender, normalize_qq
 from .reference_store import ReferenceStore
+from .social_discovery import reading_reaction_question
 from .unified_expression import _can_say, _records
 from .unified_memory import _source_id
 
@@ -25,6 +26,9 @@ _NEUTRAL = {"你好", "嗨", "在吗", "早上好", "晚上好", "早安", "晚�
             "谢谢", "谢谢你", "我回来了", "回来了", "我忙完了", "忙完了"}
 _CLARIFY = "[MaiLivingWorld:reference]\n这句短指代暂不能唯一对应仍有效的话题。先简短问清指的是哪件事，不猜对象或编造后续。"
 _CONTINUE = "[MaiLivingWorld:reference]\n这句短指代可承接最近实际提及且来源仍有效的同一话题。只依据本轮允许表达的记忆，不补猜新的进展。"
+_REACTION = ("主人在问你对刚才材料的看法。先说其中具体吸引你、让你犹豫或不认同的一点，"
+             "把报道内容和自己的判断说清楚。只有本轮提供相关的既有兴趣、观点或感受时，"
+             "才据此延续原来的态度；也可以说还没形成看法。不补写亲身经历、阅读进度或长久偏好。")
 _BOILERPLATE = re.compile(r"MaiLivingWorld|主人(?:原话|更正|自述)|未经?独立(?:核实|验证)|作品元数据|未阅读或观看正文|记录于|收到于", re.I)
 _END_PUNCTUATION = " \t\n\r。！？.!?"
 
@@ -34,7 +38,7 @@ def _short(text):
 
 
 def is_followup(text):
-    return _short(text) in _FOLLOWUPS
+    return _short(text) in _FOLLOWUPS or reading_reaction_question(text)
 
 
 def _ref(row):
@@ -124,6 +128,8 @@ class ReferenceRuntime:
         parts, text = message.get("raw_message"), message.get("processed_plain_text")
         pure = not (isinstance(parts, list) and any(not isinstance(p, dict) or p.get("type") != "text" for p in parts)
                     or any(message.get(k) for k in ("is_picture", "is_voice", "is_emoji")))
+        if reading_reaction_question(text):
+            pure = pure and direct_message_text(message, self.owner()) == text
         control = bool(message.get("is_command") or isinstance(text, str) and text.startswith("/"))
         keep = bool(_short(text) not in _CLEAR and (not pure or control or is_followup(text) or _short(text) in _NEUTRAL))
         receipt = digest(["input", self.owner(), sender.stream_id, sender.message_id])
@@ -217,7 +223,8 @@ class ReferenceRuntime:
             return result
         records = self._resolve(state["focus_refs"], context)
         if len(records) == 1:
-            result.update(query=query+" "+records[0]["text"][:240], records=records, hint=_CONTINUE, status="resolved")
+            hint = _CONTINUE + ("\n" + _REACTION if reading_reaction_question(query) else "")
+            result.update(query=query+" "+records[0]["text"][:240], records=records, hint=hint, status="resolved")
         return result
 
     def _live(self, state):

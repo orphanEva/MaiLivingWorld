@@ -740,7 +740,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.30")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.31")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -755,6 +755,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V29_LEDGERS, backup.V28_LEDGERS)
         self.assertEqual(backup.V30_LEDGERS, backup.V29_LEDGERS)
         self.assertIsNot(backup.V30_LEDGERS, backup.V29_LEDGERS)
+        self.assertEqual(backup.V31_LEDGERS, backup.V30_LEDGERS)
+        self.assertIsNot(backup.V31_LEDGERS, backup.V30_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -775,7 +777,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1267,7 +1269,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.30")
+        self.assertEqual(current["catalog"], "v0.31")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1800,7 +1802,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.30")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.31")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

@@ -15,8 +15,9 @@ import unicodedata
 from typing import Any
 
 from .policy import extract_text
-from .belief_revision import FIELDS as BELIEF_REVIEW_FIELDS, assessment_view, validate_review
+from .belief_revision import FIELDS as BELIEF_REVIEW_FIELDS, assessment_view, validate_review, normalized as normalize_topic
 from .emotion_episodes import normalize_candidate as normalize_emotion, PROMPT_RULES as EMOTION_RULES, REVIEW_RULES as EMOTION_REVIEW
+from .growth_store import source_fingerprint
 
 
 LIMITS = {"interests": 2, "beliefs": 2, "knowledge": 2, "questions": 1, "traits": 2}
@@ -187,8 +188,29 @@ def _independent_trait_sources(ids: list[str], sources: dict[str, dict]) -> bool
     return len(identities) >= 3 and len(contents) >= 3 and "" not in contents
 
 
+def _previous_question(topic, state, records, sources):
+    if not isinstance(state, dict) or not isinstance(state.get("questions"), list) or not isinstance(records, list):
+        return None
+    question = next((row for row in state["questions"] if isinstance(row, dict)
+                     and isinstance(row.get("topic"), str) and normalize_topic(row["topic"]) == normalize_topic(topic)
+                     and row.get("status") == "open"), None)
+    if question is None:
+        return None
+    refs, text = question.get("sources"), question.get("text")
+    if (not isinstance(refs, list) or not 1 <= len(refs) <= MAX_RECORDS
+            or not isinstance(text, str) or not 1 <= len(text) <= 280):
+        return None
+    originals = {row["id"]: row for row in records[:MAX_RECORDS] if isinstance(row, dict) and row.get("id") in sources}
+    try:
+        if not all(ref["id"] in sources and source_fingerprint(originals[ref["id"]]) == ref["digest"] for ref in refs):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"topic": question["topic"], "text": text, "status": "open", "evidence_ids": [ref["id"] for ref in refs]}
+
+
 def _normalize(proposal: Any, sources: dict[str, dict] | None, *, review_beliefs=False, state=None,
-               emotional_episodes=False) -> dict[str, Any] | None:
+               emotional_episodes=False, records=None) -> dict[str, Any] | None:
     sections = set(SECTIONS) | ({"emotions"} if emotional_episodes else set())
     if not isinstance(proposal, dict) or set(proposal) != sections:
         return None
@@ -247,6 +269,9 @@ def _normalize(proposal: Any, sources: dict[str, dict] | None, *, review_beliefs
                 question = _safe_text(item["question"], 180, sources)
                 if not question or item["status"] not in ("open", "resolved"):
                     return None
+                if (item["status"] == "resolved" and state is not None
+                        and _previous_question(topic, state, records, sources) is None):
+                    return None
                 row.update(question=question, status=item["status"])
             else:
                 statement = _safe_text(item["statement"], 180, sources)
@@ -293,7 +318,7 @@ def parse_growth(result: Any, records: list[dict], *, review_beliefs=False, stat
     """Strictly validate structure/evidence. Semantic approval is still required."""
     data = _json_object(result)
     return _normalize(data, _sources(records), review_beliefs=review_beliefs, state=state,
-                      emotional_episodes=emotional_episodes)
+                      emotional_episodes=emotional_episodes, records=records)
 
 
 def _state_view(state: Any, *, emotional_episodes=False) -> dict[str, Any]:
@@ -393,7 +418,8 @@ def build_growth_prompt(records: list[dict], state: dict, *, review_beliefs=Fals
 def build_growth_review_prompt(proposal: dict, records: list[dict], *, review_beliefs=False, state=None,
                               emotional_episodes=False) -> str:
     sources = _sources(records)
-    checked = _normalize(proposal, sources, review_beliefs=review_beliefs, state=state, emotional_episodes=emotional_episodes)
+    checked = _normalize(proposal, sources, review_beliefs=review_beliefs, state=state,
+                         emotional_episodes=emotional_episodes, records=records)
     if checked is None:
         return ""
     referenced = set()
@@ -402,9 +428,18 @@ def build_growth_review_prompt(proposal: dict, records: list[dict], *, review_be
         for item in checked[name]:
             referenced.update(item["evidence_ids"])
     referenced.update(checked["mood"].get("evidence_ids", []))
+    resolved_questions = [item for item in checked["questions"] if item["status"] == "resolved"]
+    previous_questions = []
+    for question in resolved_questions:
+        previous = _previous_question(question["topic"], state, records, sources)
+        if previous is not None:
+            referenced.update(previous["evidence_ids"])
+            previous_questions.append(previous)
     indexed = {name: [{"index": i, **item} for i, item in enumerate(checked[name])] for name in categories}
     indexed["mood"] = checked["mood"]
     data = {"proposal": indexed, "source_records": [sources[key] for key in sources if review_beliefs or key in referenced]}
+    if resolved_questions:
+        data["previous_questions"] = previous_questions
     if review_beliefs:
         data["current_self"] = _state_view(state, emotional_episodes=emotional_episodes)
     return (
@@ -418,6 +453,8 @@ def build_growth_review_prompt(proposal: dict, records: list[dict], *, review_be
         "兴趣必须说明智能体为何会继续探索，而非复制某人的喜欢；单一用户偏好不足以批准。"
         "traits需要多次独立经历，不能是同一件事的事件/事实/笔记别名，也不能由一次情绪反馈决定。"
         "知识需来源支持；观点可以修订但不能伪装成已证实知识；问题resolved必须有真实答案证据。"
+        "复核resolved时，逐项核对previous_questions中同主题的原问题及其原始来源，确认新证据真正回答了原问题；"
+        "缺少对应原问题、缺少原始依据或新资料只讨论了相关主题时，拒绝该resolved候选。"
         "有relation的观点还须核对旧主张、全部原始依据与候选：reinforce不能改变主张；refine不能暗中反转；"
         "challenge必须确有相反或削弱的原话证据。逐字引用必须保留否定/条件/范围。旧观点和候选计数不能自证，"
         "沿用candidate_text的候选必须由新原文支持同一含义和关系，不能只为凑次数附会证据。"

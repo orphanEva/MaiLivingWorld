@@ -50,7 +50,7 @@ class ProjectsRuntime:
         b = self.bot
         return digest([self._generation, self._activity_token, self.owner(), b.config.plugin.enabled, b.config.projects.model_dump(),
                        b.config.growth.model_dump(), b.config.unified_mind.model_dump(), b.config.reading.model_dump(),
-                       b._mcp_generation, b._mcp_signature("pixiv"), b._mcp_source_signature("pixiv")])
+                       b._mcp_generation, b._research_signature()])
 
     def _activity(self):
         b, owner = self.bot, self.owner()
@@ -89,14 +89,16 @@ class ProjectsRuntime:
         if not self.enabled() or not self.bot._ensure_growth():
             return []
         cfg = self.bot.config
-        if not (cfg.mcp.enabled and cfg.mcp_pixiv.enabled and cfg.mcp.remember_results
-                and (cfg.mcp.research_enabled or cfg.reading.enabled and cfg.reading.auto_continue)):
+        reading_available = (cfg.mcp.enabled and cfg.mcp_pixiv.enabled and cfg.mcp.remember_results
+                             and cfg.reading.enabled and cfg.reading.auto_continue)
+        if not (self.bot._research_available() or reading_available):
             return []
         state = self.bot._growth_snapshot()
         interests = [row for row in state["interests"] if row.get("weight", 0) > 0 and row.get("status", "active") == "active"]
         seeds = []
         for question in state["questions"]:
-            if question.get("status") != "open":
+            if (question.get("status") != "open"
+                    or not (self.bot._research_available(question) or reading_available)):
                 continue
             query = question["topic"]+" "+question["text"]
             matches = [(len(set(_terms(query)) & set(_terms(interest["topic"]))), interest) for interest in interests]
@@ -110,7 +112,7 @@ class ProjectsRuntime:
                     continue
                 seed = {"question_key": question["key"], "interest_key": interest["key"], "topic": question["topic"],
                         "question": question["text"], "seed_refs": refs,
-                        "source_signature": self.bot._mcp_source_signature("pixiv")}
+                        "source_signature": self.bot._research_source_signature()}
                 from .projects_store import seed_value
                 seed_value(seed)
             except (ValueError, TypeError, KeyError):
@@ -126,8 +128,9 @@ class ProjectsRuntime:
             return None
 
     def _current(self, row, *, active=False):
+        signature = self.bot._research_source_signature()
         if (not self.enabled() or row["owner_id"] != self.owner()
-                or row["seed"]["source_signature"] != self.bot._mcp_source_signature("pixiv")):
+                or row["seed"]["source_signature"] not in {signature, self.bot._mcp_source_signature("pixiv")}):
             return False
         try:
             refs = references(row["seed"]["seed_refs"]+row["evidence_refs"])
@@ -135,7 +138,10 @@ class ProjectsRuntime:
             return False
         if self._resolve(refs) is None:
             return False
-        return not active or row["seed"] in self.seed_candidates()
+        # Older projects retain their Pixiv source hash in storage. Validate it
+        # above, then compare the same seed under the current reader signature.
+        seed = dict(row["seed"], source_signature=signature)
+        return not active or seed in self.seed_candidates()
 
     def prepare(self):
         if not self.enabled() or self._activity()[0]:

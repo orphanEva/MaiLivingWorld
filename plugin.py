@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.30.0",
+        default="0.31.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -247,9 +247,9 @@ class MCPIntegration(PluginConfigBase):
     max_daily_calls: int = Field(default=100, ge=0, le=2000, description="所有 MCP 工具及图片读取共用的持久每日调用上限；失败计数")
     timeout_seconds: int = Field(default=30, ge=2, le=120, description="单次 MCP 请求超时；写入结果未知时不自动重试")
     max_response_bytes: int = Field(default=262144, ge=4096, le=1048576, description="解析后 MCP 结果大小上限；只连接管理员配置的可信服务")
-    research_enabled: bool = Field(default=False, description="未解问题可驱动 Pixiv 本地资料库查询，只读且不自动下载")
+    research_enabled: bool = Field(default=False, description="围绕未解问题继续查阅公开资料或 Pixiv 本地库，公开检索仅使用原始公开来源中的话题词", json_schema_extra={"label": "继续查阅未解问题"})
     research_interval_seconds: int = Field(default=3600, ge=60, le=86400, description="问题查阅全局最短间隔，重启保留游标与失败退避")
-    research_daily_limit: int = Field(default=6, ge=0, le=100, description="每天自主查阅轮数上限，每轮最多检索和读取一个结果各一次")
+    research_daily_limit: int = Field(default=6, ge=0, le=100, description="每天自主查阅轮数上限，每轮最多两次检索并读取一个结果，与聊天共用工具额度")
     media_enabled: bool = Field(default=False, description="允许主人私聊将 Pixiv 缓存图片交给模型观察；需本进程有后端 URL/API Key 环境变量")
     max_media_bytes: int = Field(default=8388608, ge=1024, le=33554432, description="单张图片读取字节上限，禁止跨站重定向和任意文件路径")
 
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.30.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.31.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -2362,13 +2362,35 @@ class MaiLivingWorld(MaiBotPlugin):
                 "connected": list(self._mcp_clients),
                 "last_status": self._mcp_bridge.last_status, **self._tool_store.status()}
 
+    def _research_available(self, question=None):
+        cfg = self.config.mcp
+        if not (cfg.enabled and cfg.research_enabled and cfg.remember_results):
+            return False
+        if self.config.mcp_pixiv.enabled:
+            return True
+        if not cfg.public_sources_enabled:
+            return False
+        if question is None:
+            return True
+        from .public_research import public_question
+        return public_question(question, self._resolve_roots) is not None
+
+    def _research_source_signature(self):
+        return tool_digest([self._mcp_source_signature("pixiv"), self._mcp_source_signature("news"),
+                            self._mcp_source_signature("reference")])
+
+    def _research_signature(self):
+        return tool_digest([self._mcp_generation, self._mcp_signature("pixiv"),
+                            self._research_source_signature(), self.config.growth.model_dump()])
+
     async def _research_tools(self, *, question_key=None, external_valid=None, with_evidence=False, on_dispatch=None):
         cfg = self.config.mcp
-        if not (cfg.enabled and cfg.research_enabled and cfg.remember_results and self.config.mcp_pixiv.enabled
+        if not (self._research_available() and self._unified_active()
                 and self._ensure_growth() and self.config.growth.mode == "active"):
             return
         state = self._growth_snapshot()
-        questions = {item["key"]: item for item in state["questions"] if item["status"] == "open"}
+        questions = {item["key"]: item for item in state["questions"]
+                     if item["status"] == "open" and self._research_available(item)}
         if question_key is not None:
             questions = {key: value for key, value in questions.items() if key == question_key}
         elif self.config.projects.enabled:
@@ -2383,50 +2405,53 @@ class MaiLivingWorld(MaiBotPlugin):
         if not claim:
             return
         owner = self._self_state.state()["owner_id"]
-        generation, signature = self._mcp_generation, self._mcp_signature("pixiv")
+        signature = self._research_signature()
+        question = questions[claim["question_key"]]
+        from .public_research import investigate, public_question
+        public = public_question(question, self._resolve_roots) if cfg.public_sources_enabled else None
         context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "internal-research",
                    "mid": claim["token"], "query": questions[claim["question_key"]]["topic"]}
         def valid():
             return ((external_valid is None or external_valid())
-                    and generation == self._mcp_generation and signature == self._mcp_signature("pixiv")
+                    and signature == self._research_signature() and self._unified_active()
                     and self._self_state.state()["owner_id"] == owner and self.config.growth.enabled
                     and self.config.growth.mode == "active" and self.config.unified_mind.enabled
                     and any(item == questions[claim["question_key"]]
                             for item in self._growth_snapshot()["questions"]))
         success, evidence = False, []
         try:
-            client = self._mcp_client("pixiv")
-            options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,
-                           timezone=self.config.general.timezone, record_observations=True)
-            if on_dispatch is not None:
-                options["on_dispatch"] = on_dispatch
-            found = await self._mcp_bridge.execute("pixiv", "search_library",
-                {"q": context["query"], "page_size": 1, "x_restrict": 0, "statuses": ["active"]}, **options)
-            if found.get("success") and valid():
-                rows = found["data"].get("items", [])
-                success = True
-                if rows and isinstance(rows[0], dict):
-                    ident = rows[0].get("pixiv_id")
-                    kind = "novel" if rows[0].get("type") == "novel" else "illust"
-                    if type(ident) is int and ident > 0:
-                        detail = await self._mcp_bridge.execute("pixiv", "get_library_work",
-                            {"pixiv_id": ident, "kind": kind, "file_limit": 1}, **options)
-                        success = bool(detail.get("success"))
-                        if success and with_evidence and valid():
-                            from .mcp_policy import observation
-                            from .tool_store import _digest as observation_digest
-                            item = observation("pixiv", "get_library_work", {"pixiv_id": ident, "kind": kind}, detail["data"])
-                            if item:
-                                import unicodedata
-                                key = "tool:observation:"+observation_digest("pixiv", item["resource_key"])
-                                origin = "tool:pixiv:"+observation_digest(item["origin_key"])
-                                evidence = [row for row in store.resolve([key])
-                                            if row["text"] == unicodedata.normalize("NFKC", item["text"]).strip()
-                                            and row["origin_key"] == origin]
+            if public:
+                result = await investigate(self, question, context, valid, on_dispatch)
+                success, evidence = result["success"], result["records"]
+                if success and evidence and valid():
+                    # Old question roots accompany the new source so the existing
+                    # proposal and independent review can reassess the same question.
+                    records = list({r["id"]: r for r in public["records"] + evidence}.values())
+                    self._growth.enqueue(records, mode=self.config.growth.mode)
+            else:
+                client = self._mcp_client("pixiv")
+                options = dict(config=cfg, context=context, owner=owner, client=client, valid=valid,
+                               timezone=self.config.general.timezone, record_observations=True)
+                if on_dispatch is not None:
+                    options["on_dispatch"] = on_dispatch
+                found = await self._mcp_bridge.execute("pixiv", "search_library",
+                    {"q": context["query"], "page_size": 1, "x_restrict": 0, "statuses": ["active"]}, **options)
+                if found.get("success") and valid():
+                    rows = found["data"].get("items", [])
+                    success = True
+                    if rows and isinstance(rows[0], dict):
+                        ident = rows[0].get("pixiv_id")
+                        kind = "novel" if rows[0].get("type") == "novel" else "illust"
+                        if type(ident) is int and ident > 0:
+                            detail = await self._mcp_bridge.execute("pixiv", "get_library_work",
+                                {"pixiv_id": ident, "kind": kind, "file_limit": 1}, **options)
+                            success = bool(detail.get("success"))
+                            if success and with_evidence and valid() and detail.get("observation"):
+                                evidence = [detail["observation"]]
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            success = False
         finally:
             success = success and valid()
             store.finish_research(claim["question_key"], success, token=claim["token"])

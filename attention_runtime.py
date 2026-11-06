@@ -56,7 +56,7 @@ class AttentionRuntime:
         return digest([self._generation, self.owner(), b.config.attention.model_dump(),
                        b.config.unified_mind.model_dump(), b.config.plugin.enabled,
                        b.config.reading.model_dump(), b.config.growth.model_dump(), b.config.projects.model_dump(),
-                       b._mcp_signature("pixiv")])
+                       b._research_signature()])
 
     def capture(self, message):
         if not self.enabled():
@@ -224,7 +224,7 @@ class AttentionRuntime:
         return digest([self.owner(), b.config.plugin.enabled, b.config.attention.model_dump(),
                        b.config.unified_mind.model_dump(), b.config.reading.model_dump(),
                        b.config.growth.model_dump(), b.config.projects.model_dump(),
-                       b._mcp_signature("pixiv"), b._mcp_source_signature("pixiv")])
+                       b._mcp_signature("pixiv"), b._research_source_signature()])
 
     def _activity_record(self, focus):
         """A content-free fingerprint of the still-valid original work and progress."""
@@ -253,11 +253,10 @@ class AttentionRuntime:
                 progress = digest([row["stage"], row["evidence_refs"], row["result"]])
                 proof = digest([row["id"], owner, row["status"], row["seed"], progress])
             elif focus["kind"] == "research":
-                if not (b.config.mcp.enabled and b.config.mcp.research_enabled and b.config.mcp.remember_results
-                        and b.config.mcp_pixiv.enabled and b.config.growth.enabled and b.config.growth.mode == "active"):
+                if not (b.config.growth.enabled and b.config.growth.mode == "active"):
                     return None
                 row = next((r for r in b._growth_snapshot()["questions"] if r["key"] == focus["key"]), None)
-                if not row:
+                if not row or not b._research_available(row):
                     return None
                 progress, proof = None, digest(row)
             else:
@@ -324,12 +323,11 @@ class AttentionRuntime:
                         and companion._current_refs(row) == row["source_refs"]):
                     rows.append({"kind": "reading", "key": row["id"], "version": digest([
                         row["version"], row["status"], row["source_refs"]])})
-        cfg = b.config.mcp
-        if (cfg.enabled and cfg.research_enabled and cfg.remember_results and b.config.mcp_pixiv.enabled
-                and b.config.growth.enabled and b.config.growth.mode == "active"):
+        if (b._research_available() and b.config.growth.enabled and b.config.growth.mode == "active"):
             state = b._growth_snapshot()
             interests = set().union(*(_terms(x.get("topic", "")) for x in state.get("interests", [])))
-            questions = [q for q in state.get("questions", []) if q["status"] == "open" and q["key"] not in occupied_questions]
+            questions = [q for q in state.get("questions", []) if q["status"] == "open"
+                         and q["key"] not in occupied_questions and b._research_available(q)]
             questions.sort(key=lambda q: (-len(set(_terms(q.get("topic", ""))) & interests), q["key"]))
             rows += [{"kind": "research", "key": q["key"], "version": digest(q)} for q in questions[:100]]
             if state.get("traits", {}).get("curiosity", .5) >= .55:

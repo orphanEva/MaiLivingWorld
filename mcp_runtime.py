@@ -165,6 +165,7 @@ class MCPBridge:
                 raise PolicyError("context_changed")
             item = observation(provider, tool, args, result) if record_observations else None
             summary = ""
+            saved = None
             if item:
                 public = provider in PUBLIC_PROVIDERS
                 saved = self.store.put_observation(provider=provider, **item, scope="public:"+provider if public else context["scope"],
@@ -182,7 +183,7 @@ class MCPBridge:
             result = self._filter_task_list(provider, tool, result, context)
             self.store.complete_call(call["id"], "succeeded", summary)
             self.last_status = "succeeded"
-            return {"success": True, "data": result, "arguments": args, "call_id": call["id"]}
+            return {"success": True, "data": result, "arguments": args, "call_id": call["id"], "observation": saved}
         except asyncio.CancelledError:
             if call and call["allowed"]:
                 self.store.complete_call(call["id"], "uncertain" if sent else "failed")

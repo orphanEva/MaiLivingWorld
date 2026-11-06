@@ -71,6 +71,19 @@ def _social_digest(value):
     return value
 
 
+def _social_article_inputs(owner, candidates):
+    from .owner import normalize_qq
+    from .public_web_search import _public_url
+    if not normalize_qq(owner) or normalize_qq(owner) != owner:
+        raise ValueError("invalid_social_owner")
+    if not isinstance(candidates, dict) or len(candidates) > 10:
+        raise ValueError("invalid_social_batch")
+    for url, version in candidates.items():
+        if not isinstance(url, str) or len(url) > 1000 or _public_url(url) != url:
+            raise ValueError("invalid_social_article")
+        _social_digest(version)
+
+
 def _reserved_research_key(key):
     return key in {_CONTROL, _LOCAL} or key.startswith(_SOCIAL)
 
@@ -610,15 +623,16 @@ class ToolStore:
         return self.reserve_call("mastodon", "mastodon_reply", _social_digest(target_key), "one-reply-per-status",
                                  "public:mastodon", _social_digest(account_key), day_start, max_daily, now=now)
 
-    def recent_social_reads(self, owner, now=None):
-        """Return the two latest self-selected public excerpts still at the exact version read."""
+    def recent_social_reads(self, owner, now=None, *, limit=2):
+        """Return bounded self-selected public excerpts still at the exact version read."""
         from .owner import normalize_qq
         from .social_discovery import RECEIPT_PREFIX, browse_receipt, parse_receipt
         if not normalize_qq(owner) or normalize_qq(owner) != owner:
             return []
+        _integer(limit, 1, 40)
         stamp = _now(now)
-        # The budget_day predicate uses the existing daily call index. The scheduler
-        # can finish at most four selections per day; ordinary lookup calls carry no marker.
+        # The budget_day predicate uses the existing daily call index. Only bounded
+        # autonomous browsing/research carries this marker; ordinary lookups do not.
         rows = self._read("SELECT payload,updated FROM tool_calls WHERE budget_day>=? AND updated BETWEEN ? AND ? "
                           "AND provider='news' AND tool IN ('news_read','web_read') AND status='succeeded' "
                           "AND scope=? AND subject_id=? AND payload LIKE ? ORDER BY updated DESC,id DESC LIMIT 40",
@@ -641,9 +655,66 @@ class ToolStore:
             if record and browse_receipt(record) == receipt:
                 selected.append({**record, "browse_time": finished})
                 del records[ident]
-                if len(selected) == 2:
+                if len(selected) == limit:
                     break
         return selected
+
+    def new_social_articles(self, owner, candidates, now=None):
+        """Keep changed or unseen listings, with a 24-hour ceiling on read-body suppression."""
+        from .social_discovery import browse_receipt
+        _social_article_inputs(owner, candidates)
+        if not candidates:
+            return set()
+        stamp = _now(now)
+        eligible = {r["url"]: r for r in self.recent_social_reads(owner, now=stamp, limit=40)
+                    if r["url"] in candidates and 0 <= stamp-r["browse_time"] < 86400
+                    and r["evidence_status"] in {"publisher_excerpt", "web_excerpt"}}
+        if not eligible:
+            return set(candidates)
+        slots = {_SOCIAL + "article:" + _digest(owner, url): url for url in eligible}
+        marks = ",".join("?" for _ in slots)
+        rows = self._read("SELECT question_key,lease_token,updated FROM tool_research WHERE question_key IN (" +
+                          marks + ")", tuple(slots))
+        blocked = set()
+        for row in rows:
+            url = slots[row["question_key"]]
+            if (0 <= stamp-float(row["updated"]) < 86400 and
+                    row["lease_token"] == _digest(candidates[url], browse_receipt(eligible[url]))):
+                blocked.add(url)
+        return set(candidates) - blocked
+
+    def mark_social_article_read(self, owner, url, version, *, call_id, now=None):
+        """Remember the listing fingerprint only after a freshly completed autonomous body read."""
+        from .social_discovery import browse_receipt, parse_receipt
+        _social_article_inputs(owner, {url: version})
+        if not isinstance(call_id, str) or not re.fullmatch(r"tool:call:[0-9a-f]{64}", call_id):
+            raise ValueError("invalid_call")
+        stamp = _now(now)
+        rows = self._read("SELECT payload FROM tool_calls WHERE id=? AND provider='news' "
+                          "AND tool IN ('news_read','web_read') AND status='succeeded' "
+                          "AND scope=? AND subject_id=? AND updated BETWEEN ? AND ?",
+                          (call_id, "private:"+owner, owner, stamp-60, stamp))
+        if not rows:
+            return False
+        try:
+            data = json.loads(rows[0]["payload"])
+        except (TypeError, ValueError):
+            return False
+        summary = data.get("summary") if isinstance(data, dict) else None
+        ref = parse_receipt(summary)
+        records = self.resolve([ref[0]]) if ref else []
+        record = records[0] if records else None
+        if (not record or record["url"] != url or browse_receipt(record) != summary
+                or record["evidence_status"] not in {"publisher_excerpt", "web_excerpt"}):
+            return False
+        slot = _SOCIAL + "article:" + _digest(owner, url)
+        token = _digest(version, summary)
+        with self.con:
+            self._lock()
+            self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+            self.con.execute("UPDATE tool_research SET lease_token=?,updated=? WHERE question_key=? AND updated<=?",
+                             (token, stamp, slot, stamp))
+        return True
 
     def new_social_posts(self, account_key, versions):
         """Filter at most ten target/version fingerprints with two indexed batch reads."""

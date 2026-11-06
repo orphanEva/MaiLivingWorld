@@ -156,6 +156,71 @@ class ProjectsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.prepare()
         self.assertEqual(len(self.runtime.store.items(OWNER)), 1)
 
+    async def test_public_question_reaches_attention_and_projects_without_pixiv(self):
+        b = self.bot
+        b.config.mcp_pixiv.enabled = False
+        b.config.mcp.public_sources_enabled = b.config.attention.enabled = True
+        source = b._tool_store.put_observation("news", "telescope:original", "报道节选：望远镜记录了观测资料。",
+            "public:news", sensitivity="public", url="https://www.ithome.com/0/875/123.htm")
+        proposal = empty_growth()
+        proposal["interests"] = [{"topic": "望远镜", "delta": .08, "evidence_ids": [source["id"]]}]
+        proposal["questions"] = [{"topic": "望远镜", "question": "望远镜提供了哪些观测资料？",
+                                  "status": "open", "evidence_ids": [source["id"]]}]
+        b._growth.enqueue([source])
+        job = b._growth.claim()
+        b._growth.complete(job["id"], job["token"], proposal, [source], expected_revision=b._growth.state()["revision"])
+
+        seeds = self.runtime.seed_candidates()
+        self.assertEqual([seed["topic"] for seed in seeds], ["望远镜"])
+        self.assertEqual(seeds[0]["source_signature"], b._research_source_signature())
+        attention = b._ensure_attention()
+        candidates = attention.candidates()
+        self.assertEqual([(row["kind"], row["key"]) for row in candidates], [("research", seeds[0]["question_key"])])
+        self.assertIsNotNone(attention._activity_record(candidates[0]))
+
+        row = self.runtime.prepare()
+        self.assertEqual(self.runtime.active_question_keys(), {seeds[0]["question_key"]})
+        self.assertEqual([item["kind"] for item in attention.candidates()], ["project"])
+        evidence = b._tool_store.put_observation("news", "telescope:followup", "报道节选：望远镜获得了补充观测数据。",
+            "public:news", sensitivity="public", url="https://www.ithome.com/0/875/124.htm")
+        b._research_tools = AsyncMock(return_value={"success": True, "records": [evidence]})
+        self.assertTrue((await self.runtime.tick())["success"])
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["stage"], "review")
+        b._research_tools.assert_awaited_once()
+        self.assertEqual(b._research_tools.call_args.kwargs["question_key"], seeds[0]["question_key"])
+        b._tool_store.retract_observation("news", "telescope:original")
+        self.assertIsNone(attention._activity_record(candidates[0]))
+        self.assertEqual(self.runtime.candidates(), [])
+
+    async def test_legacy_pixiv_project_continues_with_same_sources_after_restart(self):
+        seed = self.runtime.seed_candidates()[0]
+        seed["source_signature"] = self.bot._mcp_source_signature("pixiv")
+        row = self.runtime.store.create(OWNER, seed)
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
+        self.assertTrue((await self.runtime.tick())["success"])
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        self.assertEqual(len(self.runtime.candidates()), 1)
+        persisted = self.runtime.store.get(OWNER, row["id"])
+        self.assertEqual(persisted["stage"], "review")
+        self.assertEqual(persisted["seed"]["source_signature"], seed["source_signature"])
+        self.bot.config.mcp_pixiv.url = "http://127.0.0.1:9001/mcp"
+        self.assertFalse(self.runtime._current(persisted, active=True))
+
+    async def test_persisted_project_survives_runtime_generation_and_budget_changes(self):
+        row = await self.gathered()
+        signature = self.runtime.signature()
+        self.bot._mcp_generation += 1
+        self.bot.config.unified_mind.max_daily_model_calls += 1
+        self.assertNotEqual(signature, self.runtime.signature())
+        self.assertTrue(self.runtime._current(row, active=True))
+        await self.bot.on_unload()
+        self.bot, self.runtime = self.make_bot()
+        self.runtime.prepare()
+        self.assertEqual(self.runtime.store.get(OWNER, row["id"])["status"], "active")
+        self.assertEqual(len(self.runtime.candidates()), 1)
+
     async def test_empty_search_is_not_evidence_or_a_completed_project(self):
         self.bot._research_tools = AsyncMock(return_value={"success": True, "records": []})
         self.runtime.prepare()
