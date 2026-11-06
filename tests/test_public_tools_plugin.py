@@ -62,6 +62,7 @@ class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def capture(self, mid, text, **audience):
         event = message(mid, text=text, **audience)
+        event["raw_message"] = [{"type": "text", "data": text}]
         await self.bot.capture_unified(message=event)
         return event
 
@@ -163,6 +164,104 @@ class PublicToolsPluginTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config.mcp.public_sources_enabled = False
         self.assertFalse((await self.bot.mcp_tools("news", message=event))["success"])
         self.client.call_tool.assert_awaited_once_with("news_search", args)
+
+    async def test_external_search_never_extracts_an_unrequested_private_name(self):
+        self.bot.config.mcp.social_mode = "只逛逛"
+        self.client.call_tool.return_value = {"items": []}
+        for mid, text in (
+                ("private-name", "我室友周小宁今天睡得很差"),
+                ("different-request", "我室友周小宁今天睡得很差，帮我查一下木卫二"),
+                ("quoted", "朋友说“帮我查周小宁”，我只是转述一下"),
+                ("quoted-clauses", "朋友说“查木卫二，搜索周小宁”，我只是转述一下"),
+                ("hypothetical", "如果你搜周小宁会发生什么"),
+                ("refused", "不要搜周小宁"),
+                ("descriptive", "周小宁最近想了解天文")):
+            event = await self.capture(mid, text)
+            for provider, tool in (("news", "web_search"), ("reference", "reference_search"),
+                                   ("mastodon", "mastodon_search")):
+                result = await self.call(event, provider, tool, {"query": "周小宁"})
+                self.assertFalse(result["success"], (mid, result))
+                self.assertIn("ask_for_public_search_terms", result["content"])
+        self.client.call_tool.assert_not_called()
+        self.assertEqual(self.bot._ensure_tool_store().status()["call_budget"]["count"], 0)
+
+        for mid, text, topic in (
+                ("direct", "我室友周小宁今天睡得很差，帮我查一下木卫二", "木卫二"),
+                ("quoted-object", "请搜索“木卫二”", "木卫二"),
+                ("english", "Please search for Europa", "Europa")):
+            event = await self.capture(mid, text)
+            result = await self.call(event, "reference", "reference_search", {"query": topic})
+            self.assertTrue(result["success"], (mid, result))
+        self.assertEqual([call.args[1] for call in self.client.call_tool.await_args_list],
+                         [{"query": "木卫二"}, {"query": "木卫二"}, {"query": "Europa"}])
+
+    async def test_search_request_must_come_from_original_text_and_the_current_context(self):
+        self.client.call_tool.return_value = {"items": []}
+        raw = [{"type": "text", "data": "请搜索木卫二"}]
+        variants = (
+            {"raw_message": [{"type": "forward", "data": {}}]},
+            {"raw_message": raw, "reply_to": "quoted-message"},
+            {"raw_message": [{"type": "text", "data": "我只是在转述"}]},
+            {"raw_message": raw + [{"type": "image", "data": "fixture"}]},
+            {},
+        )
+        for index, changes in enumerate(variants):
+            event = {**message(f"source-{index}", text="请搜索木卫二"), **changes}
+            await self.bot.capture_unified(message=event)
+            result = await self.call(event, "reference", "reference_search", {"query": "木卫二"})
+            self.assertFalse(result["success"], (index, result))
+        self.client.call_tool.assert_not_called()
+
+        first = await self.capture("asked-before", "请搜索木卫二")
+        await self.capture("new-message", "现在只想和你聊聊")
+        result = await self.bot.mcp_call("reference", "reference_search", {"query": "木卫二"},
+                                        session_id=first["session_id"])
+        self.assertFalse(result["success"], result)
+        self.client.call_tool.assert_not_called()
+
+    async def test_search_objects_cannot_expand_into_a_private_or_reported_tail(self):
+        self.bot.config.mcp.social_mode = "只逛逛"
+        self.client.call_tool.return_value = {"items": []}
+        for index, (text, topic) in enumerate((
+                ("搜索“木卫二”时我室友叫周小宁", "周小宁"),
+                ("搜索“木卫二”时我室友叫周小宁", "木卫二"),
+                ("不要搜索木卫二，搜周小宁是我舍友说的", "周小宁"),
+                ("“查木卫二”只是举例", "木卫二"),
+                ("查木卫二的时候我室友周小宁来敲门", "周小宁"),
+                ("查木卫二的时候我室友周小宁来敲门", "木卫二"),
+                ("搜索“木卫二”只是举例", "木卫二"))):
+            event = await self.capture(f"tail-{index}", text)
+            for provider, tool in (("news", "web_search"), ("reference", "reference_search"),
+                                   ("mastodon", "mastodon_search")):
+                result = await self.call(event, provider, tool, {"query": topic})
+                self.assertFalse(result["success"], (text, result))
+        self.client.call_tool.assert_not_called()
+        self.assertEqual(self.bot._ensure_tool_store().status()["call_budget"]["count"], 0)
+
+        event = await self.capture("bounded-object", "请搜索“木卫二”的公开资料")
+        self.assertTrue((await self.call(event, "reference", "reference_search", {"query": "木卫二"}))["success"])
+        self.client.call_tool.assert_awaited_once_with("reference_search", {"query": "木卫二"})
+
+    async def test_incomplete_quotes_and_code_never_authorize_hidden_requests(self):
+        self.client.call_tool.return_value = {"items": []}
+        for index, text in enumerate((
+                "朋友说“明天看看，搜索木卫二",
+                "朋友说「明天看看，搜索木卫二",
+                '朋友说"明天看看，搜索木卫二',
+                "朋友说‘明天看看，搜索木卫二",
+                "朋友说'明天看看，搜索木卫二",
+                "下面是一段示例\n`\n搜索木卫二",
+                "下面是一段示例\n```text\n搜索木卫二\n```",
+                "下面是一段示例\n```text\n搜索木卫二",
+                "下面是一段示例\n> 搜索木卫二")):
+            event = await self.capture(f"quote-{index}", text)
+            result = await self.call(event, "reference", "reference_search", {"query": "木卫二"})
+            self.assertFalse(result["success"], (text, result))
+        self.client.call_tool.assert_not_called()
+        for index, text in enumerate(("请搜索“木卫二”", "请搜索「木卫二」", "Please search for 'Europa'")):
+            event = await self.capture(f"complete-{index}", text)
+            topic = "Europa" if "Europa" in text else "木卫二"
+            self.assertTrue((await self.call(event, "reference", "reference_search", {"query": topic}))["success"])
 
     async def test_reply_after_restart_cites_only_an_approved_persisted_public_source(self):
         from MaiLivingWorld.tests.test_unified_runtime import kwargs, response

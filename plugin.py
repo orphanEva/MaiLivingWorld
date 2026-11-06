@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.29.0",
+        default="0.30.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.29.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.30.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1203,9 +1203,14 @@ class MaiLivingWorld(MaiBotPlugin):
                     reference_signature = reference.signature() if reference else None
                     recalled = []
                     direct_ids = set()
+                    discovery_turn = bool(before and before.get("discovery_period")
+                                          and before["speaker_id"] == normalize_qq(self.config.owner.qq)
+                                          and before["scope"] == "private:" + before["speaker_id"])
                     def recall(query):
-                        nonlocal recalled
+                        nonlocal recalled, discovery_turn
                         resolved = reference.resolve(kwargs) if reference else None
+                        context = runtime.context(kwargs)
+                        discovery_turn = False
                         if resolved and resolved["status"] in {"ambiguous", "unavailable"}:
                             records = []
                         elif resolved and resolved["status"] == "resolved":
@@ -1215,9 +1220,19 @@ class MaiLivingWorld(MaiBotPlugin):
                                        if row["id"] not in ids and any(
                                            ref.get("id") in ids for ref in row.get("sources", []) if isinstance(ref, dict))]
                             records = (focus + related)[:self.config.unified_mind.recall_limit]
+                        elif context and context.get("discovery_period"):
+                            from .social_discovery import dated_reads
+                            owner = normalize_qq(self.config.owner.qq)
+                            discovery_turn = (context["speaker_id"] == owner and context["scope"] == "private:"+owner)
+                            records = []
+                            social = self._social_runtime()
+                            if (discovery_turn and social and social.owner() == owner and
+                                    self.config.mcp.remember_results and self.config.mcp.public_sources_enabled):
+                                now = time.time()
+                                items = self._ensure_tool_store().recent_social_reads(owner, now=now)
+                                records = dated_reads(items, context["discovery_period"], self.config.general.timezone, now)
                         else:
                             records = self._collect_unified(query)
-                        context = runtime.context(kwargs)
                         records = self._expression_records(records, context)
                         if visual and context:
                             records = visual.focus_records(records, context)
@@ -1231,6 +1246,9 @@ class MaiLivingWorld(MaiBotPlugin):
                         timezone=self.config.general.timezone, direct_ids=direct_ids,
                     )
                     hints = {}
+                    if discovery_turn and runtime.context(kwargs) == before:
+                        hints["discovery"] = ("主人在问你这段时间自己逛到的见闻。只从本轮获准提及且标明亲自选读的资料里挑想聊的一件，"
+                                              "分清节选与摘要。缺少对应记录就自然说明，不补写发帖、与人互动或受托查询的经历。")
                     social = self._social_runtime()
                     if (social and before and before["scope"] == "private:"+before["speaker_id"]
                             and runtime.context(kwargs) == before):
@@ -2624,7 +2642,7 @@ class MaiLivingWorld(MaiBotPlugin):
     async def recent(self) -> dict[str,Any]:
         return {"stories":self._store.recent() if self._store else []}
 
-    @Tool("get_living_discoveries", description="查看最近从B站热门或可信RSS读到的公开资讯标题、简介和链接；只有元信息，不能声称看完整视频", parameters=[])
+    @Tool("get_living_discoveries", description="查看B站热门或订阅源提供的候选标题、简介与链接。主人若问你自己挑了什么阅读，以本轮回复中的亲自选读记录为依据。", parameters=[])
     async def get_living_discoveries(self, **kwargs: Any) -> dict[str, Any]:
         del kwargs
         if not self.config.plugin.enabled or not self.config.general.enabled or not self.config.explorer.enabled or not self._store:

@@ -609,3 +609,69 @@ class ToolStore:
         """Reserve one lifetime reply per verified account/status, inside both daily budgets."""
         return self.reserve_call("mastodon", "mastodon_reply", _social_digest(target_key), "one-reply-per-status",
                                  "public:mastodon", _social_digest(account_key), day_start, max_daily, now=now)
+
+    def recent_social_reads(self, owner, now=None):
+        """Return the two latest self-selected public excerpts still at the exact version read."""
+        from .owner import normalize_qq
+        from .social_discovery import RECEIPT_PREFIX, browse_receipt, parse_receipt
+        if not normalize_qq(owner) or normalize_qq(owner) != owner:
+            return []
+        stamp = _now(now)
+        # The budget_day predicate uses the existing daily call index. The scheduler
+        # can finish at most four selections per day; ordinary lookup calls carry no marker.
+        rows = self._read("SELECT payload,updated FROM tool_calls WHERE budget_day>=? AND updated BETWEEN ? AND ? "
+                          "AND provider='news' AND tool IN ('news_read','web_read') AND status='succeeded' "
+                          "AND scope=? AND subject_id=? AND payload LIKE ? ORDER BY updated DESC,id DESC LIMIT 40",
+                          (stamp - 8*86400, stamp - 7*86400, stamp, "private:"+owner, owner,
+                           '{"summary":"' + RECEIPT_PREFIX + '%'))
+        receipts = []
+        for row in rows:
+            try:
+                data = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            summary = data.get("summary") if isinstance(data, dict) else None
+            ref = parse_receipt(summary)
+            if ref:
+                receipts.append((ref[0], summary, float(row["updated"])))
+        records = {r["id"]: r for r in self.resolve([entry[0] for entry in receipts])}
+        selected = []
+        for ident, receipt, finished in receipts:
+            record = records.get(ident)
+            if record and browse_receipt(record) == receipt:
+                selected.append({**record, "browse_time": finished})
+                del records[ident]
+                if len(selected) == 2:
+                    break
+        return selected
+
+    def new_social_posts(self, account_key, versions):
+        """Filter at most ten target/version fingerprints with two indexed batch reads."""
+        account = _social_digest(account_key)
+        if not isinstance(versions, dict) or len(versions) > 10:
+            raise ValueError("invalid_social_batch")
+        versions = {_social_digest(target): _social_digest(version) for target, version in versions.items()}
+        if not versions:
+            return set()
+        context = _digest("one-reply-per-status", "public:mastodon", account)
+        calls = {"tool:call:" + _digest("mastodon", "mastodon_reply", target, context): target for target in versions}
+        slots = {_SOCIAL + "read:" + _digest(account, target): target for target in versions}
+        placeholders = ",".join("?" for _ in versions)
+        attempted = self._read("SELECT id FROM tool_calls WHERE id IN (" + placeholders + ")", tuple(calls))
+        read = self._read("SELECT question_key,lease_token FROM tool_research WHERE question_key IN (" +
+                         placeholders + ")", tuple(slots))
+        blocked = {calls[row["id"]] for row in attempted}
+        blocked.update(slots[row["question_key"]] for row in read
+                       if row["lease_token"] == versions[slots[row["question_key"]]])
+        return set(versions) - blocked
+
+    def mark_social_post_read(self, account_key, target_key, version, now=None):
+        """Retain only the latest read-content fingerprint, never a public conversation transcript."""
+        account, target, version = (_social_digest(value) for value in (account_key, target_key, version))
+        slot = _SOCIAL + "read:" + _digest(account, target)
+        stamp = _now(now)
+        with self.con:
+            self._lock()
+            self.con.execute("INSERT OR IGNORE INTO tool_research(question_key) VALUES (?)", (slot,))
+            self.con.execute("UPDATE tool_research SET lease_token=?,updated=? WHERE question_key=? AND updated<=?",
+                             (version, stamp, slot, stamp))

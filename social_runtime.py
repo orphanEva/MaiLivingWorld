@@ -27,6 +27,21 @@ _AUTH_ERRORS = {"mastodon_not_configured": "social_setup_required", "mastodon_un
                 "mastodon_invalid_config": "social_setup_required", "mastodon_forbidden": "social_permission_required"}
 
 
+def public_interests(memories):
+    scores = dict.fromkeys(_TOPICS, 0.0)
+    for record in memories:
+        if record.get("kind") != "interest" or not isinstance(record.get("topic"), str):
+            continue
+        weight = record.get("weight", 1)
+        if type(weight) not in (int, float) or not -1 <= weight <= 1:
+            continue
+        for topic in _TOPICS:
+            if topic in record["topic"]:
+                scores[topic] += weight
+    likes = [topic for topic in _TOPICS if scores[topic] > 0]
+    return likes or [topic for topic in _TOPICS if scores[topic] == 0]
+
+
 def public_reply_text(value):
     if not isinstance(value, str):
         return ""
@@ -117,48 +132,67 @@ class SocialRuntime:
                      bot._mcp_source_signature("news"), bot.config.general.dry_run))
         # A private person or memory must never become an outbound search query.
         # Project interests onto a small public vocabulary; descriptions stay here.
-        interests = [r.get("topic", "") for r in bot._derived_memories() if r.get("kind") == "interest"]
-        topics = [t for t in _TOPICS if any(t in x for x in interests if isinstance(x, str))] or list(_TOPICS)
-        topic = topics[(seq-1) % len(topics)]
-        context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "social-exploration", "mid": f"{key}:{seq}", "query": topic}
+        topics = public_interests(bot._derived_memories())
+        topic = topics[(seq-1) % len(topics)] if topics else ""
+        context = {"scope": "private:"+owner, "speaker_id": owner, "sid": "social-exploration",
+                   "mid": f"{key}:{seq}", "query": topic, "public_search_terms": [topic]}
+        account = ""
+
+        def post_version(row):
+            return digest([row.get("text", ""), row.get("spoiler_text", "")])
 
         async def read(provider, tool, args):
             if not valid() or not bot._mcp_provider_enabled(provider):
                 return {}
             result = await bot._mcp_bridge.execute(provider, tool, args, config=cfg, context=context, owner=owner,
                 client=bot._mcp_client(provider), valid=valid, timezone=bot.config.general.timezone,
-                record_observations=cfg.remember_results)
+                record_observations=cfg.remember_results, autonomous_read=True)
             if not valid():
                 return {}
             if result.get("code") in _AUTH_ERRORS:
                 store.social_help(key, _AUTH_ERRORS[result["code"]])
-            return result.get("data", {}) if result.get("success") else {}
+            data = result.get("data", {}) if result.get("success") else {}
+            if (account and provider == "mastodon" and tool == "mastodon_read"
+                    and data.get("id") == args.get("id") and data.get("text")
+                    and data.get("visibility") == "public" and data.get("account_id") != identity.get("account_id")):
+                store.mark_social_post_read(account, digest([account, data["id"]]), post_version(data))
+            return data
 
         choices = []
         seen = set()
         def add(provider, tool, rows):
-            for row in rows.get("items", [])[:4]:
+            batch = {}
+            for row in rows.get("items", [])[:10]:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     continue
                 ref = (provider, tool, row["id"])
-                if ref not in seen:
-                    seen.add(ref)
-                    choices.append((provider, tool, row))
+                if ref in seen or provider == "mastodon" and (not account or row.get("account_id") == identity.get("account_id")):
+                    continue
+                batch.setdefault(ref, row)
+            if provider == "mastodon":
+                versions = {digest([account, row["id"]]): post_version(row) for row in batch.values()}
+                unread = store.new_social_posts(account, versions) if account else set()
+                batch = {ref: row for ref, row in batch.items() if digest([account, row["id"]]) in unread}
+            for ref, row in list(batch.items())[:4]:
+                seen.add(ref)
+                choices.append((provider, tool, row))
 
         env = bot._builtin_mcp_environment("mastodon")
         identity = {}
         if env.get("MLW_MASTODON_INSTANCE") and env.get("MLW_MASTODON_TOKEN"):
             identity = await read("mastodon", "mastodon_identity", {})
             if identity.get("account_id") and valid():
+                account = digest([identity["instance"], identity["account_id"]])
                 for resolved in ("social_setup_required", "social_auth_failed"):
                     store.social_help(key, None, clear_code=resolved)
-                add("mastodon", "mastodon_read", await read("mastodon", "mastodon_mentions", {"limit": 3}))
-                add("mastodon", "mastodon_read", await read("mastodon", "mastodon_search", {"query": topic, "limit": 4}))
+                add("mastodon", "mastodon_read", await read("mastodon", "mastodon_mentions", {"limit": 10}))
+                if topic:
+                    add("mastodon", "mastodon_read", await read("mastodon", "mastodon_search", {"query": topic, "limit": 10}))
         elif cfg.social_mode == "参与讨论" or not cfg.public_sources_enabled:
             store.social_help(key, "social_setup_required")
         if cfg.public_sources_enabled:
             add("news", "news_read", await read("news", "news_search", {"limit": 4}))
-            if os.environ.get("MLW_BRAVE_SEARCH_KEY"):
+            if topic and os.environ.get("MLW_BRAVE_SEARCH_KEY"):
                 add("news", "web_read", await read("news", "web_search", {"query": topic, "limit": 4}))
         choice = await self._choose(choices, topics, valid)
         if not choice or not valid():

@@ -119,7 +119,8 @@ def _public_source_url(item: dict) -> str:
     return ""
 
 
-def _records(memories: Any, *, include_mention_history: bool = False, include_public_links: bool = False
+def _records(memories: Any, *, include_mention_history: bool = False, include_public_links: bool = False,
+             include_browse_dates: bool = False
              ) -> dict[str, dict[str, Any]]:
     """Take a bounded copy; reject duplicate source IDs instead of guessing precedence."""
     if not isinstance(memories, list):
@@ -159,10 +160,14 @@ def _records(memories: Any, *, include_mention_history: bool = False, include_pu
                     records[ident]["previously_mentioned"] = True
         if correction_id:
             records[ident]["correction_id"] = correction_id
-        if include_public_links:
+        if include_public_links or (include_browse_dates and item.get("browse_date")):
             source_url = _public_source_url(item)
             if source_url:
-                records[ident]["source_url"] = source_url
+                if include_public_links:
+                    records[ident]["source_url"] = source_url
+                if (include_browse_dates and item.get("source_name") == "news" and isinstance(item.get("browse_date"), str)
+                        and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", item["browse_date"])):
+                    records[ident]["browse_date"] = item["browse_date"]
     for ident in duplicates:
         records.pop(ident, None)
     return records
@@ -192,7 +197,10 @@ def _json_object(result: Any) -> dict[str, Any] | None:
 def build_deliberation_prompt(memories: list[dict], *, query: str,
                               audience_scope: str, speaker_id: str,
                               is_owner: bool, proactive: bool = False) -> str:
-    records = list(_records(memories).values())
+    owner_reply = is_owner is True and not proactive and audience_scope == "private:" + speaker_id
+    records = list(_records(memories, include_browse_dates=owner_reply).values())
+    reading_rule = ("browse_date 表示这天你在网上亲自挑选并读到了此条材料，可以从确实在意的一条聊起。"
+                    if any("browse_date" in r for r in records) else "")
     data = {
         "audience": {"scope": audience_scope, "speaker_id": speaker_id,
                      "is_owner": bool(is_owner) and not (proactive and audience_scope.startswith("group:")),
@@ -222,7 +230,7 @@ def build_deliberation_prompt(memories: list[dict], *, query: str,
         "只有枚举 behavior 可以承载未说出的经历对表达方式的影响，不提供自由文本理由。\n"
         "有分歧的观点保留两边依据与不确定性，不替智能体把待核对候选当作已采纳立场。"
         "低把握的记忆不能变成确定回答，历史观点调整不等于现实事件发生变化。\n"
-        "UNTRUSTED_INPUT_JSON\n" + json.dumps(data, ensure_ascii=False)
+        + reading_rule + "\nUNTRUSTED_INPUT_JSON\n" + json.dumps(data, ensure_ascii=False)
     )
 
 
@@ -307,7 +315,7 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
             or not isinstance(decisions, list) or len(decisions) > MAX_MEMORIES):
         return None
     owner_reply = is_owner is True and not proactive and audience_scope == "private:" + speaker_id
-    records = _records(memories, include_mention_history=owner_reply, include_public_links=True)
+    records = _records(memories, include_mention_history=owner_reply, include_public_links=True, include_browse_dates=owner_reply)
     plan: dict[str, Any] = {"behavior": behavior, "memories": [],
                             "pending_generalizations": [],
                             "stats": {"considered": len(records), "withheld": 0,
@@ -343,6 +351,8 @@ def parse_expression(result: Any, memories: list[dict], *, audience_scope: str,
                 direct["attribution"] = "public_material"
             if record.get("source_url"):
                 direct.update(attribution="public_material", source_url=record["source_url"])
+                if owner_reply and record.get("browse_date"):
+                    direct["browse_date"] = record["browse_date"]
             if (is_owner is True and record.get("recently_asked") is True
                     and audience_scope == "private:"+speaker_id
                     and record["scope"] == audience_scope and record["subject_id"] == speaker_id):
@@ -444,6 +454,8 @@ def expression_hint(plan: dict[str, Any] | None) -> str:
                     visible[-1]["attribution"] = "来自查到的公开资料。转述时保留资料的说法，阅读或观看进度另需依据。"
                     if item.get("source_url"):
                         visible[-1]["source_url"] = item["source_url"]
+                    if item.get("browse_date"):
+                        visible[-1]["reading"] = item["browse_date"] + " 自主浏览时亲自选中并读到这份材料。日期是阅读时间。"
                 elif item.get("attribution") == "owner_correction" and corrected:
                     visible[-1]["attribution"] = "对方亲自更正过标明的引文。其余叙述的作者仍待确认。"
                 if item.get("previously_mentioned") is True:

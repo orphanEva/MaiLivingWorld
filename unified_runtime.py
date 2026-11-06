@@ -30,7 +30,7 @@ def _memory_version(items):
         [{key: memory.get(key) for key in (
             "id", "text", "scope", "subject_id", "sensitivity", "evidence_status",
             "timestamp", "source", "kind", "sources", "revision", "correction_id",
-            "recently_asked", "previously_mentioned", "derived")}
+            "recently_asked", "previously_mentioned", "derived", "browse_date")}
          for memory in items], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -97,11 +97,19 @@ class UnifiedRuntime:
             "speaker_id": sender.user_id, "query": " ".join(text.split())[:600],
             "seen": now,
         }
-        if sender.kind == "private" and text.startswith("公开回复 "):
-            direct = direct_message_text(message, self.state.state()["owner_id"])
-            if direct:
-                self._contexts[key]["public_reply_digest"] = hashlib.sha256(direct.encode()).hexdigest()
+        from .mcp_policy import public_search_requests
+        requests = public_search_requests(message)
+        if requests:
+            self._contexts[key]["public_search_terms"] = requests
         if sender.kind == "private":
+            from .social_discovery import discovery_period
+            period = discovery_period(text)
+            if period or text.startswith("公开回复 "):
+                direct = direct_message_text(message, self.state.state()["owner_id"])
+                if direct and period and direct == text:
+                    self._contexts[key]["discovery_period"] = period
+                elif direct and direct.startswith("公开回复 "):
+                    self._contexts[key]["public_reply_digest"] = hashlib.sha256(direct.encode()).hexdigest()
             self._private[sender.stream_id] = sender.message_id
 
     def context(self, kwargs: dict[str, Any]) -> dict | None:

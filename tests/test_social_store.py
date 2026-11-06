@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from MaiLivingWorld.tool_store import ToolStore
 from MaiLivingWorld.tests import test_tool_mysql_live as db_fixture
@@ -20,6 +21,69 @@ ACCOUNT = fingerprint("instance,verified account")
 
 
 class SocialStoreChecks:
+    def test_recent_discoveries_require_same_owner_current_source_and_completed_read(self):
+        from MaiLivingWorld.social_discovery import browse_receipt
+        owner = "12345678"
+        db = self.store()
+        source = db.put_observation("news", "sample", "报道节选：望远镜", "public:news",
+                                    sensitivity="public", url="https://www.ithome.com/0/875/123.htm", now=11)
+        call = db.reserve_call("news", "news_read", fingerprint("sample"), "window", "private:"+owner, owner, 0, 10, now=12)
+        self.assertEqual(db.recent_social_reads(owner, now=12), [])
+        db.complete_call(call["id"], "succeeded", browse_receipt(source), now=13)
+        second = self.store()
+        self.assertEqual([r["id"] for r in second.recent_social_reads(owner, now=14)], [source["id"]])
+        self.assertEqual(second.recent_social_reads("87654321", now=14), [])
+        self.assertEqual(second.recent_social_reads(owner, now=13+7*86400+1), [])
+        db.retract_observation("news", "sample", now=15)
+        self.assertEqual(second.recent_social_reads(owner, now=15), [])
+
+    def test_read_versions_survive_restart_and_previous_reply_attempts_are_always_hidden(self):
+        db = self.store()
+        target, version, changed = (fingerprint(text) for text in ("post", "body-one", "body-two"))
+        self.assertEqual(db.new_social_posts(ACCOUNT, {target: version}), {target})
+        db.mark_social_post_read(ACCOUNT, target, version, now=12)
+        second = self.store()
+        self.assertEqual(second.new_social_posts(ACCOUNT, {target: version}), set())
+        self.assertEqual(second.new_social_posts(ACCOUNT, {target: changed}), {target})
+        self.assertEqual(second.new_social_posts(OTHER, {target: version}), {target})
+        second.mark_social_post_read(ACCOUNT, target, changed, now=14)
+        db.mark_social_post_read(ACCOUNT, target, version, now=13)
+        self.assertEqual(db.new_social_posts(ACCOUNT, {target: changed}), set())
+        self.assertEqual(db.status()["call_budget"]["count"], 0)
+        for i, outcome in enumerate(("succeeded", "uncertain", "failed", "reserved")):
+            post = fingerprint("target-" + outcome)
+            day = i * 86400
+            ticket = db.reserve_social_reply(ACCOUNT, post, day, 10, now=day + 20)
+            if outcome != "reserved":
+                db.complete_call(ticket["id"], outcome, now=day + 21)
+            self.assertEqual(second.new_social_posts(ACCOUNT, {post: changed}), set(), outcome)
+            self.assertEqual(second.new_social_posts(OTHER, {post: changed}), {post}, outcome)
+
+    def test_candidate_batch_uses_two_reads_and_keeps_distinct_targets_and_versions(self):
+        db = self.store()
+        targets = [fingerprint("post-" + str(index)) for index in range(10)]
+        version, older = fingerprint("new-text"), fingerprint("old-text")
+        db.mark_social_post_read(ACCOUNT, targets[0], version, now=10)
+        db.mark_social_post_read(ACCOUNT, targets[1], older, now=11)
+        attempt = db.reserve_social_reply(ACCOUNT, targets[2], 0, 10, now=12)
+        db.complete_call(attempt["id"], "uncertain", now=13)
+        with patch.object(db, "_read", wraps=db._read) as query:
+            self.assertEqual(db.new_social_posts(ACCOUNT, dict.fromkeys(targets, version)), set(targets[1:]) - {targets[2]})
+        self.assertEqual(query.call_count, 2)
+        for call in query.call_args_list:
+            sql, args = call.args
+            self.assertIn(" IN (", sql)
+            self.assertEqual(len(args), 10)
+            self.assertEqual(sql.count("?"), 10)
+        self.assertEqual(db.new_social_posts(OTHER, dict.fromkeys(targets, version)), set(targets))
+        with patch.object(db, "_read", wraps=db._read) as query:
+            self.assertEqual(db.new_social_posts(ACCOUNT, {}), set())
+            with self.assertRaisesRegex(ValueError, "invalid_social_batch"):
+                db.new_social_posts(ACCOUNT, dict.fromkeys([*targets, fingerprint("eleventh")], version))
+            with self.assertRaises(ValueError):
+                db.new_social_posts(ACCOUNT, {targets[0]: "unvalidated source text"})
+            query.assert_not_called()
+
     def test_window_survives_restart_with_cooldown_daily_limit_and_clock_rollback(self):
         db = self.store()
         self.assertEqual(db.claim_social_window(SCOPE, 0, now=0), 1)
@@ -98,6 +162,24 @@ class SocialStoreChecks:
             results = [f.result(timeout=50) for f in futures]
         self.assertEqual(sorted(r[0] for r in results), [0, 1])
         self.assertEqual(sorted(r[1] for r in results), [False, True])
+
+    def test_concurrent_read_markers_retain_latest_version(self):
+        self.store()
+        barrier = threading.Barrier(2)
+        target = fingerprint("post")
+        def mark(stamp):
+            db = self.store()
+            try:
+                barrier.wait(timeout=30)
+                db.mark_social_post_read(ACCOUNT, target, fingerprint(str(stamp)), now=stamp)
+            finally:
+                self.stores.remove(db)
+                db.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(mark, stamp) for stamp in (10, 20)]
+            for task in futures:
+                task.result(timeout=50)
+        self.assertEqual(self.store().new_social_posts(ACCOUNT, {target: fingerprint("20")}), set())
 
 
 class SocialSQLiteTests(SocialStoreChecks, unittest.TestCase):

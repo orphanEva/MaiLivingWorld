@@ -1,19 +1,21 @@
 """Actual companion policy, MCP bridge, hooks and SQLite with offline public providers."""
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
 
 
 PRIVATE = "主人私下提起的蓝信封"
-ORIGINAL = "比较两台望远镜的口径时应该控制观测条件。"
+ORIGINAL = "公开讨论：比较两台望远镜的口径时应该控制观测条件。"
 PUBLIC_REPLY = "两次观测是在相同光照下进行的吗?"
 
 
@@ -37,7 +39,7 @@ class PublicFixture:
         if name == "mastodon_mentions":
             return {"items": []}
         if name == "mastodon_search":
-            return {"items": [{"id": "99", "text": "公开讨论：用望远镜观察星空"}]}
+            return {"items": [{"id": "99", "text": ORIGINAL, "account_id": "22"}]}
         if name in ("news_search", "web_search"):
             title = "科技新闻：望远镜" if name == "news_search" else "公开网页：观测报告"
             ident = "un:2026:11:1143147" if name == "news_search" else "web_search-public"
@@ -111,11 +113,14 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def calls(self, name):
         return [args for tool, args in self.fixture.calls if tool == name]
 
-    async def next_window(self):
+    async def next_window(self, hours=3):
         store = self.bot._ensure_tool_store()
         original = store.claim_social_window
-        with patch.object(store, "claim_social_window", side_effect=lambda key, day:
-                          original(key, day, now=time.time() + 3*3600 + 1)):
+        stamp = time.time() + hours * 3600 + 1
+        day = datetime.fromtimestamp(stamp, ZoneInfo(self.bot.config.general.timezone)).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        with patch.object(store, "claim_social_window", side_effect=lambda key, current_day:
+                          original(key, day, now=stamp)):
             await self.tick()
 
     async def reply_to(self, event):
@@ -162,14 +167,91 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config.mcp.social_mode = "参与讨论"
         self.bot.config.general.dry_run = True
         await self.next_window()
+        self.assertEqual(len(self.calls("mastodon_read")), 1)
+        self.assertFalse(self.calls("mastodon_reply"))
+
+    async def test_replied_and_own_posts_do_not_hide_fresh_mentions_after_restart(self):
+        await self.tick()
+        first_reply = self.calls("mastodon_reply")[0]["text"]
+        await self.bot.on_unload()
+        self.bot = self.new_bot()
+        underlying = self.fixture.call_tool
+        fresh = {"id": "101", "text": "公开讨论：我用的是同样的光照条件。",
+                 "account_id": "22", "visibility": "public", "in_reply_to_id": "100"}
+        async def next_turn(name, args):
+            if name == "mastodon_mentions":
+                return {"items": [{"id": "99", "text": ORIGINAL, "account_id": "22"}, fresh]}
+            if name == "mastodon_search":
+                return {"items": [{"id": "100", "text": "公开讨论：" + first_reply, "account_id": "11"},
+                                  {"id": "99", "text": ORIGINAL, "account_id": "22"}]}
+            if name == "mastodon_read" and args["id"] == "101":
+                self.fixture.calls.append((name, dict(args)))
+                return dict(fresh)
+            if name == "mastodon_read" and args["id"] == "100":
+                self.fixture.calls.append((name, dict(args)))
+                return {"id": "100", "text": first_reply, "account_id": "11", "visibility": "public"}
+            return await underlying(name, args)
+        self.fixture.call_tool = next_turn
+        self.reply_text = "可以再比较一下两次观测的时间。"
+        start = len(self.prompts)
+        await self.next_window()
+        self.assertEqual([r["id"] for r in self.calls("mastodon_reply")], ["99", "101"])
+        choice = json.loads(self.prompts[start].rsplit("\n", 1)[-1])
+        titles = [r["title"] for r in choice["条目"]]
+        self.assertIn(fresh["text"], titles)
+        self.assertNotIn(ORIGINAL, titles)
+        self.assertNotIn("公开讨论：" + first_reply, titles)
+        self.assertEqual([r["id"] for r in self.calls("mastodon_read")], ["99", "101", "100"])
+        reply = json.loads(self.prompts[-1].rsplit("\n", 1)[-1])
+        self.assertEqual(reply["对方引用的账号本人公开原话"], first_reply)
+
+    async def test_silent_read_is_not_repeated_but_a_changed_public_post_can_be_read(self):
+        self.bot.config.mcp.social_mode = "只逛逛"
+        await self.tick()
+        await self.bot.on_unload()
+        self.bot = self.new_bot()
+        self.bot.config.mcp.social_mode = "只逛逛"
+        underlying = self.fixture.call_tool
+        edited = ORIGINAL + "更新：增加了观测时间。"
+        async def changed(name, args):
+            result = await underlying(name, args)
+            if name == "mastodon_search":
+                result["items"][0]["text"] = edited
+            if name == "mastodon_read":
+                result["text"] = edited
+            return result
+        await self.next_window()
+        self.assertEqual(len(self.calls("mastodon_read")), 1)
+        self.fixture.call_tool = changed
+        await self.next_window(hours=6)
         self.assertEqual(len(self.calls("mastodon_read")), 2)
         self.assertFalse(self.calls("mastodon_reply"))
+
+    async def test_filtering_happens_before_the_four_candidate_limit(self):
+        underlying = self.fixture.call_tool
+        async def many_own_posts(name, args):
+            if name == "mastodon_search":
+                self.assertEqual(args["limit"], 10)
+                return {"items": [
+                    *({"id": str(200+i), "text": "公开讨论：我自己发的", "account_id": "11"} for i in range(6)),
+                    {"id": "99", "text": ORIGINAL, "account_id": "22"}]}
+            return await underlying(name, args)
+        self.fixture.call_tool = many_own_posts
+        await self.tick()
+        menu = json.loads(self.prompts[0].rsplit("\n", 1)[-1])["条目"]
+        self.assertNotIn("我自己发的", str(menu))
+        self.assertEqual([r["id"] for r in self.calls("mastodon_reply")], ["99"])
 
     async def test_changed_config_while_reading_discards_pending_decision(self):
         self.fixture.after_read = lambda: setattr(self.bot.config.mcp, "social_mode", "关闭")
         await self.tick()
         self.assertEqual(len(self.calls("mastodon_read")), 1)
         self.assertFalse(self.calls("mastodon_reply"))
+        self.fixture.after_read = None
+        self.bot.config.mcp.social_mode = "参与讨论"
+        await self.next_window()
+        self.assertEqual(len(self.calls("mastodon_read")), 2)
+        self.assertEqual(len(self.calls("mastodon_reply")), 1)
 
     async def test_ambiguous_receipt_never_retried_and_help_only_in_actual_owner_private_prompt(self):
         self.fixture.wrong_receipt = True
@@ -204,3 +286,16 @@ class SocialRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("回执", social.help_hint(OWNER))
         await self.bot.capture_unified(message={**message("owner-ack", text=ack), "raw_message": text})
         self.assertEqual(social.help_hint(OWNER), "")
+
+    async def test_external_query_uses_positive_interests_and_respects_dislikes(self):
+        self.bot._derived_memories = lambda: [
+            {"kind": "interest", "topic": "游戏", "weight": -0.8},
+            {"kind": "interest", "topic": PRIVATE + "的摄影", "weight": 0.3}]
+        await self.tick()
+        self.assertEqual(self.calls("web_search")[0]["query"], "摄影")
+        self.assertEqual(self.calls("mastodon_search")[0]["query"], "摄影")
+        self.assertNotIn(PRIVATE, repr(self.prompts) + repr(self.fixture.calls))
+        from MaiLivingWorld.social_runtime import public_interests
+        self.assertNotIn("游戏", public_interests([{"kind": "interest", "topic": "游戏", "weight": -0.5}]))
+        self.assertEqual(public_interests([{"kind": "interest", "topic": t, "weight": -1}
+                                          for t in public_interests([])]), [])

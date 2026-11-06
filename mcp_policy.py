@@ -60,11 +60,11 @@ PIXIV_TOOLS = {
 PUBLIC_PROVIDERS = ("news", "reference")
 NEWS_TOOLS = {"news_search": ("read", "按主题筛选近期公开报道，可留空看最近条目"),
               "news_read": ("read", "用新闻编号读取出处、发表时间、正文节选或订阅摘要"),
-              "web_search": ("read", "用 Brave 搜索公开网页，只搜索本轮明确的公开关键词"),
+              "web_search": ("read", "用 Brave 搜索当前发言者本人直接请求查找的公开关键词"),
               "web_read": ("read", "用刚取得的结果编号打开网页，阅读有限正文")}
-REFERENCE_TOOLS = {"reference_search": ("read", "按本轮明确提到的公开词条检索中英文维基百科"),
+REFERENCE_TOOLS = {"reference_search": ("read", "按当前发言者直接请求了解的公开词条检索中英文维基百科"),
                    "reference_read": ("read", "按词条编号和语言分页读取真实百科摘录与版本")}
-MASTODON_TOOLS = {"mastodon_search": ("read", "搜索本站索引中的公开讨论"),
+MASTODON_TOOLS = {"mastodon_search": ("read", "按本轮直接请求的公开主题搜索本站讨论"),
                   "mastodon_read": ("read", "读取一条公开原帖"),
                   "mastodon_mentions": ("read", "读取该账号收到的公开提及"),
                   "mastodon_identity": ("read", "核对此账号身份"),
@@ -83,6 +83,55 @@ class PolicyError(ValueError):
     """Only a fixed error code, safe for logs and outward results."""
 
 
+def public_search_requests(message):
+    """Find explicit search objects in this speaker's original plain text."""
+    from .owner import authored_message_text
+    text = authored_message_text(message)
+    if not text:
+        return []
+    from .dialogue_policy import _plain, _REPORT, _HYPOTHETICAL
+    from .public_reference import public_topic
+    from .unified_expression import _SECRET, _INSTRUCTION
+    text = unicodedata.normalize("NFKC", text)
+    if _SECRET.search(text) or _INSTRUCTION.search(text):
+        return []
+    requests = []
+    plain = _plain(text)
+    # Preserve offsets while hiding complete quotations. Incomplete quotations
+    # cannot establish which later text belongs to the speaker's own request.
+    plain = re.sub(r"'[^'\n]*'|‘[^’]*’|\x60[^\x60\n]*\x60",
+                   lambda match: " " * len(match[0]), plain)
+    if re.search(r'["“”「」『』‘\x60]|(?<![A-Za-z])[\x27’]|[\x27’](?![A-Za-z])', plain):
+        return []
+    for span in re.finditer(r"[^，,。！？!?；;\n]+", plain):
+        clause = text[span.start():span.end()]
+        match = re.match(
+            r"(?i)^\s*(?:(?:请你|请|麻烦|劳驾|帮我|帮忙|能不能|可不可以|能否|可以|你能|你可以)\s*)*"
+            r"(?:查(?:一下|一查|查|询)?|搜(?:一下|一搜|索|搜)?|检索|(?:我)?想(?:要)?了解|"
+            r"介绍(?:一下)?|科普(?:一下)?|讲讲|了解一下|"
+            r"(?:please\s+)?(?:search(?:\s+for)?|look\s+up|find\s+information\s+on|tell\s+me\s+about)\b)",
+            span[0])
+        if match:
+            requested = clause[match.end():].lstrip(":： \t")
+            quotes = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
+            if requested and requested[0] in quotes:
+                end = requested.find(quotes[requested[0]], 1)
+                tail = requested[end+1:].strip() if end > 0 else requested
+                if end < 0 or not re.fullmatch(r"(?:的?(?:公开)?(?:资料|信息|背景)|相关资料|谢谢|好吗|可以吗|吧|吗|呀|呢)*", tail):
+                    continue
+                requested = requested[1:end].strip()
+            if (_REPORT.search(requested) or _HYPOTHETICAL.search(requested)
+                    or re.search(r"室友|舍友|(?:的)?时候|当时|只是|举例|例子|说的|讲的|来敲门|"
+                                 r"(?i:\b(?:said|example|quote|when)\b)", requested)):
+                continue
+            try:
+                public_topic(requested)
+            except ValueError:
+                continue
+            requests.append(requested)
+    return requests[:8]
+
+
 def check_public_query(provider, tool, args, context):
     if (provider, tool) not in {("reference", "reference_search"), ("news", "web_search"),
                                 ("mastodon", "mastodon_search")}:
@@ -93,11 +142,14 @@ def check_public_query(provider, tool, args, context):
         return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) if isinstance(value, str) else ""
     topic = folded(args.get("query"))
     original = folded(context.get("query"))
+    requests = context.get("public_search_terms")
+    permitted_terms = requests if isinstance(requests, list) and len(requests) <= 8 else []
     try:
         public_topic(topic)
     except ValueError:
         raise PolicyError("ask_for_public_search_terms") from None
     if (not topic or len(topic) > 80 or topic not in original or _SECRET.search(original)
+            or not any(topic in folded(terms) for terms in permitted_terms)
             or _IDENTIFIER.search(topic) or _INSTRUCTION.search(topic)):
         raise PolicyError("ask_for_public_search_terms")
 

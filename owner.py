@@ -53,8 +53,14 @@ def is_owner(sender: SenderIdentity | None, owner_qq: str) -> bool:
 
 def direct_message_text(message: Any, owner_qq: str) -> str:
     """Return the bound owner's own text from a single, plain QQ private message."""
+    return authored_message_text(message, private_owner=normalize_qq(owner_qq))
+
+
+def authored_message_text(message: Any, *, private_owner: str | None = None) -> str:
+    """Accept only the identified sender's original, unmixed QQ text."""
     sender = extract_sender(message)
-    if (not is_owner(sender, owner_qq) or sender.kind != "private" or not sender.stream_id or not sender.message_id
+    if (not sender or not sender.stream_id or not sender.message_id
+            or private_owner is not None and (sender.kind != "private" or not is_owner(sender, private_owner))
             or normalize_qq(message.get("account_id")) == sender.user_id
             or any(message.get(key) for key in ("reply_to", "is_command", "is_notify", "is_picture", "is_voice", "is_emoji"))):
         return ""

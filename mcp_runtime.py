@@ -123,7 +123,8 @@ class MCPBridge:
         return {key: rows, "scope": "当前会话由本插件发起的任务", "filtered": True}
 
     async def execute(self, provider, tool, arguments, *, config, context, owner, client,
-                      valid, timezone, record_observations=True, task_source_signature="", on_dispatch=None):
+                      valid, timezone, record_observations=True, task_source_signature="", on_dispatch=None,
+                      autonomous_read=False):
         if (provider, tool) == ("mastodon", "mastodon_reply"):
             # All external replies use SocialRuntime.post's durable reservation.
             return {"success": False, "code": "social_reply_requires_authorized_dispatch"}
@@ -163,10 +164,14 @@ class MCPBridge:
             if not valid():
                 raise PolicyError("context_changed")
             item = observation(provider, tool, args, result) if record_observations else None
+            summary = ""
             if item:
                 public = provider in PUBLIC_PROVIDERS
-                self.store.put_observation(provider=provider, **item, scope="public:"+provider if public else context["scope"],
+                saved = self.store.put_observation(provider=provider, **item, scope="public:"+provider if public else context["scope"],
                     subject_id="" if public else context["speaker_id"], sensitivity="public" if public else "personal")
+                if autonomous_read and provider == "news" and tool in ("news_read", "web_read"):
+                    from .social_discovery import browse_receipt
+                    summary = browse_receipt(saved)
             elif provider == "pixiv" and result.get("pixiv_id") == args.get("pixiv_id") and (
                     (tool == "get_library_work" and (result.get("accessible") is False
                         or result.get("status") in {"private", "deleted", "auth_required"}))
@@ -175,7 +180,7 @@ class MCPBridge:
                 self.store.retract_origin(provider, "work:"+kind+":"+str(args["pixiv_id"]))
                 result = {"available": False, "reason": "source_unavailable"}
             result = self._filter_task_list(provider, tool, result, context)
-            self.store.complete_call(call["id"], "succeeded")
+            self.store.complete_call(call["id"], "succeeded", summary)
             self.last_status = "succeeded"
             return {"success": True, "data": result, "arguments": args, "call_id": call["id"]}
         except asyncio.CancelledError:
@@ -197,6 +202,9 @@ class MCPBridge:
 
 def outward_result(result: dict) -> dict:
     if not result.get("success"):
+        if result.get("code") == "ask_for_public_search_terms":
+            return {"success": False, "content": "需要本轮本人直接提出的公开检索词（ask_for_public_search_terms）。"
+                    "可以直接说「搜索木卫二」或「想了解木卫二」，再按这次请求中的关键词查找。"}
         return {"success": False, "content": "工具未完成："+str(result.get("code", "tool_failed"))+
                 "。超时或断连时结果可能未知，不要自动重试写操作。"}
     content = json.dumps(clean_result(result["data"]), ensure_ascii=False)
