@@ -170,6 +170,41 @@ class GrowthMemoryTests(unittest.TestCase):
             self.brain.con.execute("UPDATE brain_facts SET scope='private:12345678' WHERE id='F1'")
         self.assertEqual(derived_memories(state,self.resolve([identity]),fingerprint=fingerprint), [])
 
+    def test_long_interest_checks_early_and_late_dependencies_and_inherits_all_privacy(self):
+        base = self.resolve([self.fact(scope="public:12345678")])["brain:fact:F1"]
+        roots = [{**base, "id": "brain:fact:long"+str(index)} for index in range(130)]
+        state = {"interests": [item("interests", roots)]}
+        resolved = {row["id"]: row for row in roots}
+        projected = derived_memories(state, resolved, fingerprint=fingerprint)
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["sources"], state["interests"][0]["sources"])
+        self.assertEqual(projected[0]["sensitivity"], "public")
+        for index in (0, 127, 129):
+            key = roots[index]["id"]
+            missing = {sid: row for sid, row in resolved.items() if sid != key}
+            self.assertEqual(derived_memories(state, missing, fingerprint=fingerprint), [])
+            changed = {**resolved, key: {**roots[index], "text": "原材料已修正"}}
+            self.assertEqual(derived_memories(state, changed, fingerprint=fingerprint), [])
+        roots[-1] = {**roots[-1], "scope": "private:"+OTHER, "subject_id": OTHER, "sensitivity": "personal"}
+        resolved = {row["id"]: row for row in roots}
+        private = derived_memories({"interests": [item("interests", roots)]}, resolved, fingerprint=fingerprint)
+        self.assertEqual((private[0]["scope"], private[0]["sensitivity"], private[0]["subject_id"]),
+                         ("global:derived", "personal", ""))
+        for category in ("knowledge", "beliefs", "questions"):
+            self.assertEqual(derived_memories({category: [item(category, roots[:25])]},
+                                             resolved, fingerprint=fingerprint), [])
+
+    def test_long_interest_retains_the_new_total_limit_and_rejects_duplicate_dependencies(self):
+        base = self.resolve([self.fact()])["brain:fact:F1"]
+        roots = [{**base, "id": "brain:fact:limit"+str(index)}
+                 for index in range(unified_memory.MAX_INTEREST_SOURCES+1)]
+        resolved = {row["id"]: row for row in roots}
+        at_limit = derived_memories({"interests": [item("interests", roots[:-1])]}, resolved, fingerprint=fingerprint)
+        self.assertEqual(len(at_limit), 1)
+        for invalid in (roots, roots[:129]+roots[:1]):
+            self.assertEqual(derived_memories({"interests": [item("interests", invalid)]},
+                                             resolved, fingerprint=fingerprint), [])
+
     def test_cross_scope_private_and_group_sources_share_internal_memory_without_public_label(self):
         ids = [self.fact("private"), self.fact("group",scope="group:22222222")]
         sources = self.resolve(ids)

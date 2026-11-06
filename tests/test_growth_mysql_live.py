@@ -12,7 +12,7 @@ from pathlib import Path
 from MaiLivingWorld.brain_core import BrainBook
 from MaiLivingWorld.cognition import CognitiveStore
 from MaiLivingWorld.experience_loop import ExperienceLoop
-from MaiLivingWorld.growth_store import GrowthStore
+from MaiLivingWorld.growth_store import GrowthStore, MAX_INTEREST_SOURCES
 from MaiLivingWorld.mind import MindStore
 from MaiLivingWorld.proactive_feedback import ProactiveFeedback
 from MaiLivingWorld.self_state import SelfState
@@ -118,7 +118,7 @@ class GrowthMySQLLiveTests(unittest.TestCase):
         from unittest.mock import patch
         from MaiLivingWorld.tests.test_growth_store import fill_interest_sources, interest, records
         db, peer = self.store(), self.store()
-        original = fill_interest_sources(db, records("old-private-", 24))
+        original = fill_interest_sources(db, records("old-private-", MAX_INTEREST_SOURCES))
         before = peer.state(now=131)["revision"]
         new = records("fresh-", 2)
         proposal = {"interests": [*interest(new[:1])["interests"], *interest(new[1:], topic="天文")["interests"]]}
@@ -133,14 +133,47 @@ class GrowthMySQLLiveTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "synthetic-history-failure"):
                 db.complete(jid, job["token"], proposal, new, now=141, skip_interest_overflow=True)
         self.assertEqual(peer.state(now=142)["revision"], before)
-        self.assertEqual(peer.status()["consumed"], 24)
+        self.assertEqual(peer.status()["consumed"], MAX_INTEREST_SOURCES)
         self.assertEqual(peer.status()["jobs"]["running"], 1)
         result = db.complete(jid, job["token"], proposal, new, now=143, skip_interest_overflow=True)
         self.assertEqual((result["interests"], result["skipped_interest_overflow"]), (1, 1))
         self.assertEqual(peer.state(now=144)["interests"][0], original)
-        self.assertEqual(peer.status()["consumed"], 25)
+        self.assertEqual(peer.status()["consumed"], MAX_INTEREST_SOURCES+1)
         self.assertEqual([ref["id"] for ref in peer.history()[0]["sources"]], [new[1]["id"]])
         self.assertEqual(peer.rollback(result["revision"], now=145)["interests"], [original])
+
+    def test_extended_interest_preserves_all_sources_across_revision_race_and_reconnect(self):
+        from MaiLivingWorld.tests.test_growth_store import fill_interest_sources, interest, records
+        db, peer = self.store(), self.store()
+        original = fill_interest_sources(db, records("old-private-", 24))
+        previous_revision = db.state(now=130)["revision"]
+        first, second = records("later-", 2, "public")
+        for row in (first, second):
+            row.update(subject_id="", sensitivity="public")
+        first_id = db.enqueue([first], now=140)
+        second_id = peer.enqueue([second], now=141)
+        first_job = db.claim(now=142)
+        second_job = peer.claim(now=142)
+        db.complete(first_id, first_job["token"], interest([first]), [first],
+                    now=143, expected_revision=previous_revision)
+        with self.assertRaisesRegex(ValueError, "revision_conflict"):
+            peer.complete(second_id, second_job["token"], interest([second], -.02), [second],
+                          now=144, expected_revision=previous_revision)
+        extended = peer.state(now=145)["interests"][0]
+        self.assertEqual(len(extended["sources"]), 25)
+        self.assertTrue(all(ref in extended["sources"] for ref in original["sources"]))
+        self.assertEqual(peer.status()["consumed"], 25)
+        self.assertEqual(peer.status()["jobs"]["running"], 1)
+        result = peer.complete(second_id, second_job["token"], interest([second], -.02), [second],
+                               now=146, expected_revision=previous_revision+1)
+        reopened = self.store()
+        current = reopened.state(now=147)["interests"][0]
+        self.assertEqual(len(current["sources"]), 26)
+        self.assertAlmostEqual(current["weight"], extended["weight"]-.02)
+        self.assertEqual(reopened.history()[0]["after"]["interests"], [current])
+        self.assertEqual(reopened.rollback(result["revision"], now=148)["interests"], [extended])
+        self.assertEqual(db.state(now=149)["interests"], [extended])
+        self.assertEqual(db.status()["consumed"], 26)
 
     def test_racing_claims_and_expired_lease_recovery(self):
         db = self.store()

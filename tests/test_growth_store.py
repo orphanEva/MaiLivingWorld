@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from MaiLivingWorld.growth_store import GrowthStore, HALF_LIFE, source_fingerprint
+from MaiLivingWorld.growth_store import GrowthStore, HALF_LIFE, MAX_INTEREST_SOURCES, source_fingerprint
 from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import snapshot, ALL_TABLES
 from MaiLivingWorld.brain_core import BrainBook
 from MaiLivingWorld.cognition import CognitiveStore
@@ -40,9 +40,9 @@ def belief(rows, statement="工具需要根据任务选择", topic="编程工具
 
 
 def fill_interest_sources(db, rows, topic="编程"):
-    for offset in range(0, len(rows), 3):
-        batch = rows[offset:offset+3]
-        stamp = 100 + offset
+    for offset in range(0, len(rows), 24):
+        batch = rows[offset:offset+24]
+        stamp = 100 + offset // 24 * 2
         jid = db.enqueue(batch, now=stamp)
         job = db.claim(now=stamp)
         db.complete(jid, job["token"], interest(batch, .01, topic), batch, now=stamp+1)
@@ -346,7 +346,7 @@ class GrowthStoreTests(unittest.TestCase):
         self.assertEqual(len(previous["beliefs"][0]["sources"]), 24)
 
     def test_interest_capacity_skip_preserves_private_state_and_commits_only_valid_sibling(self):
-        old = fill_interest_sources(self.db, records("private-", 24))
+        old = fill_interest_sources(self.db, records("private-", MAX_INTEREST_SOURCES))
         rows = [{**row, "subject_id": "", "sensitivity": "public"} for row in records("public-", 2, "public")]
         jid = self.db.enqueue(rows, now=140)
         job = self.db.claim(now=140)
@@ -365,7 +365,7 @@ class GrowthStoreTests(unittest.TestCase):
         self.assertEqual(self.db.rollback(result["revision"], now=143)["interests"], [old])
 
     def test_capacity_skip_keeps_revision_conflicts_and_other_validation_fatal(self):
-        previous = records("prior-", 24)
+        previous = records("prior-", MAX_INTEREST_SOURCES)
         old = fill_interest_sources(self.db, previous)
         rows = [{**previous[0], "text": "已更正的版本"}, *records("independent-", 1)]
         jid = self.db.enqueue(rows, now=140)
@@ -379,7 +379,67 @@ class GrowthStoreTests(unittest.TestCase):
             self.db.complete(jid, job["token"], data, rows, now=141, skip_interest_overflow=True)
         self.assertEqual(self.db.state(now=142)["interests"], [old])
         self.assertEqual(self.db.status()["jobs"]["running"], 1)
+        self.assertEqual(self.db.status()["consumed"], MAX_INTEREST_SOURCES)
+
+    def test_interest_continues_after_twenty_four_with_atomic_retry_restart_and_rollback(self):
+        old = fill_interest_sources(self.db, records("private-", 24))
+        first, second = [{**row, "subject_id": "", "sensitivity": "public"}
+                         for row in records("public-", 2, "public")]
+        job_id = self.db.enqueue([first], now=140)
+        job = self.db.claim(now=140)
+        with self.db.con:
+            self.db.con.execute("CREATE TRIGGER reject_extended_interest BEFORE INSERT ON growth_history "
+                                "BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.complete(job_id, job["token"], interest([first]), [first], now=141)
+        self.assertEqual(self.db.state(now=142)["interests"], [old])
         self.assertEqual(self.db.status()["consumed"], 24)
+        self.assertEqual(self.db.status()["jobs"]["running"], 1)
+        with self.db.con:
+            self.db.con.execute("DROP TRIGGER reject_extended_interest")
+        result = self.db.complete(job_id, job["token"], interest([first]), [first], now=143)
+        self.assertTrue(result["changed"])
+        self.assertNotIn("skipped_interest_overflow", result)
+        extended = self.db.state(now=144)["interests"][0]
+        self.assertAlmostEqual(extended["weight"], old["weight"]+.1)
+        self.assertEqual(len(extended["sources"]), 25)
+        self.assertTrue(all(ref in extended["sources"] for ref in old["sources"]))
+        self.assertEqual(self.db.history()[0]["before"]["interests"], [old])
+        result = self.submit(interest([second], -.02), [second], now=150)
+        self.db.close()
+        self.db = GrowthStore(self.path)
+        current = self.db.state(now=152)["interests"][0]
+        self.assertEqual(len(current["sources"]), 26)
+        self.assertAlmostEqual(current["weight"], extended["weight"]-.02)
+        self.assertEqual(self.db.history()[0]["after"]["interests"], [current])
+        self.assertEqual(self.db.rollback(result["revision"], now=153)["interests"], [extended])
+        unused = records("unused-", 1)
+        replay = self.submit(interest([second]), [second, *unused], now=160)
+        self.assertFalse(replay["changed"])
+        self.assertEqual(self.db.state(now=161)["interests"], [extended])
+        self.assertEqual(self.db.status()["consumed"], 26)
+
+    def test_extended_interest_keeps_batch_bound_observe_mode_and_retirement(self):
+        with self.assertRaisesRegex(ValueError, "invalid_sources"):
+            self.db.enqueue(records("one-batch-", 25), now=100)
+        original = fill_interest_sources(self.db, records("earlier-", 25))
+        before = self.db.state(now=130)["revision"]
+        new = records("new-", 1)
+        observed = self.submit(interest(new, -.02), new, now=140, mode="observe")
+        self.assertTrue(observed["observed"])
+        self.assertEqual(observed["interests"], 1)
+        self.assertFalse(observed["changed"])
+        self.assertEqual(self.db.state(now=142)["interests"], [original])
+        self.assertEqual(self.db.state(now=142)["revision"], before)
+        self.assertEqual(self.db.status()["consumed"], 25)
+        changed = self.submit(interest(new, -.02), new, now=150)
+        current = self.db.state(now=152)["interests"][0]
+        self.assertEqual(len(current["sources"]), 26)
+        retired = self.db.retire(current["key"], changed["revision"], now=153)
+        self.assertEqual(retired["interests"], [])
+        self.assertEqual(self.db.history()[0]["before"]["interests"], [current])
+        self.assertEqual(self.db.history()[0]["kind"], "retire")
+        self.assertEqual(self.db.status()["consumed"], 26)
 
     def test_rollback_does_not_replenish_daily_trait_budget(self):
         for i in range(3):

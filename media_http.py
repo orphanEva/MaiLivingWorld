@@ -78,7 +78,7 @@ def _request(url, hosts, max_bytes, deadline, referer, redirect_only, api_key=No
         p = _parts(url, hosts)
         host = p.hostname
         target = (p.path or "/") + ("?" + p.query if p.query else "")
-        headers = {"Host": host, "User-Agent": "MaiLivingWorldBot/0.34 (+https://github.com/orphanEva/MaiLivingWorld)", "Accept-Encoding": "identity",
+        headers = {"Host": host, "User-Agent": "MaiLivingWorldBot/0.35 (+https://github.com/orphanEva/MaiLivingWorld)", "Accept-Encoding": "identity",
                    "Connection": "close"}
         if referer:
             headers["Referer"] = referer

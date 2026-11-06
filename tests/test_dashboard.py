@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -98,6 +99,48 @@ class DashboardTests(unittest.TestCase):
         self.item["sources"].append({"id": other["id"], "digest": fingerprint(other)})
         result = self.build(resolved_sources={self.source["id"]: self.source, other["id"]: other})
         self.assertEqual(result["source_counts"]["protected"], 1)
+
+    def long_interest(self, count):
+        records = {f"brain_fact:{number}": dict(self.source, id=f"brain_fact:{number}") for number in range(count)}
+        refs = [{"id": record["id"], "digest": fingerprint(record)} for record in records.values()]
+        return dict(self.item, sources=refs, weight=.6), records
+
+    def test_interest_capacity_uses_all_roots_while_other_categories_stay_bounded(self):
+        for count in (1, 24, 25, 129, 160, 161):
+            item, records = self.long_interest(count)
+            for category in dashboard.CATEGORIES:
+                with self.subTest(count=count, category=category):
+                    result = self.build(growth={category: [item]}, resolved_sources=records)
+                    visible = result["growth"][category][0]
+                    expected = "valid" if count <= (160 if category == "interests" else 24) else "invalid"
+                    self.assertEqual(visible["source_status"], expected)
+                    self.assertEqual(visible["source_count"], count if expected == "valid" else 0)
+                    self.assertEqual(visible["topic"], item["topic"] if expected == "valid" else "")
+                    self.assertNotIn(self.source["text"], dashboard.render_dashboard(result))
+
+    def test_long_interest_keeps_old_private_and_invalid_dependencies_protected(self):
+        for position in (0, 23, 24, 128, 159):
+            for condition in ("missing", "changed", "private", "confidential"):
+                with self.subTest(position=position, condition=condition):
+                    item, records = self.long_interest(160)
+                    original = records[f"brain_fact:{position}"]
+                    if condition == "missing":
+                        del records[f"brain_fact:{position}"]
+                    elif condition == "changed":
+                        original["text"] = "changed original"
+                    else:
+                        original.update(sensitivity="personal" if condition == "private" else "confidential",
+                                        scope="private:87654321", subject_id="87654321")
+                        item["sources"][position]["digest"] = fingerprint(original)
+                    result = self.build(growth={"interests": [item]}, resolved_sources=records)
+                    visible = result["growth"]["interests"][0]
+                    expected = "invalid" if condition in ("missing", "changed") else "protected"
+                    self.assertEqual(visible["source_status"], expected)
+                    self.assertEqual(visible["source_count"], 160)
+                    self.assertIsNone(visible["value"])
+                    for output in (json.dumps(result, ensure_ascii=False), dashboard.render_dashboard(result)):
+                        for hidden in (item["topic"], item["text"], original["text"], "87654321"):
+                            self.assertNotIn(hidden, output)
 
     def test_sensitive_generated_text_is_omitted(self):
         for text in ("密码 hello", "邮箱 a@example.com", "QQ 12345678", "https://example.com/private", "token api_key secret"):
@@ -315,6 +358,17 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("hidden_topic", html)
         self.assertNotIn("hidden_text", html)
 
+    def test_export_hides_legacy_private_interest_weights(self):
+        item, records = self.long_interest(1)
+        snapshot = self.build(growth={"interests": [item]}, resolved_sources=records)
+        for status in ("protected", "invalid", "unknown"):
+            with self.subTest(status=status):
+                snapshot["growth"]["interests"][0].update(source_status=status, value=.6)
+                exported = dashboard._export(snapshot)["growth"]["interests"][0]
+                self.assertIsNone(exported["value"])
+                self.assertEqual(exported["topic"], "")
+                self.assertEqual(exported["text"], "")
+
     def test_offline_cli_no_overwrite(self):
         with tempfile.TemporaryDirectory() as temp:
             source, output = Path(temp)/"state.json", Path(temp)/"panel.html"
@@ -324,6 +378,33 @@ class DashboardTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 dashboard.main(["--input", str(source), "--output", str(output)])
             self.assertEqual(content, output.read_bytes())
+
+    def test_direct_offline_cli_still_exports_without_a_package_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, output = Path(temp)/"state.json", Path(temp)/"panel.html"
+            source.write_text(json.dumps(self.build()), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", str(ROOT/"dashboard.py"),
+                "--input", str(source), "--output", str(output)],
+                cwd=temp, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("<html", output.read_text(encoding="utf-8"))
+
+    def test_top_level_import_builds_without_a_package_or_database_dependencies(self):
+        code = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import dashboard
+snapshot = dashboard.build_dashboard(identity={}, growth={}, resolved_sources={},
+    fingerprint=lambda record: '', authorized=True)
+assert snapshot['source_counts'] == {'valid': 0, 'invalid': 0, 'protected': 0}
+assert 'growth_limits' in sys.modules
+assert not any(name.endswith('growth_store') for name in sys.modules)
+assert 'pydantic' not in sys.modules and 'pymysql' not in sys.modules
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)],
+                cwd=temp, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_webui_binding_and_offline_seed(self):
         manifest = json.loads((ROOT/"webui.json").read_text(encoding="utf-8"))

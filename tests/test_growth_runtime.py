@@ -135,10 +135,14 @@ class GrowthRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot._growth.state()["knowledge"][0]["text"], LEARNED_TEXT)
 
     async def test_full_interest_finishes_each_review_without_starving_unrelated_knowledge(self):
+        from MaiLivingWorld.growth_store import MAX_INTEREST_SOURCES
         from MaiLivingWorld.tests.test_growth_store import fill_interest_sources
         self.bot._ensure_growth()
-        ids = [self.event("seed-"+str(i), "第"+str(i)+"次交流的观察") for i in range(24)]
-        old = fill_interest_sources(self.bot._growth, list(self.bot._resolve_roots(ids).values()), "交流方式")
+        ids = [self.event("seed-"+str(i), "第"+str(i)+"次交流的观察") for i in range(MAX_INTEREST_SOURCES)]
+        sources = []
+        for offset in range(0, len(ids), 128):
+            sources.extend(self.bot._resolve_roots(ids[offset:offset+128]).values())
+        old = fill_interest_sources(self.bot._growth, sources, "交流方式")
         before = self.bot._growth.state()["revision"]
         for index, with_knowledge in enumerate((False, True)):
             repeat = self.event("repeat-"+str(index), "一次新的交流观察")
@@ -160,11 +164,45 @@ class GrowthRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.state()["revision"], before+int(with_knowledge))
             self.assertEqual(len(store.history()), before+int(with_knowledge))
             self.assertEqual(store.state()["interests"], [old])
-            self.assertEqual(store.status()["consumed"], 24)
-            self.assertEqual(store.status()["jobs"], {"pending": 0, "running": 0, "done": 9+index, "failed": 0})
+            self.assertEqual(store.status()["consumed"], MAX_INTEREST_SOURCES)
+            self.assertEqual(store.status()["jobs"], {"pending": 0, "running": 0, "done": before+1+index, "failed": 0})
         self.assertEqual(self.bot.ctx.llm.generate.await_count, 4)
         self.assertEqual(self.bot._growth.state()["knowledge"][0]["text"], LEARNED_TEXT)
         self.assertEqual([ref["id"] for ref in self.bot._growth.history()[0]["sources"]], [sibling])
+
+    async def test_interest_changes_after_twenty_four_sources_and_keeps_learning_after_restart(self):
+        from MaiLivingWorld.tests.test_growth_store import fill_interest_sources
+        self.bot._ensure_growth()
+        ids = [self.event("earlier-"+str(i), "此前第"+str(i)+"次交流的独立观察") for i in range(24)]
+        original = fill_interest_sources(self.bot._growth, list(self.bot._resolve_roots(ids).values()), "交流方式")
+        previous = original
+        for index, delta in enumerate((-.02, .03)):
+            source = self.event("later-"+str(index), "后来关于交流方式的一次新观察")
+            rows = list(self.bot._resolve_roots([source]).values())
+            self.bot._growth.enqueue(rows)
+            data = empty_growth()
+            data["interests"] = [{"topic": "交流方式", "delta": delta, "evidence_ids": [source]}]
+            if index:
+                data["knowledge"] = [{"topic": "交谈节奏", "statement": LEARNED_TEXT,
+                                      "confidence": .7, "evidence_ids": [source]}]
+            self.model_for(data)
+            await self.bot._grow()
+            self.assertEqual(self.bot._growth_runtime.last_status, "learned")
+            self.assertNotIn("skipped_interest_overflow", self.bot._growth_runtime.last_counts)
+            current = self.bot._growth.state()["interests"][0]
+            self.assertAlmostEqual(current["weight"], previous["weight"]+delta)
+            self.assertEqual(len(current["sources"]), 25+index)
+            self.assertTrue(all(ref in current["sources"] for ref in original["sources"]))
+            prompt = self.bot.ctx.llm.generate.await_args_list[0].args[0]
+            self.assertIn(rows[0]["text"], prompt)
+            self.assertNotIn("此前第", prompt)
+            await self.bot.on_unload()
+            self.bot = self.make_bot()
+            self.bot._ensure_growth()
+            self.assertEqual(self.bot._growth.state()["interests"], [current])
+            previous = current
+        self.assertEqual(self.bot._growth.status()["consumed"], 26)
+        self.assertEqual(self.bot._growth.state()["knowledge"][0]["text"], LEARNED_TEXT)
 
     async def test_observe_does_not_change_profile_or_consume_active_evidence(self):
         ident = self.event()

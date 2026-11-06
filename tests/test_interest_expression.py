@@ -4,10 +4,12 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from MaiLivingWorld.growth_model import empty_growth
 from MaiLivingWorld.social_discovery import interest_followup_question, interest_question, reading_reaction_question
 from MaiLivingWorld.tests.test_growth_runtime import model_response, review
+from MaiLivingWorld.tests.test_growth_store import fill_interest_sources
 from MaiLivingWorld.tests.test_mcp_plugin import GROUP, OTHER, OWNER, message
 from MaiLivingWorld.tests.test_runtime import FakeContext, plugin
 
@@ -103,6 +105,79 @@ class InterestExpressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("自己的兴趣倾向：摄影", visible)
         self.assertIn(PHOTO, visible)
         self.assertNotIn("岩石", visible)
+
+    async def test_long_interest_survives_restart_and_bounded_questions_then_checks_last_source_again(self):
+        await self.reply("你最近喜欢什么", "before-long-interest")
+        await self.bot.reference_send_feedback(sent=True,
+            message=message("photo-before-long-interest", uid="99999999", text=PHOTO))
+        additional = [self.source("long-photo-"+str(index), f"第{index}份摄影资料讨论了构图和光线。")
+                      for index in range(129)]
+        fill_interest_sources(self.bot._growth, additional, "摄影")
+        await self.bot.on_unload()
+        self.bot = self.make_bot()
+        current = next(row for row in self.bot._interest_memories() if row["topic"] == "摄影")
+        self.assertEqual(len(current["sources"]), 130)
+        self.assertTrue(any(row["topic"] == "摄影" for row in self.bot._growth_snapshot()["interests"]))
+        for limit in (1, 2, 12):
+            self.bot.config.unified_mind.recall_limit = limit
+            visible = await self.reply("你现在还喜欢这个吗", "long-followup-"+str(limit), sid="long-new-session")
+            self.assertIn("自己的兴趣倾向：摄影", visible)
+            self.assertIn("兴趣有所回升", visible)
+            self.assertLessEqual(len(self.memories), limit)
+            self.assertEqual(sum(row["kind"] == "interest" for row in self.memories), 1)
+            self.assertTrue(all("sources" not in row for row in self.memories))
+        self.bot.config.unified_mind.recall_limit = 2
+        ordinary = await self.reply("你最近喜欢什么", "long-general-question")
+        self.assertIn("自己的兴趣倾向：摄影", ordinary)
+        self.assertLessEqual(len(self.memories), 2)
+        changed = await self.reply("你最近喜欢什么", "long-retracted-during-expression", on_expression=lambda:
+            self.bot._tool_store.retract_observation("news", "long-photo-128"))
+        self.assertNotIn("自己的兴趣倾向：摄影", changed)
+        self.assertFalse(any(row["topic"] == "摄影" for row in self.bot._interest_memories()))
+
+    async def test_late_private_source_keeps_a_long_interest_internal_until_old_source_is_withdrawn(self):
+        additional = [self.source("private-photo-"+str(index), f"第{index}份公开资料记录了摄影的取景方式。")
+                      for index in range(128)]
+        private = self.source("private-photo-last", "另一个人私下描述了摄影带给她的心情。", private=True)
+        fill_interest_sources(self.bot._growth, additional+[private], "摄影")
+        current = next(row for row in self.bot._interest_memories() if row["topic"] == "摄影")
+        self.assertEqual((len(current["sources"]), current["sensitivity"], current["subject_id"]), (130, "personal", ""))
+        visible = await self.reply("你最近喜欢什么", "long-private-interest")
+        self.assertTrue(any(row["kind"] == "interest" for row in self.memories))
+        self.assertNotIn("自己的兴趣倾向：摄影", visible)
+        self.assertNotIn(private["text"], visible)
+        self.bot._tool_store.retract_observation("news", "photo")
+        self.assertFalse(any(row["topic"] == "摄影" for row in self.bot._interest_memories()))
+
+    async def test_three_interests_share_a_bounded_reply_after_all_dependencies_are_checked(self):
+        for index, topic in enumerate(("摄影", "天文", "园艺")):
+            sources = [self.source(f"several-{index}-{number}", f"{topic}资料记录了第{number}次观察。")
+                       for number in range(49 if topic == "摄影" else 50)]
+            fill_interest_sources(self.bot._growth, sources, topic)
+        selected = [row for row in self.bot._interest_memories() if row["weight"] > 0]
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(sum(len(row["sources"]) for row in selected), 150)
+        self.bot.config.unified_mind.recall_limit = 6
+        with patch.object(self.bot, "_resolve_roots", wraps=self.bot._resolve_roots) as resolve:
+            visible = await self.reply("你最近喜欢什么", "three-interests")
+        self.assertTrue(all(len(call.args[0]) <= 128 for call in resolve.call_args_list))
+        self.assertEqual([row["id"] for row in self.memories[:3]], [row["id"] for row in selected])
+        self.assertEqual(len(self.memories), 6)
+        for topic in ("摄影", "天文", "园艺"):
+            self.assertIn("自己的兴趣倾向："+topic, visible)
+
+    async def test_growth_dependency_batches_deduplicate_in_order_and_keep_exact_read_limits(self):
+        unique = ["brain:event:batch"+str(index) for index in range(257)]
+        requested = unique[:140]+unique[:2]+unique[140:]
+        def resolve(ids):
+            return {sid: {"id": sid} for sid in ids if sid != unique[128]}
+        with patch.object(self.bot, "_resolve_roots", side_effect=resolve) as reader:
+            result = self.bot._resolve_growth_roots(requested)
+            self.assertEqual([len(call.args[0]) for call in reader.call_args_list], [128, 128, 1])
+            self.assertEqual([sid for call in reader.call_args_list for sid in call.args[0]], unique)
+            self.assertEqual(list(result), [sid for sid in unique if sid != unique[128]])
+        with self.assertRaisesRegex(ValueError, "invalid memory ids"):
+            self.bot._resolve_roots(unique)
 
     async def test_retracted_and_unapproved_preferences_are_not_outbound(self):
         omitted = await self.reply("你喜欢什么", mode="omit")

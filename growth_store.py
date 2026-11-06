@@ -21,10 +21,10 @@ from .mysql_compat import MySQLCompatConnection
 from .sql_logging import connect_sqlite
 from .belief_revision import FIELDS as BELIEF_REVIEW_FIELDS, assess as assess_belief
 from .emotion_episodes import active_items as active_emotions, apply_candidates as apply_emotions, receipt_keys as emotion_receipts
+from .growth_limits import MAX_INTEREST_SOURCES, MAX_RECORDS
 
 TRAITS = ("curiosity", "sociability", "patience", "caution")
 COLLECTIONS = ("interests", "beliefs", "knowledge", "questions")
-MAX_RECORDS = 24
 MAX_ITEMS = 32
 MAX_PENDING = 128
 HALF_LIFE = 6 * 3600
@@ -149,14 +149,14 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
             raise ValueError("invalid_evidence")
         return [allowed[sid] for sid in sorted(ids)]
 
-    def merge_sources(old: list[dict], new: list[dict], *, skip_overflow=False) -> list[dict]:
+    def merge_sources(old: list[dict], new: list[dict], *, limit=MAX_RECORDS, skip_overflow=False) -> list[dict]:
         combined = {ref["id"]: ref for ref in old}
         for ref in new:
             previous = combined.get(ref["id"])
             if previous is not None and previous != ref:
                 raise ValueError("source_revision_conflict")
             combined[ref["id"]] = ref
-        if len(combined) > MAX_RECORDS:
+        if len(combined) > limit:
             # Check every proposed reference for conflicting versions before
             # classifying a valid merge as too large. Evidence is always nonempty.
             if skip_overflow:
@@ -202,7 +202,8 @@ def _apply_proposal(before: dict, proposal: Any, allowed: dict[str, dict],
         weight = round(max(-1.0, min(1.0, previous + delta)), 8)
         if not fresh or weight == previous:
             continue
-        merged = merge_sources(current["sources"] if current else [], refs, skip_overflow=skip_interest_overflow)
+        merged = merge_sources(current["sources"] if current else [], refs,
+                               limit=MAX_INTEREST_SOURCES, skip_overflow=skip_interest_overflow)
         if not merged:
             skipped_interest_overflow += 1
             continue

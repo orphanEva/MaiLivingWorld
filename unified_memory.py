@@ -15,6 +15,7 @@ from typing import Any
 from .sql_logging import SQLMySQLCursor
 from .mysql_compat import MySQLCompatConnection
 from .emotion_episodes import expression_detail as emotion_detail
+from .growth_limits import MAX_INTEREST_SOURCES, MAX_RECORDS
 
 MAX_RESULTS = 50
 MAX_SCAN = 1000
@@ -23,7 +24,7 @@ MAX_QUERY_TERMS = 24
 MAX_TEXT_CHARS = 600
 MAX_RESOLVE_IDS = 128
 MAX_GROWTH_ITEMS = 144
-MAX_GROWTH_SOURCES = 24
+MAX_GROWTH_SOURCES = MAX_RECORDS
 _DAY = 86400
 _STOP_TERMS = {"这个", "那个", "什么", "怎么", "一下", "一个", "我们", "你们", "他们", "可以", "请问"}
 _CONFIDENTIAL = re.compile(
@@ -310,8 +311,8 @@ def resolve_memories(ids, *, brain=None, mind=None, cognition=None, stories=None
     return {identity: found[identity] for identity in parsed if identity in found}
 
 
-def _derived_sources(refs: Any, resolved: dict, fingerprint) -> tuple[list[dict], list[dict]] | None:
-    if not isinstance(refs, list) or not 1 <= len(refs) <= MAX_GROWTH_SOURCES:
+def _derived_sources(refs: Any, resolved: dict, fingerprint, *, limit=MAX_GROWTH_SOURCES) -> tuple[list[dict], list[dict]] | None:
+    if not isinstance(refs, list) or not 1 <= len(refs) <= limit:
         return None
     records, saved = [], []
     seen: set[str] = set()
@@ -406,7 +407,8 @@ def derived_memories(state, resolved_sources, *, fingerprint, query: str = "",
             text = item.get("text", "")
             if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS or (kind != "interest" and not text.strip()):
                 continue
-            source_data = _derived_sources(item.get("sources"), resolved_sources, fingerprint)
+            source_data = _derived_sources(item.get("sources"), resolved_sources, fingerprint,
+                limit=MAX_INTEREST_SOURCES if kind == "interest" else MAX_GROWTH_SOURCES)
             if source_data is None:
                 continue
             sources, refs = source_data
@@ -520,8 +522,13 @@ def annotate_interest_changes(records: list[dict], history: list[dict]) -> list[
                     or old["revision"] < 1 or old.get("topic") != current.get("topic")
                     or current.get("revision") != old["revision"] + 1
                     or not isinstance(old.get("sources"), list) or not old["sources"]
-                    or not isinstance(current.get("sources"), list)
-                    or any(ref not in current["sources"] for ref in old["sources"])):
+                    or not isinstance(current.get("sources"), list)):
+                continue
+            current_sources = {ref["id"]: ref for ref in current["sources"]
+                               if isinstance(ref, dict) and isinstance(ref.get("id"), str)}
+            if (len(current_sources) != len(current["sources"])
+                    or any(not isinstance(ref, dict) or not isinstance(ref.get("id"), str)
+                           or current_sources.get(ref["id"]) != ref for ref in old["sources"])):
                 continue
             changes.append((current, old_weight))
     result = []

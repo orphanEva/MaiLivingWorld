@@ -163,6 +163,47 @@ def assert_belief_revision_restore(case, store, expected):
     case.assertEqual(store.status()["consumed"], 1)
 
 
+def seed_long_interest(growth, tools):
+    from MaiLivingWorld.growth_store import MAX_INTEREST_SOURCES
+    roots = [tools.put_observation("news", f"interest-backup-{index:03d}",
+        f"摄影资料第{index}页记录了舞台灯光与镜头变化。", "public", sensitivity="public", now=100+index)
+        for index in range(MAX_INTEREST_SOURCES)]
+    for offset in range(0, len(roots), 24):
+        batch = roots[offset:offset+24]
+        stamp = 300 + offset
+        job_id = growth.enqueue(batch, now=stamp)
+        job = growth.claim(now=stamp)
+        proposal = {"interests": [{"topic": "摄影", "delta": -.02 if offset+24 >= len(roots) else .01,
+                                   "evidence_ids": [row["id"] for row in batch]}]}
+        growth.complete(job_id, job["token"], proposal, batch, now=stamp+1)
+    return {"state": growth.state(now=500), "history": growth.history(limit=20), "roots": roots}
+
+
+def assert_long_interest_restore(case, growth, tools, expected):
+    from MaiLivingWorld.growth_store import source_fingerprint
+    from MaiLivingWorld.unified_memory import annotate_interest_changes, derived_memories
+    case.assertEqual(growth.state(now=500), expected["state"])
+    case.assertEqual(growth.history(limit=20), expected["history"])
+    item = expected["state"]["interests"][0]
+    case.assertEqual(len(item["sources"]), 160)
+    case.assertEqual(item["revision"], 7)
+    case.assertAlmostEqual(item["weight"], .04)
+    resolved = {}
+    ids = [row["id"] for row in expected["roots"]]
+    for offset in range(0, len(ids), 128):
+        resolved.update((row["id"], row) for row in tools.resolve(ids[offset:offset+128], now=500))
+    case.assertEqual(resolved, {row["id"]: row for row in expected["roots"]})
+    visible = derived_memories(growth.state(now=500), resolved, fingerprint=source_fingerprint)
+    case.assertEqual(len(visible), 1)
+    case.assertEqual(visible[0]["sources"], item["sources"])
+    changed = annotate_interest_changes(visible, growth.history(limit=20))
+    case.assertIn("兴趣有所减弱", changed[0]["text"])
+    case.assertTrue(tools.retract_observation("news", "interest-backup-000", now=501))
+    case.assertEqual(tools.resolve([ids[0]], now=502), [])
+    resolved.pop(ids[0])
+    case.assertEqual(derived_memories(growth.state(now=502), resolved, fingerprint=source_fingerprint), [])
+
+
 def seed_recollection(store):
     from MaiLivingWorld.growth_store import source_fingerprint
     owner = "12345678"
@@ -740,7 +781,7 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.CATALOGS["v0.22"], backup.CATALOGS["v0.21"])
         self.assertEqual(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
         self.assertIsNot(backup.CATALOGS["v0.23"], backup.CATALOGS["v0.22"])
-        self.assertEqual(backup.CURRENT_CATALOG, "v0.34")
+        self.assertEqual(backup.CURRENT_CATALOG, "v0.35")
         self.assertNotIn("repair.sqlite3", backup.V23_LEDGERS)
         self.assertEqual(set(backup.V24_LEDGERS)-set(backup.V23_LEDGERS), {"repair.sqlite3"})
         self.assertEqual(backup.V25_LEDGERS, backup.V24_LEDGERS)
@@ -763,6 +804,8 @@ class SQLiteBackupTests(unittest.TestCase):
         self.assertIsNot(backup.V33_LEDGERS, backup.V32_LEDGERS)
         self.assertEqual(backup.V34_LEDGERS, backup.V33_LEDGERS)
         self.assertIsNot(backup.V34_LEDGERS, backup.V33_LEDGERS)
+        self.assertEqual(backup.V35_LEDGERS, backup.V34_LEDGERS)
+        self.assertIsNot(backup.V35_LEDGERS, backup.V34_LEDGERS)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.14"]["bond.sqlite3"] = ("bond_profiles",)
         with self.assertRaises(TypeError):
@@ -783,7 +826,7 @@ class SQLiteBackupTests(unittest.TestCase):
             backup.CATALOGS["v0.20"]["advice.sqlite3"] = ("advice_control",)
         with self.assertRaises(TypeError):
             backup.CATALOGS["v0.20"]["reference.sqlite3"] = ("reference_control",)
-        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34"):
+        for version in ("v0.21", "v0.22", "v0.23", "v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34", "v0.35"):
             with self.subTest(version=version), self.assertRaises(TypeError):
                 backup.CATALOGS[version]["growth.sqlite3"] = ("replacement",)
 
@@ -1164,6 +1207,32 @@ class SQLiteBackupTests(unittest.TestCase):
         restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
         self.assertEqual((restored["files"], restored["missing"]), (21, []))
 
+    def test_v34_archive_restores_with_the_current_schema(self):
+        archive = self.legacy_archive(explicit=True, catalog="v0.34")
+        checked = backup.verify_archive(archive)
+        self.assertEqual((checked["catalog"], checked["files"], checked["missing"]), ("v0.34", 21, []))
+        restored = backup.restore_sqlite(archive, self.target, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+        self.assertEqual((restored["files"], restored["missing"]), (21, []))
+
+    def test_long_interest_and_original_tool_material_survive_restore_and_retraction(self):
+        from MaiLivingWorld.growth_store import GrowthStore
+        from MaiLivingWorld.tool_store import ToolStore
+        classes = (("growth", GrowthStore), ("tool_memory", ToolStore))
+        stores = [cls(self.source/(name+".sqlite3")) for name, cls in classes]
+        try:
+            expected = seed_long_interest(*stores)
+        finally:
+            for store in stores:
+                store.close()
+        self.archive_now()
+        self.restore_now()
+        stores = [cls(self.target/(name+".sqlite3")) for name, cls in classes]
+        try:
+            assert_long_interest_restore(self, *stores, expected)
+        finally:
+            for store in stores:
+                store.close()
+
     def test_emotional_episodes_and_real_memory_archival_survive_restore(self):
         from MaiLivingWorld.growth_store import GrowthStore
         from MaiLivingWorld.advice_store import AdviceStore
@@ -1275,7 +1344,7 @@ class SQLiteBackupTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as package:
             current = json.loads(package.read("manifest.json"))
         self.assertEqual(current["format"], backup.FORMAT)
-        self.assertEqual(current["catalog"], "v0.34")
+        self.assertEqual(current["catalog"], "v0.35")
         for change in (lambda m: m.pop("catalog"), lambda m: m.update(catalog="future"),
                        lambda m: m.update(catalog=[]), lambda m: m["missing"].remove("bond.sqlite3")):
             candidate = copy.deepcopy(current)
@@ -1726,11 +1795,11 @@ class MySQLBackupTests(unittest.TestCase):
     def test_v23_mysql_archive_requires_matching_old_schema(self):
         self.check_same_schema_archive("v0.23")
 
-    def test_v24_through_v28_mysql_catalogs_restore_to_same_current_schema(self):
+    def test_v24_through_v34_mysql_catalogs_restore_to_same_current_schema(self):
         rows = {table: copy.deepcopy(self.data.get(table, [])) for table in backup.TABLES}
         current = Path(self.temp.name)/"current-complete.zip"
         backup.backup_mysql(self.config, current, apply=True, writers_stopped=True, connect=lambda _: FakeMySQL(rows))
-        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28"):
+        for catalog in ("v0.24", "v0.25", "v0.26", "v0.27", "v0.28", "v0.29", "v0.30", "v0.31", "v0.32", "v0.33", "v0.34"):
             with self.subTest(catalog=catalog):
                 archive = Path(self.temp.name)/(catalog+".zip")
                 with zipfile.ZipFile(current) as source, zipfile.ZipFile(archive, "w") as destination:
@@ -1778,6 +1847,53 @@ class MySQLBackupTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1" and os.getenv("MLW_BACKUP_MYSQL_DATABASE", "").startswith("mlw_backup_test"),
                      "Only with an explicitly configured empty dedicated MySQL CI database")
 class BackupMySQLLiveTests(unittest.TestCase):
+    def test_real_long_interest_and_tool_sources_survive_backup_restore(self):
+        import pymysql
+        from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
+        from MaiLivingWorld.growth_store import GrowthStore
+        from MaiLivingWorld.tool_store import ToolStore
+        env = dict(os.environ, MLW_MYSQL_DATABASE=os.environ["MLW_BACKUP_MYSQL_DATABASE"], MLW_MYSQL_PREFIX="v35_backup_")
+        config = backup.mysql_config(env)
+        settings = {key: value for key, value in config.items() if key != "prefix"}
+        settings["table_prefix"] = config["prefix"]
+        connection = pymysql.connect(**{key: value for key, value in config.items() if key != "prefix"}, autocommit=True)
+        created = False
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW TABLES")
+                self.assertEqual(cursor.fetchall(), (), "backup CI database must be empty before this test")
+            with tempfile.TemporaryDirectory() as temp:
+                directory, archive = Path(temp), Path(temp)/"v35-mysql.zip"
+                created = True
+                ensure_schema(settings, directory)
+                classes = (("growth", GrowthStore), ("tool_memory", ToolStore))
+                stores = [cls(directory/(name+".sqlite3"), mysql_settings=settings) for name, cls in classes]
+                try:
+                    expected = seed_long_interest(*stores)
+                finally:
+                    for store in stores:
+                        store.close()
+                self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.35")
+                with connection.cursor() as cursor:
+                    for table in reversed(backup.TABLES):
+                        cursor.execute("DROP TABLE `v35_backup_"+table+"`")
+                ensure_schema(settings, directory)
+                result = backup.restore_mysql(archive, config, apply=True, writers_stopped=True, confirm=backup.CONFIRM)
+                self.assertEqual(result["tables"], 82)
+                stores = [cls(directory/(name+".sqlite3"), mysql_settings=settings) for name, cls in classes]
+                try:
+                    assert_long_interest_restore(self, *stores, expected)
+                finally:
+                    for store in stores:
+                        store.close()
+        finally:
+            if created:
+                with connection.cursor() as cursor:
+                    for table in reversed(backup.TABLES):
+                        cursor.execute("DROP TABLE IF EXISTS `v35_backup_"+table+"`")
+            connection.close()
+
     def test_real_v25_emotions_and_archives_restore_without_reviving_forgotten_memory(self):
         import pymysql
         from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ensure_schema
@@ -1808,7 +1924,7 @@ class BackupMySQLLiveTests(unittest.TestCase):
                     for store in stores:
                         store.close()
                 self.assertEqual(backup.backup_mysql(config, archive, apply=True, writers_stopped=True)["tables"], 82)
-                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.34")
+                self.assertEqual(backup.verify_archive(archive)["catalog"], "v0.35")
                 with connection.cursor() as cursor:
                     for table in reversed(backup.TABLES):
                         cursor.execute("DROP TABLE `v25_backup_"+table+"`")

@@ -179,6 +179,11 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
         raise DashboardError("dashboard_access_denied")
     if not all(isinstance(item, dict) for item in (identity, growth, resolved_sources)) or not callable(fingerprint):
         raise DashboardError("invalid_dashboard_state")
+    if __package__:
+        from .growth_limits import MAX_INTEREST_SOURCES, MAX_RECORDS
+    else:
+        from growth_limits import MAX_INTEREST_SOURCES, MAX_RECORDS
+
     now = time.time() if now is None else now
     owner = identity.get("owner_id")
     owner = owner if isinstance(owner, str) and re.fullmatch(r"[0-9]{5,20}", owner) else ""
@@ -192,9 +197,10 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
     result["mood"] = {"valence": _number(_dict(growth.get("mood")).get("valence"), -1, 1),
                       "energy": _number(_dict(growth.get("mood")).get("energy"))}
 
-    def source_state(item):
+    def source_state(item, category):
         refs = item.get("sources")
-        if not isinstance(refs, list) or not 1 <= len(refs) <= 24:
+        limit = MAX_INTEREST_SOURCES if category == "interests" else MAX_RECORDS
+        if not isinstance(refs, list) or not 1 <= len(refs) <= limit:
             return "invalid", 0
         records = []
         for ref in refs:
@@ -221,7 +227,7 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
     for key in CATEGORIES:
         result["growth"][key] = []
         for item in _rows(growth.get(key), 32):
-            state, count = source_state(item)
+            state, count = source_state(item, key)
             topic = _text(item.get("topic")) if state == "valid" else ""
             text = _text(item.get("text"), 360) if state == "valid" else ""
             if state == "valid" and (not topic or (item.get("text") and not text)):
@@ -229,7 +235,8 @@ def build_dashboard(*, identity: dict, growth: dict, resolved_sources: dict, fin
             result["source_counts"][state] += 1
             result["growth"][key].append({"topic": topic, "text": text,
                 "status": "active" if key == "interests" else _status(item.get("status")),
-                "value": _number(item.get("weight"), -1, 1) if key == "interests" else _number(item.get("confidence")),
+                "value": _number(item.get("weight") if state == "valid" else None, -1, 1)
+                         if key == "interests" else _number(item.get("confidence")),
                 "source_status": state, "source_count": count, "revision": _count(item.get("revision"))})
     for key in ("model", "tools", "research", "reading"):
         row = _dict(_dict(budgets).get(key))
@@ -299,9 +306,10 @@ def _export(snapshot):
         for item in _rows(_dict(snapshot.get("growth")).get(key), 32):
             state = item.get("source_status")
             state = state if state in ("valid", "invalid", "protected") else "protected"
+            value = item.get("value") if key != "interests" or state == "valid" else None
             result["growth"][key].append({"topic": _text(item.get("topic")) if state == "valid" else "",
                 "text": _text(item.get("text"), 360) if state == "valid" else "", "status": _status(item.get("status")),
-                "value": _number(item.get("value"), -1 if key == "interests" else 0, 1), "source_status": state,
+                "value": _number(value, -1 if key == "interests" else 0, 1), "source_status": state,
                 "source_count": _count(item.get("source_count")), "revision": _count(item.get("revision"))})
     for key in ("valid", "invalid", "protected"):
         result["source_counts"][key] = _count(_dict(snapshot.get("source_counts")).get(key))

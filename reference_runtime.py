@@ -277,7 +277,7 @@ class ReferenceRuntime:
         if not interests:
             return result
         refs = interests[0]["sources"]
-        roots = b._resolve_roots([ref["id"] for ref in refs])
+        roots = b._resolve_growth_roots([ref["id"] for ref in refs])
         if any(ref["id"] not in roots or _ref(roots[ref["id"]]) != ref for ref in refs):
             return result
         others = sorted((row for row in roots.values() if row["id"] != focus["id"]),

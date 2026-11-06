@@ -62,7 +62,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.34.1",
+        default="0.35.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -576,7 +576,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.34.1；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.35.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1241,8 +1241,8 @@ class MaiLivingWorld(MaiBotPlugin):
                                          or (direction == "negative" and row["weight"] < 0)]
                             limit = self.config.unified_mind.recall_limit
                             selected = interests[:max(1, min(3, limit // 2))]
-                            source_ids = list(dict.fromkeys(ref["id"] for row in selected for ref in row["sources"]))
-                            roots = self._resolve_roots(source_ids) if source_ids else {}
+                            source_ids = [ref["id"] for row in selected for ref in row["sources"]]
+                            roots = self._resolve_growth_roots(source_ids)
                             records = (selected + list(roots.values()))[:limit]
                         elif context and context.get("discovery_period"):
                             from .social_discovery import dated_reads
@@ -1636,6 +1636,14 @@ class MaiLivingWorld(MaiBotPlugin):
         recollection = self._ensure_recollection()
         return {row["id"]: row for row in recollection.overlay(list(roots.values()))} if recollection else roots
 
+    def _resolve_growth_roots(self, ids) -> dict[str, dict]:
+        """Re-read every distinct growth dependency in bounded, ordered batches."""
+        unique_ids = list(dict.fromkeys(ids))
+        resolved = {}
+        for offset in range(0, len(unique_ids), 128):
+            resolved.update(self._resolve_roots(unique_ids[offset:offset+128]))
+        return resolved
+
     def _growth_snapshot(self) -> dict:
         state = self._growth.state()
         sections = ("interests", "beliefs", "knowledge", "questions")
@@ -1643,12 +1651,8 @@ class MaiLivingWorld(MaiBotPlugin):
             sections += ("emotions",)
         else:
             state.pop("emotions", None)
-        refs = list(dict.fromkeys(ref["id"] for key in sections
-                                 for item in state.get(key, []) for ref in item["sources"]))
-        # Bounded exact reads also re-check retractions/expiry of old evidence.
-        resolved = {}
-        for offset in range(0, len(refs), 128):
-            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        refs = [ref["id"] for key in sections for item in state.get(key, []) for ref in item["sources"]]
+        resolved = self._resolve_growth_roots(refs)
         for key in sections:
             state[key] = [item for item in state.get(key, []) if item["sources"] and all(
                 ref["id"] in resolved and source_fingerprint(resolved[ref["id"]]) == ref["digest"]
@@ -1667,10 +1671,8 @@ class MaiLivingWorld(MaiBotPlugin):
         if not (self.config.growth.enabled and self.config.growth.mode == "active" and self._ensure_growth()):
             return []
         state = self._growth.state()
-        refs = list(dict.fromkeys(ref["id"] for item in state["interests"] for ref in item["sources"]))
-        resolved = {}
-        for offset in range(0, len(refs), 128):
-            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        refs = [ref["id"] for item in state["interests"] for ref in item["sources"]]
+        resolved = self._resolve_growth_roots(refs)
         records = derived_memories({"interests": state["interests"]}, resolved,
                                    fingerprint=source_fingerprint, limit=MAX_GROWTH_ITEMS)
         return annotate_interest_changes(records, self._recent_growth_history(state["revision"])) if records else []
@@ -1684,11 +1686,8 @@ class MaiLivingWorld(MaiBotPlugin):
             sections += ("emotions",)
         else:
             state.pop("emotions", None)
-        refs = list(dict.fromkeys(ref["id"] for key in sections
-                                 for item in state.get(key, []) for ref in item["sources"]))
-        resolved = {}
-        for offset in range(0, len(refs), 128):
-            resolved.update(self._resolve_roots(refs[offset:offset+128]))
+        refs = [ref["id"] for key in sections for item in state.get(key, []) for ref in item["sources"]]
+        resolved = self._resolve_growth_roots(refs)
         records = derived_memories(state, resolved, fingerprint=source_fingerprint, query=query, limit=12)
         if not any(record["kind"] == "interest" for record in records):
             return records
@@ -2128,11 +2127,9 @@ class MaiLivingWorld(MaiBotPlugin):
             return build_dashboard(identity={}, growth={}, resolved_sources={}, fingerprint=source_fingerprint, authorized=True)
         identity = self._self_state.state()
         growth = self._growth.state() if self._ensure_growth() else {}
-        ids = list(dict.fromkeys(ref["id"] for key in ("interests", "beliefs", "knowledge", "questions")
-            for item in growth.get(key, []) for ref in item["sources"]))
-        resolved = {}
-        for offset in range(0, len(ids), 128):
-            resolved.update(self._resolve_roots(ids[offset:offset+128]))
+        ids = [ref["id"] for key in ("interests", "beliefs", "knowledge", "questions")
+               for item in growth.get(key, []) for ref in item["sources"]]
+        resolved = self._resolve_growth_roots(ids)
         tools = self._ensure_tool_store().status()
         today = tool_day_start(self.config.general.timezone)
         runtime = self._ensure_companion()
