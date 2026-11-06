@@ -15,7 +15,7 @@ class ConfigSectionTests(unittest.TestCase):
         defaults = plugin.Config().model_dump()
         self.assertIn("plugin", defaults)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "0.27.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "0.28.0")
         self.assertFalse(defaults["general"]["enabled"])
         self.assertTrue(defaults["general"]["dry_run"])
 
@@ -35,7 +35,7 @@ class ConfigSectionTests(unittest.TestCase):
         self.assertEqual(parsed, defaults)
         total_fields = sum(len(fields) for fields in defaults.values())
         self.assertEqual(len(defaults), 30)
-        self.assertEqual(total_fields, 198)
+        self.assertEqual(total_fields, 199)
         import re
         comments = re.findall(r"^# [^\n]+\n[a-z_][a-z_0-9]*\s*=", content, flags=re.M)
         self.assertEqual(len(comments), total_fields, "每个字段必须紧跟一条中文注释")

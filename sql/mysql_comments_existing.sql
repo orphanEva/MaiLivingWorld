@@ -387,10 +387,10 @@ ALTER TABLE `mlw_tool_calls`
   MODIFY COLUMN `tool` VARCHAR(191) NOT NULL COMMENT '已批准的固定工具名称',
   MODIFY COLUMN `args_digest` VARCHAR(191) NOT NULL COMMENT '调用参数SHA256摘要，不保存参数原文',
   MODIFY COLUMN `context_digest` VARCHAR(191) NOT NULL COMMENT '可信消息ID场合和主体的摘要，不保存原请求键',
-  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'reserved、succeeded、failed或uncertain，未知结果禁止重放',
+  MODIFY COLUMN `status` VARCHAR(191) NOT NULL COMMENT 'reserved、succeeded、failed、uncertain，skipped 标记未读媒体，withdrawn 标记已收到原消息撤回',
   MODIFY COLUMN `scope` VARCHAR(191) NOT NULL COMMENT '调用发起场合，用于授权追溯',
   MODIFY COLUMN `subject_id` VARCHAR(191) NOT NULL COMMENT '可信调用发起主体',
-  MODIFY COLUMN `budget_day` DOUBLE NOT NULL COMMENT '独立全局工具日预算起点，失败和未知调用也计数',
+  MODIFY COLUMN `budget_day` DOUBLE NOT NULL COMMENT '工具与聊天媒体分别统计每日额度，失败和未知调用计数，skipped 不计数',
   MODIFY COLUMN `payload` LONGTEXT NOT NULL COMMENT '适配器生成的有界结果状态摘要，不保存密钥或原始响应',
   MODIFY COLUMN `created` DOUBLE NOT NULL COMMENT '原子预留调用时间，Unix秒',
   MODIFY COLUMN `updated` DOUBLE NOT NULL COMMENT '调用状态最近变化时间，Unix秒';

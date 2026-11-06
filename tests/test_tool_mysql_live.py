@@ -18,15 +18,185 @@ from MaiLivingWorld.mind import MindStore
 from MaiLivingWorld.proactive_feedback import ProactiveFeedback
 from MaiLivingWorld.self_state import SelfState
 from MaiLivingWorld.store import Store
-from MaiLivingWorld.tool_store import ToolStore
+from MaiLivingWorld.tool_store import ToolStore, observation_id
 from MaiLivingWorld.unified_memory import collect_memories, resolve_memories
 from MaiLivingWorld.scripts.migrate_all_sqlite_to_mysql import ALL_TABLES, apply, snapshot
 
 DIGEST = hashlib.sha256(b"test-only-arguments").hexdigest()
 
 
+class ChatMediaLedgerChecks:
+    """Run the same public ledger operations against SQLite and the CI MySQL service."""
+
+    def media_call(self, db, key, *, kind="image", scope="group:20000001", sender="10000001",
+                  now=100, day=0, maximum=300):
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return db.reserve_call("chat_media", kind, digest, key, scope, sender, day, maximum, now=now)
+
+    def restart(self, db):
+        db.close()
+        self.stores.remove(db)
+        return self.store()
+
+    def test_chat_media_and_mcp_daily_budgets_are_independent_after_restart(self):
+        db = self.store()
+        first = self.media_call(db, "media-day-0", maximum=1)
+        self.assertTrue(first["allowed"])
+        db.complete_call(first["id"], "failed", now=101)
+        self.assertEqual(db.status()["call_budget"]["count"], 0)
+
+        def mcp(provider, key, day=0):
+            return db.reserve_call(provider, "read", DIGEST, key, "private:10000001", "10000001",
+                                   day, 1, now=day + 105)
+
+        first_mcp = mcp("pixiv", "mcp-day-0")
+        self.assertTrue(first_mcp["allowed"])
+        db.complete_call(first_mcp["id"], now=108)
+        db = self.restart(db)
+        self.assertEqual(self.media_call(db, "media-day-0", maximum=1),
+                         {"id": first["id"], "status": "failed", "allowed": False})
+        self.assertEqual(self.media_call(db, "another-media", maximum=1)["status"], "budget_exhausted")
+        self.assertEqual(mcp("cap", "another-mcp")["status"], "budget_exhausted")
+        self.assertEqual(db.status()["calls"], {"reserved": 0, "succeeded": 1, "failed": 0, "uncertain": 0})
+        self.assertEqual(db.status()["call_budget"], {"count": 1, "day_start": 0})
+
+        self.assertTrue(mcp("cap", "mcp-day-1", day=86400)["allowed"])
+        # The MCP clock has advanced. Yesterday's second media slot is still available.
+        self.assertTrue(self.media_call(db, "late-media", maximum=2, now=120)["allowed"])
+        self.assertTrue(self.media_call(db, "media-day-1", day=86400, now=86520, maximum=1)["allowed"])
+        self.assertEqual(self.media_call(db, "another-late-media", maximum=3)["status"], "budget_exhausted")
+        self.assertEqual(db.status()["call_budget"], {"count": 1, "day_start": 86400})
+
+    def test_recent_media_uses_chat_kind_and_time_and_keeps_failed_reads(self):
+        db = self.store()
+        group, other, private = "group:20000001", "group:20000002", "private:10000001"
+        expected = {}
+        fixtures = [
+            ("old", "image", group, "succeeded", 99),
+            ("image1", "image", group, "succeeded", 100),
+            ("video", "video", group, "succeeded", 820),
+            ("link", "bilibili", group, "succeeded", 850),
+            ("image2", "image", group, "failed", 900),
+            ("other", "image", other, "succeeded", 930),
+            ("private", "image", private, "succeeded", 940),
+            ("future", "image", group, "succeeded", 1001),
+        ]
+        for key, kind, scope, status, stamp in fixtures:
+            sender = "10000002" if key == "image2" else "10000001"
+            call = self.media_call(db, key, kind=kind, scope=scope, sender=sender, now=stamp)
+            self.assertTrue(call["allowed"])
+            db.complete_call(call["id"], status, now=stamp)
+            expected[key] = {"args_digest": hashlib.sha256(key.encode()).hexdigest(), "status": status}
+        # Persist only successful sightings, just as the intake hook does.
+        for key, scope in (("image1", group), ("private", private)):
+            db.put_observation("chat_media", expected[key]["args_digest"], "图片画面：屋檐上有一只猫。",
+                               scope, subject_id="10000001" if scope == private else "", now=950)
+        # A different source with the same tool name is never a media candidate.
+        self.assertTrue(db.reserve_call("cap", "image", DIGEST, "cap-image", group, "10000001",
+                                        0, 1, now=970)["allowed"])
+        db = self.restart(db)
+        self.assertEqual(db.recent_chat_media(group, ["image"], now=1000),
+                         [expected["image2"], expected["image1"]])
+        self.assertEqual(db.recent_chat_media(group, ["video", "bilibili"], now=1000),
+                         [expected["link"], expected["video"]])
+        self.assertEqual(db.recent_chat_media(other, ["image"], now=1000), [expected["other"]])
+        self.assertEqual(db.recent_chat_media(private, ["image"], now=1000), [expected["private"]])
+        self.assertEqual(db.recent_chat_media("private:10000002", ["image"], now=1000), [])
+        self.assertEqual(db.recent_chat_media(group, ["image"], now=2000), [])
+        for scope, subject in ((group, ""), (private, "10000001")):
+            recent = db.recent_chat_media(scope, ["image"], now=1000)
+            records = db.resolve([observation_id("chat_media", row["args_digest"]) for row in recent])
+            self.assertEqual([(r["scope"], r["subject_id"], r["evidence_status"]) for r in records],
+                             [(scope, subject, "visual_observation")])
+
+    def test_withdrawal_fences_another_writer_and_costs_no_read(self):
+        reader, writer = self.store(), self.store()
+        key, message_key = (hashlib.sha256(s.encode()).hexdigest() for s in ("picture", "message"))
+        scope, author = "group:20000001", "10000001"
+        ticket = writer.reserve_call("chat_media", "image", key, key, scope, author, 0, 2,
+                                     now=80, media_message_key=message_key)
+        self.assertTrue(ticket["allowed"])
+        reader.put_observation("chat_media", key, "图中的胡杨树", scope, media_message_key=message_key)
+        self.assertTrue(reader.retract_chat_media(message_key, [key], scope, author, now=81))
+        self.assertFalse(reader.retract_chat_media(message_key, [key], scope, author, now=82))
+        self.assertIsNone(writer.put_observation("chat_media", key, "迟到的图像结果", scope, media_message_key=message_key))
+        writer.complete_call(ticket["id"], "failed", now=83)
+        self.assertFalse(writer.resolve([observation_id("chat_media", key)]))
+        self.assertFalse(writer.reserve_call("chat_media", "image", key, key, scope, author, 0, 2,
+                                            now=84, media_message_key=message_key)["allowed"])
+        self.assertTrue(self.media_call(writer, "next", maximum=2)["allowed"])
+
+    def test_recent_media_filters_before_limiting_across_a_full_page(self):
+        group = "group:20000001"
+        db = self.store()
+        for stamp in (200, 201, 202):
+            call = self.media_call(db, str(stamp), scope=group, now=stamp)
+            self.assertTrue(call["allowed"])
+            db.complete_call(call["id"], now=stamp)
+        # More than a normal 200-row memory scan, all newer and in a different chat.
+        for stamp in range(300, 501):
+            self.assertTrue(self.media_call(db, str(stamp), scope="group:20000002", now=stamp)["allowed"])
+        db = self.restart(db)
+        self.assertEqual(db.recent_chat_media(group, ["image"], now=501), [
+            {"args_digest": hashlib.sha256(key).hexdigest(), "status": "succeeded"}
+            for key in (b"202", b"201")])
+
+    def test_skipped_media_survives_restart_without_spending_a_slot_or_duplicating_a_retry(self):
+        group = "group:20000001"
+        db = self.store()
+        first = self.media_call(db, "first", now=100, maximum=1)
+        db.complete_call(first["id"], now=101)
+        self.assertFalse(self.media_call(db, "second", now=110, maximum=1)["allowed"])
+        self.assertFalse(self.media_call(db, "second", now=111, maximum=0)["allowed"])
+        db = self.restart(db)
+        rows = db.recent_chat_media(group, ["image"], now=112)
+        self.assertEqual([r["status"] for r in rows], ["skipped", "succeeded"])
+        self.assertEqual(rows[0]["args_digest"], hashlib.sha256(b"second").hexdigest())
+        self.assertEqual(db.recent_chat_media(group, ["video"], now=112), [])
+        self.assertEqual(db.recent_chat_media("private:10000001", ["image"], now=112), [])
+        second = self.media_call(db, "second", now=120, maximum=2)
+        self.assertTrue(second["allowed"])
+        db.complete_call(second["id"], now=121)
+        self.assertEqual([r["status"] for r in db.recent_chat_media(group, ["image"], now=122)],
+                         ["succeeded", "succeeded"])
+        self.assertEqual(self.media_call(db, "second", now=123, maximum=0)["status"], "succeeded")
+        self.assertEqual(db.status()["call_budget"]["count"], 0)
+
+    def test_multiple_omissions_share_one_unresolvable_marker(self):
+        db = self.store()
+        group = "group:20000001"
+        for n in range(6):
+            self.assertFalse(self.media_call(db, str(n), now=150+n, maximum=0)["allowed"])
+        db = self.restart(db)
+        skipped, = db.recent_chat_media(group, ["image"], now=156)
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertNotIn(skipped["args_digest"], [hashlib.sha256(str(n).encode()).hexdigest() for n in range(6)])
+        allowed = self.media_call(db, "5", now=157, maximum=1)
+        self.assertTrue(allowed["allowed"])
+        db.complete_call(allowed["id"], now=158)
+        self.assertEqual(db.recent_chat_media(group, ["image"], now=160)[1], skipped)
+        self.assertEqual(db.recent_chat_media(group, ["image"], now=1056)[0]["status"], "succeeded")
+
+
+class ChatMediaSQLiteTests(ChatMediaLedgerChecks, unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "media.sqlite3"
+        self.stores = []
+
+    def store(self):
+        db = ToolStore(self.path)
+        self.stores.append(db)
+        return db
+
+    def tearDown(self):
+        for db in self.stores:
+            db.close()
+        self.temp.cleanup()
+
+
 @unittest.skipUnless(os.getenv("MLW_LIVE_MYSQL") == "1", "Only with ephemeral MySQL CI")
-class ToolMySQLLiveTests(unittest.TestCase):
+class ToolMySQLLiveTests(ChatMediaLedgerChecks, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name)

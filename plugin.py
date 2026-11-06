@@ -61,7 +61,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.27.0",
+        default="0.28.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -275,6 +275,8 @@ class MCPPixiv(MCPCap):
 
 
 class Reading(PluginConfigBase):
+    chat_media_enabled: bool = Field(default=False, description="在主人私聊及已允许记忆的群读取图片、视频和 B 站链接。使用宿主 vlm 视觉模型，观察可进入长期记忆。",
+                                     json_schema_extra={"label": "看聊天里的图片和视频"})
     __ui_label__ = "15 / 连续阅读与学习"
     enabled: bool = Field(default=False, description="保存作品版本、逐页/逐段阅读进度和核验笔记；需统一心智、唯一主人和MCP")
     cap_pdf_enabled: bool = Field(default=False, description="允许读取cap网关中已有PDF，网关也需显式启用PDF读取；不自动下载")
@@ -520,6 +522,7 @@ class MaiLivingWorld(MaiBotPlugin):
         self._shared_reading: SharedReadingRuntime | None = None
         self._advice: AdviceRuntime | None = None
         self._reference: ReferenceRuntime | None = None
+        self._visual = None
         self._repair = None
         self._last_brain_check = 0.0
         self._last_brain_quick_check = 0.0
@@ -568,10 +571,12 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.27.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.28.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
+        if self._visual:
+            self._visual.reset()
         # 配置变更后失效既有认证快照，避免旧主人继续被识别。
         self._owner_events.clear()
         self._owner_group_messages.clear()
@@ -726,6 +731,16 @@ class MaiLivingWorld(MaiBotPlugin):
     )
     async def capture_unified(self, message: Any = None, **kwargs):
         runtime = self._ensure_unified()
+        if isinstance(message, dict) and message.get("is_notify") is True and self.config.plugin.enabled:
+            from .chat_media import recalled_media_target
+            target = recalled_media_target(message)
+            owner = normalize_qq(self.config.owner.qq)
+            if target and owner:
+                from .visual_runtime import VisualRuntime
+                if self._visual is None:
+                    self._visual = VisualRuntime(self)
+                self._visual.withdraw(target, owner)
+                return {"action": "continue"}
         if runtime:
             private = _clean_ids(self.config.brain_memory.private_users)
             if self.config.brain_memory.include_owner:
@@ -825,6 +840,15 @@ class MaiLivingWorld(MaiBotPlugin):
         if changed and runtime:
             runtime.reset()
             runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids))
+        if runtime and self.config.reading.chat_media_enabled and self._unified_active():
+            from .visual_runtime import VisualRuntime
+            if self._visual is None:
+                self._visual = VisualRuntime(self)
+            if self._visual.capture(message):
+                # Use a neutral search cue for a bare attachment. Keep the actual message
+                # untouched for command, identity and quoted evidence processing.
+                runtime.capture(message, private_users=private, group_ids=_clean_ids(self.config.brain_memory.group_ids),
+                                media_fallback="分享的图片或视频")
         return {"action": "continue"}
 
     @HookHandler(
@@ -1146,7 +1170,9 @@ class MaiLivingWorld(MaiBotPlugin):
     @HookHandler(
         "maisaka.replyer.before_model_request", name="living_world_brain_reply_hint",
         description="核验当前QQ交谈对象，按统一记忆与表达判断形成回复背景",
-        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, error_policy=ErrorPolicy.SKIP,
+        # Host v1.3.10 defaults this hook to 6s. Media waits at most 8s, dialogue
+        # classification at most 8s, and expression may make two bounded 30s calls.
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL, timeout_ms=80_000, error_policy=ErrorPolicy.SKIP,
     )
     async def brain_reply_hint(self, **kwargs):
         if self.config.unified_mind.enabled:
@@ -1157,6 +1183,9 @@ class MaiLivingWorld(MaiBotPlugin):
                 try:
                     attention = self._ensure_attention()
                     before = runtime.context(kwargs)
+                    visual = self._visual if self.config.reading.chat_media_enabled and self._unified_active() else None
+                    if visual and before:
+                        await visual.wait_current(before)
                     if attention:
                         await attention.prepare_dialogue(kwargs)
                     recollection = self._ensure_recollection()
@@ -1182,6 +1211,8 @@ class MaiLivingWorld(MaiBotPlugin):
                             records = self._collect_unified(query)
                         context = runtime.context(kwargs)
                         records = self._expression_records(records, context)
+                        if visual and context:
+                            records = visual.focus_records(records, context)
                         recalled = records
                         if reference:
                             records = reference.mark_prior_mentions(records, context)
@@ -1192,6 +1223,12 @@ class MaiLivingWorld(MaiBotPlugin):
                         timezone=self.config.general.timezone, direct_ids=direct_ids,
                     )
                     hints = {}
+                    if visual and before and runtime.context(kwargs) == before and self.config.reading.chat_media_enabled:
+                        material, visual_sources = visual.hint(before)
+                        if material:
+                            hints["visual"] = material
+                            recalled.extend(visual_sources)
+                            direct_ids.update(row["id"] for row in visual_sources)
                     if attention and self._unified_active():
                         if runtime.context(kwargs) != before:
                             prompt = ""
@@ -1302,6 +1339,8 @@ class MaiLivingWorld(MaiBotPlugin):
         return {"action":"continue", "modified_kwargs":updated} if updated is not None else {"action":"continue"}
 
     async def on_unload(self):
+        if self._visual:
+            self._visual.reset()
         t=self._loop_task
         self._loop_task=None
         if t:

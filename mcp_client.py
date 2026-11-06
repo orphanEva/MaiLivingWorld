@@ -1,13 +1,13 @@
-"""Lazy MCP v2 stdio/HTTP boundaries for administrator-configured servers.
+"""Lazy MCP stdio/HTTP boundaries for administrator-configured servers.
 
 One worker owns the SDK context for its entire lifetime. It never retries a tool
 request: after a transport failure the caller must construct a new client and
 decide what to do with the operation whose outcome may be unknown.
 
-``max_response_bytes`` bounds parsed results and HTTP SSE events, not raw stdio
-lines or HTTP JSON bodies before parsing. The official transports buffer those
-JSON messages first; configured executables and endpoints therefore remain
-trusted services, not sandboxed untrusted code.
+``max_response_bytes`` bounds parsed results. The MCP 1.x HTTP client also
+limits the whole uncompressed response with an extra 8 KiB for its envelope.
+MCP 2.x limits HTTP SSE events. Its JSON transport and both stdio transports
+buffer messages before parsing, so endpoints and executables remain trusted.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -60,42 +61,54 @@ def _quiet_sdk_logs():
     # in the same host keep their normal logging behavior.
     for name, logger in tuple(logging.Logger.manager.loggerDict.items()):
         if (any(name == prefix or name.startswith(prefix + ".")
-                for prefix in ("mcp", "mcp_types", "httpx2", "httpcore2"))
+                for prefix in ("mcp", "mcp_types", "httpx", "httpcore", "httpx2", "httpcore2"))
                 and isinstance(logger, logging.Logger)):
             if _QUIET_FILTER not in logger.filters:
                 logger.addFilter(_QUIET_FILTER)
 
 
 @asynccontextmanager
+async def _session(sdk, transport, timeout_seconds):
+    if hasattr(sdk, "Client"):
+        async with sdk.Client(transport, mode="legacy", read_timeout_seconds=timeout_seconds,
+                              input_required_max_rounds=0, cache=None) as client:
+            yield client
+    else:
+        async with transport as streams:
+            async with sdk.ClientSession(streams[0], streams[1],
+                                         read_timeout_seconds=timedelta(seconds=timeout_seconds)) as client:
+                await client.initialize()
+                yield client
+
+
+@asynccontextmanager
 async def _sdk_context(*, command, args, cwd, env, timeout_seconds):
     try:
-        from mcp import Client
+        import mcp
         from mcp.client.stdio import StdioServerParameters, stdio_client
     except (ImportError, AttributeError):
         raise MCPError("sdk_unavailable") from None
     _quiet_sdk_logs()
     parameters = StdioServerParameters(command=command, args=args, cwd=cwd, env=env)
-    # SDK 2.3 stdio uses shell=False-style argv, CREATE_NO_WINDOW on Windows,
-    # a minimal environment allowlist, and bounded child-process cleanup.
-    # No sampling, elicitation, roots, notification handlers or extensions.
+    # Both official transports use explicit argv, a minimal inherited environment
+    # and child-process cleanup. No sampling, elicitation or roots are registered.
     with open(os.devnull, "w", encoding="utf-8") as errors:
-        async with Client(
-            stdio_client(parameters, errlog=errors), mode="legacy",
-            read_timeout_seconds=timeout_seconds, input_required_max_rounds=0,
-            cache=None,
-        ) as client:
+        async with _session(mcp, stdio_client(parameters, errlog=errors), timeout_seconds) as client:
             yield client
 
 
 @asynccontextmanager
 async def _http_sdk_context(*, url, bearer_token, timeout_seconds, max_response_bytes):
     try:
-        import httpx2
-        from mcp import Client
+        import mcp
         from mcp.client.streamable_http import streamable_http_client
+        if hasattr(mcp, "Client"):
+            import httpx2 as http
+        else:
+            import httpx as http
     except (ImportError, AttributeError):
         raise MCPError("sdk_unavailable") from None
-    endpoint = httpx2.URL(url)
+    endpoint = http.URL(url)
 
     async def fixed_endpoint(request):
         # No redirect/OAuth destination, server-supplied URL or proxy inherits
@@ -105,22 +118,50 @@ async def _http_sdk_context(*, url, bearer_token, timeout_seconds, max_response_
         request.headers["Authorization"] = "Bearer " + bearer_token
         request.headers.pop("Cookie", None)
 
-    # The SDK follows same-origin redirects itself, independently of
+    hooks = {"request": [fixed_endpoint]}
+    headers = {"Authorization": "Bearer " + bearer_token}
+    transport_options = {}
+    if hasattr(mcp, "Client"):
+        transport_options["max_sse_event_size"] = max_response_bytes
+    else:
+        # v1 buffers JSON responses and does not bound SSE messages. Bound the
+        # complete response before the SDK reads it, even for chunked transfers.
+        # Our gateways use one JSON response per request.
+        headers["Accept-Encoding"] = "identity"
+
+        class LimitedStream(http.AsyncByteStream):
+            def __init__(self, upstream):
+                self.upstream = upstream
+
+            async def __aiter__(self):
+                size = 0
+                async for chunk in self.upstream:
+                    size += len(chunk)
+                    if size > max_response_bytes + 8192:  # includes the JSON-RPC envelope
+                        raise MCPError("response_too_large")
+                    yield chunk
+
+            async def aclose(self):
+                await self.upstream.aclose()
+
+        async def bound_response(response):
+            if response.headers.get("content-encoding", "identity").lower() != "identity":
+                await response.aclose()
+                raise MCPError("invalid_response")
+            response.stream = LimitedStream(response.stream)
+
+        hooks["response"] = [bound_response]
+
+    # The v2 SDK follows same-origin redirects itself, independently of
     # follow_redirects. Its loop consults max_redirects, so zero disables ALL
     # redirects, including a trailing-slash normalization of the endpoint.
-    async with httpx2.AsyncClient(
-        headers={"Authorization": "Bearer " + bearer_token},
-        timeout=httpx2.Timeout(timeout_seconds), follow_redirects=False,
-        max_redirects=0, trust_env=False, event_hooks={"request": [fixed_endpoint]},
+    async with http.AsyncClient(
+        headers=headers, timeout=http.Timeout(timeout_seconds), follow_redirects=False,
+        max_redirects=0, trust_env=False, event_hooks=hooks,
     ) as http_client:
         _quiet_sdk_logs()
-        transport = streamable_http_client(
-            url, http_client=http_client, max_sse_event_size=max_response_bytes,
-        )
-        async with Client(
-            transport, mode="legacy", read_timeout_seconds=timeout_seconds,
-            input_required_max_rounds=0, cache=None,
-        ) as client:
+        transport = streamable_http_client(url, http_client=http_client, **transport_options)
+        async with _session(mcp, transport, timeout_seconds) as client:
             yield client
 
 
@@ -184,7 +225,12 @@ def _invalid_constant(_):
 
 
 def _value(obj, name, default=None):
-    return obj.get(name, default) if type(obj) is dict else getattr(obj, name, default)
+    if type(obj) is dict or hasattr(obj, name):
+        return obj.get(name, default) if type(obj) is dict else getattr(obj, name)
+    # v1 exposes wire field names directly; v2 exposes Python-style names.
+    wire_name = {"is_error": "isError", "structured_content": "structuredContent",
+                 "input_schema": "inputSchema", "next_cursor": "nextCursor"}.get(name, name)
+    return getattr(obj, wire_name, default)
 
 
 def _result(result, limit):
@@ -239,7 +285,7 @@ class StdioMCPClient:
 
     A test ``client_factory`` is called with keyword arguments ``command``,
     ``args``, ``cwd``, ``env``, ``timeout_seconds`` and returns an async context
-    manager exposing the SDK v2 ``list_tools`` and ``call_tool`` methods.
+    manager exposing the SDK ``list_tools`` and ``call_tool`` methods.
     Cancelling a queued caller never cancels somebody else's active operation.
     Cancelling an active caller discards its outcome, then retires the session
     after that operation settles or reaches its deadline; it is never replayed.

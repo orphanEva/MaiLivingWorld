@@ -275,14 +275,10 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.entries, 1)
 
 
-def has_sdk_v2():
-    if importlib.util.find_spec("mcp") is None:
-        return False
-    import mcp
-    return hasattr(mcp, "Client")
+HAS_SDK = importlib.util.find_spec("mcp") is not None
 
 
-@unittest.skipUnless(has_sdk_v2(), "optional MCP v2 dependency is not installed")
+@unittest.skipUnless(HAS_SDK, "requires the MCP client SDK")
 class RealStdioTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -398,6 +394,7 @@ class OfflineHTTPApp:
         self.redirect_on = None
         self.unauthorized = False
         self.hang = False
+        self.padding = 0
         self.calls = 0
         self.capabilities = None
 
@@ -440,28 +437,33 @@ class OfflineHTTPApp:
             data = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {
                 "isError": False, "structuredContent": {"calls": self.calls},
                 "content": [{"type": "text", "text": json.dumps({"calls": self.calls})}]}}).encode()
+            data += b" " * self.padding
         elif method and method.startswith("notifications/"):
             status = 202
         await send({"type": "http.response.start", "status": status, "headers": response_headers})
         await send({"type": "http.response.body", "body": data})
 
 
-@unittest.skipUnless(has_sdk_v2(), "optional MCP v2 dependency is not installed")
+@unittest.skipUnless(HAS_SDK, "requires the MCP client SDK")
 class RealHTTPTransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        import httpx2
-        self.httpx = httpx2
+        import mcp
+        if hasattr(mcp, "Client"):
+            import httpx2 as http
+        else:
+            import httpx as http
+        self.httpx = http
         self.app = OfflineHTTPApp()
         self.http_clients, self.options, self.clients = [], [], []
-        real_client = httpx2.AsyncClient
+        real_client = http.AsyncClient
 
         def factory(**kwargs):
             self.options.append(kwargs)
-            client = real_client(transport=httpx2.ASGITransport(app=self.app), **kwargs)
+            client = real_client(transport=http.ASGITransport(app=self.app), **kwargs)
             self.http_clients.append(client)
             return client
 
-        self.patcher = patch.object(httpx2, "AsyncClient", side_effect=factory)
+        self.patcher = patch.object(http, "AsyncClient", side_effect=factory)
         self.patcher.start()
 
     async def asyncTearDown(self):
@@ -471,8 +473,8 @@ class RealHTTPTransportTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.patcher.stop()
 
-    def client(self, timeout=2):
-        client = HTTPMCPClient("http://gateway:8000/mcp", TOKEN, timeout_seconds=timeout)
+    def client(self, timeout=2, **kwargs):
+        client = HTTPMCPClient("http://gateway:8000/mcp", TOKEN, timeout_seconds=timeout, **kwargs)
         self.clients.append(client)
         return client
 
@@ -522,7 +524,7 @@ class RealHTTPTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_authentication_failure_is_safe_and_never_discovers_oauth_endpoint(self):
         self.app.unauthorized = True
         client = self.client()
-        with self.assertNoLogs("httpx2", level="INFO"), self.assertRaisesRegex(MCPError, "^disconnected$"):
+        with self.assertNoLogs(self.httpx.__name__, level="INFO"), self.assertRaisesRegex(MCPError, "^disconnected$"):
             await client.list_tools()
         self.assertEqual(len(self.app.requests), 1)
 
@@ -535,6 +537,20 @@ class RealHTTPTransportTests(unittest.IsolatedAsyncioTestCase):
         await client.close()
         self.assertEqual(self.app.calls, 1)
         self.assertEqual(sum(request["rpc"] == "tools/call" for request in self.app.requests), 1)
+
+    async def test_v1_transport_rejects_oversized_json_envelope_before_parsing(self):
+        if self.httpx.__name__ != "httpx":
+            self.skipTest("MCP 1.x streaming response hook")
+        client = self.client(max_response_bytes=1024)
+        await client.list_tools()
+        self.assertEqual(await client.call_tool("echo", {}), {"calls": 1})
+        # The tool payload is tiny and valid. Only the on-wire envelope crosses the cap.
+        self.app.padding = 16000
+        with self.assertRaises(MCPError):
+            await client.call_tool("echo", {})
+        await client.close()
+        self.assertTrue(client.retired)
+        self.assertEqual(self.app.calls, 2)
 
 
 if __name__ == "__main__":

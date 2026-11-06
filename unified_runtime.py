@@ -53,7 +53,7 @@ class UnifiedRuntime:
         self._private.clear()
         self._cache.clear()
 
-    def capture(self, message: Any, *, private_users: list[str], group_ids: list[str]) -> None:
+    def capture(self, message: Any, *, private_users: list[str], group_ids: list[str], media_fallback: str = "") -> None:
         sender = extract_sender(message)
         if (not sender or not sender.stream_id or not sender.message_id
                 or str(message.get("account_id") or "") == sender.user_id):
@@ -79,6 +79,8 @@ class UnifiedRuntime:
                 if isinstance(value, str):
                     fragments.append(value)
             text = " ".join(fragments)
+        if not text.strip():
+            text = media_fallback
         if not text.strip():
             return
         now = time.monotonic()

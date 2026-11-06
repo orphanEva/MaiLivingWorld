@@ -92,14 +92,26 @@ def _url(value):
     return value
 
 
+def observation_id(provider, resource_key):
+    return "tool:observation:" + _digest(_name(provider, 40), _text(resource_key, 191, code="invalid_resource"))
+
+
 def observation_record(row):
     """One canonical mapper shared by direct and unified-memory reads."""
     if not row or int(row["active"]) != 1:
         return None
+    evidence = "tool_observation"
+    if row["provider"] == "chat_media":
+        evidence = "visual_observation"
+        if row["text"].startswith("B站链接资料"):
+            evidence = "source_metadata"
+        elif row["text"].startswith("B站字幕节选"):
+            evidence = "subtitle_excerpt"
     return {"id": row["id"], "source": "tool", "kind": "observation",
             "scope": row["scope"], "subject_id": row["subject_id"], "text": row["text"],
             "timestamp": float(row["timestamp"]), "sensitivity": row["sensitivity"],
-            "evidence_status": "tool_observation", "origin_key": row["origin_key"],
+            "evidence_status": evidence,
+            "origin_key": row["origin_key"],
             "url": row["url"], "source_name": row["provider"]}
 
 
@@ -173,7 +185,7 @@ class ToolStore:
             cursor.close()
 
     def put_observation(self, provider, resource_key, text, scope, subject_id="",
-                        sensitivity="personal", url="", origin_key="", now=None):
+                        sensitivity="personal", url="", origin_key="", now=None, *, media_message_key=None):
         provider = _name(provider, 40)
         resource_key = _text(resource_key, 191, code="invalid_resource")
         text = _text(text, 600)
@@ -185,13 +197,15 @@ class ToolStore:
         origin_key = _text(origin_key, 240, empty=True)
         origin_key = "tool:" + provider + ":" + _digest(origin_key or resource_key)
         timestamp = _now(now)
-        identity = "tool:observation:" + _digest(provider, resource_key)
+        identity = observation_id(provider, resource_key)
         if sensitivity == "public" and not (scope == "public" or scope.startswith("public:")):
             sensitivity = "personal" if scope.startswith(("private:", "group:")) else "unknown"
         if _SECRET.search(text):
             sensitivity = "confidential"
         with self.con:
             self._lock()
+            if provider == "chat_media" and media_message_key and self._withdrawn_media(media_message_key):
+                return None
             old = self.con.execute("SELECT * FROM tool_observations WHERE id=?", (identity,)).fetchone()
             if old is not None:
                 sensitivity = max((old["sensitivity"], sensitivity), key=_RANK.get)
@@ -229,8 +243,38 @@ class ToolStore:
                                   url, origin_key, timestamp, timestamp))
             return observation_record(self.con.execute("SELECT * FROM tool_observations WHERE id=?", (identity,)).fetchone())
 
+    def _withdrawn_media(self, message_key):
+        marker = "tool:call:" + _digest("media-withdrawal", message_key)
+        return self.con.execute("SELECT id FROM tool_calls WHERE id=?", (marker,)).fetchone() is not None
+
+    def retract_chat_media(self, message_key, keys, scope, author, *, in_flight=False, now=None):
+        """Fence all attachments of one verified original, including workers on another connection."""
+        if (not isinstance(keys, list) or not 1 <= len(keys) <= 9
+                or any(not isinstance(k, str) or not re.fullmatch(r"[0-9a-f]{64}", k) for k in [message_key, *keys])):
+            raise ValueError("invalid_media_keys")
+        ids = [observation_id("chat_media", key) for key in keys]
+        marks = ",".join("?" for _ in keys)
+        stamp = _now(now)
+        with self.con:
+            self._lock()
+            if self._withdrawn_media(message_key):
+                return False
+            ticket = self.con.execute("SELECT id FROM tool_calls WHERE provider='chat_media' AND scope=? "
+                f"AND subject_id=? AND args_digest IN ({marks}) LIMIT 1", (scope, author, *keys)).fetchone()
+            cleared = self.con.execute("UPDATE tool_observations SET text='',active=0,"
+                "timestamp=CASE WHEN timestamp>=? THEN timestamp+0.001 ELSE ? END "
+                f"WHERE scope=? AND id IN ({marks}) AND active=1", (stamp, stamp, scope, *ids))
+            if not (in_flight or ticket or cleared.rowcount):
+                return False
+            # One marker for a real accepted message. Do not register unrelated QQ notices.
+            marker = "tool:call:" + _digest("media-withdrawal", message_key)
+            self.con.execute("INSERT INTO tool_calls(id,provider,tool,args_digest,context_digest,status,scope,"
+                "subject_id,budget_day,payload,created,updated) VALUES (?,'chat_media','withdrawal',?,'',"
+                "'withdrawn',?,?,0,'{}',?,?)", (marker, message_key, scope, author, stamp, stamp))
+            return True
+
     def retract_observation(self, provider, resource_key, now=None):
-        identity = "tool:observation:" + _digest(_name(provider, 40), _text(resource_key, 191, code="invalid_resource"))
+        identity = observation_id(provider, resource_key)
         timestamp = _now(now)
         with self.con:
             self._lock()
@@ -256,6 +300,34 @@ class ToolStore:
                 (timestamp, timestamp, provider, origin_key))
             return int(result.rowcount)
 
+    def recent_chat_media(self, scope, kinds, *, now=None):
+        """Return up to two recent candidates, including failed reads so an older one cannot impersonate them."""
+        if not kinds or any(k not in ("image", "video", "bilibili") for k in kinds):
+            return []
+        stamp = _now(now)
+        placeholders = ",".join("?" for _ in kinds)
+        return self._read("SELECT args_digest,status FROM tool_calls WHERE provider=? AND scope=? "
+                          f"AND tool IN ({placeholders}) AND created>=? AND created<=? ORDER BY created DESC,id DESC LIMIT 2",
+                          ("chat_media", scope, *kinds, stamp - 900, stamp))
+
+    def _mark_media_skipped(self, slot, kind, scope, key, day, stamp):
+        """Called under the reservation lock. Keep one unread marker per audience/kind."""
+        previous = self.con.execute("SELECT args_digest,created FROM tool_calls WHERE id=?", (slot,)).fetchone()
+        if previous is None:
+            self.con.execute("INSERT INTO tool_calls(id,provider,tool,args_digest,context_digest,status,scope,"
+                             "subject_id,budget_day,payload,created,updated) VALUES (?,'chat_media',?,?,'','skipped',"
+                             "?,'',?,'{}',?,?)", (slot, kind, key, scope, day, stamp, stamp))
+            return
+        previous_time = float(previous["created"])
+        if stamp < previous_time - 900:
+            return
+        if abs(stamp - previous_time) <= 900 and previous["args_digest"] != key:
+            # Several omissions cannot all be resolved by later reading one of them.
+            key = _digest("multiple-skipped-media", scope, kind)
+        newest = max(previous_time, stamp)
+        self.con.execute("UPDATE tool_calls SET args_digest=?,created=?,updated=? WHERE id=?",
+                         (key, newest, newest, slot))
+
     def observations(self, limit=200, now=None):
         _integer(limit, 1, 1000)
         _now(now)
@@ -275,7 +347,7 @@ class ToolStore:
         return [lookup[i] for i in dict.fromkeys(ids) if i in lookup]
 
     def reserve_call(self, provider, tool, args_digest, request_key, scope, subject_id,
-                     day_start, max_daily, now=None):
+                     day_start, max_daily, now=None, *, media_message_key=None):
         provider, tool = _name(provider, 40), _name(tool)
         if not isinstance(args_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", args_digest):
             raise ValueError("invalid_digest")
@@ -288,13 +360,26 @@ class ToolStore:
         identity = "tool:call:"+_digest(provider, tool, args_digest, context_digest)
         with self.con:
             self._lock()
+            if provider == "chat_media" and media_message_key and self._withdrawn_media(media_message_key):
+                return {"id": "", "status": "withdrawn", "allowed": False}
             old = self.con.execute("SELECT status FROM tool_calls WHERE id=?", (identity,)).fetchone()
             if old is not None:
                 return {"id": identity, "status": old["status"], "allowed": False}
-            count = self.con.execute("SELECT COUNT(*) FROM tool_calls WHERE budget_day=?", (day_start,)).fetchone()[0]
-            latest = self.con.execute("SELECT MAX(budget_day) FROM tool_calls").fetchone()[0]
+            # Chat attachments have an independent intake limit. Disabling MCP or exhausting its
+            # quota must not enable, disable or consume the conversation's visual allowance.
+            media_slot = "tool:call:" + _digest("skipped-media", scope, tool) if provider == "chat_media" else None
+            pool = "provider=? AND status NOT IN ('skipped','withdrawn')" if media_slot else "provider<>?"
+            count = self.con.execute("SELECT COUNT(*) FROM tool_calls WHERE budget_day=? AND " + pool,
+                                     (day_start, "chat_media")).fetchone()[0]
+            latest = self.con.execute("SELECT MAX(budget_day) FROM tool_calls WHERE " + pool, ("chat_media",)).fetchone()[0]
             if count >= max_daily or (latest is not None and day_start < latest):
+                if media_slot:
+                    self._mark_media_skipped(media_slot, tool, scope, args_digest, day_start, timestamp)
                 return {"id": "", "status": "budget_exhausted", "allowed": False}
+            if media_slot:
+                # An exact retry now has a normal receipt. A marker for other omissions stays.
+                self.con.execute("DELETE FROM tool_calls WHERE id=? AND args_digest=? AND status='skipped'",
+                                 (media_slot, args_digest))
             self.con.execute("INSERT INTO tool_calls(id,provider,tool,args_digest,context_digest,status,scope,"
                              "subject_id,budget_day,payload,created,updated) VALUES (?,?,?,?,?,'reserved',?,?,?,'{}',?,?)",
                              (identity, provider, tool, args_digest, context_digest, scope, subject_id,
@@ -421,9 +506,9 @@ class ToolStore:
 
     def status(self):
         # Dedicated reads are side-effect free even on a new empty database.
-        calls = {row["status"]: int(row["n"]) for row in self._read("SELECT status,COUNT(*) AS n FROM tool_calls GROUP BY status")}
+        calls = {row["status"]: int(row["n"]) for row in self._read("SELECT status,COUNT(*) AS n FROM tool_calls WHERE provider<>? GROUP BY status", ("chat_media",))}
         active = {int(row["active"]): int(row["n"]) for row in self._read("SELECT active,COUNT(*) AS n FROM tool_observations GROUP BY active")}
-        daily = self._read("SELECT budget_day,COUNT(*) AS n FROM tool_calls GROUP BY budget_day ORDER BY budget_day DESC LIMIT 1")
+        daily = self._read("SELECT budget_day,COUNT(*) AS n FROM tool_calls WHERE provider<>? GROUP BY budget_day ORDER BY budget_day DESC LIMIT 1", ("chat_media",))
         control = self._read("SELECT attempts,last_attempt,budget_day,daily_count FROM tool_research WHERE question_key=?", (_CONTROL,))
         return {"observations": {"active": active.get(1, 0), "inactive": active.get(0, 0)},
                 "calls": {name: calls.get(name, 0) for name in ("reserved", "succeeded", "failed", "uncertain")},

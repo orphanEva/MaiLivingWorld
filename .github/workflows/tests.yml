@@ -11,7 +11,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade pip
-      - run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp>=2.3,<3' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2'
+      - run: pip install pydantic 'PyMySQL>=1.1,<2.0' 'mcp==1.28.1' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2' 'Pillow>=10,<13' 'imageio-ffmpeg>=0.6,<1'
       - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -v
       - run: python scripts/build_release.py
       - name: Upload WebUI install package
@@ -20,3 +20,13 @@ jobs:
           name: MaiLivingWorld-WebUI-install
           path: dist/MaiLivingWorld-*-WebUI.zip
           if-no-files-found: error
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'mcp==2.3.0' 'jsonschema>=4,<5' 'PyMuPDF>=1.26,<2' 'Pillow>=10,<13'
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mcp_client.py' -v
+      - run: PYTHONPATH="$(dirname "$GITHUB_WORKSPACE")" python -m unittest discover -s tests -p 'test_mcp_gateway.py' -v

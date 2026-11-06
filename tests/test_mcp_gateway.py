@@ -17,7 +17,8 @@ from MaiLivingWorld.document_reader import DocumentError, PDF_SCHEMA, PDF_TOOL
 
 TOKEN = "test-only-gateway-token-"+"a"*32
 BACKEND_KEY = "test-only-backend-key-"+"b"*32
-HAS_MCP = importlib.util.find_spec("mcp") is not None and importlib.util.find_spec("httpx2") is not None
+HAS_MCP = (importlib.util.find_spec("mcp") is not None and hasattr(__import__("mcp"), "Client")
+           and importlib.util.find_spec("httpx2") is not None)
 SCHEMA = {"type": "object", "properties": {"jm_id": {"type": "string", "pattern": "^[0-9]+$"}},
           "required": ["jm_id"], "additionalProperties": False}
 
