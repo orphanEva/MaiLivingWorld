@@ -142,4 +142,3 @@ python scripts/evaluate_companion.py --scenarios evaluations/cognition_scenarios
 | 工作区为空 | 使用主人私聊，检查 attention 与 integrated_workspace 开关及当前可信消息 |
 | 后台暂时没有动作 | 检查主人对话占用、冷却、日额度、有效候选、MCP 与项目总开关 |
 | 重启后像失忆 | 核对原持久卷、数据库和 owner.qq，发一条新消息建立当前会话的可信映射 |
-
