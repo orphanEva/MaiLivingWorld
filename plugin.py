@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from maibot_sdk import API, Tool, Field, MaiBotPlugin, PluginConfigBase, HookHandler
 from maibot_sdk.types import HookMode, HookOrder, ErrorPolicy
+from pydantic import ValidationInfo, field_validator
 
 from .bilibili import fetch_popular
 from .explore import Story, choose_story, fetch_feed, parse_feed
@@ -60,7 +61,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "00 / 插件设置"
     enabled: bool = Field(default=True, description="插件总开关；关闭后不执行主人识别、探索或主动聊天")
     config_version: str = Field(
-        default="0.26.0",
+        default="0.27.0",
         description="配置格式版本，随插件升级自动迁移",
         json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
     )
@@ -97,8 +98,12 @@ class Audience(PluginConfigBase):
 
 class Owner(PluginConfigBase):
     __ui_label__ = "03 / 主人识别（QQ 可信身份）"
+    setup_mode: Literal["详细配置", "日常陪伴", "陪伴与成长"] = Field(default="详细配置",
+        description="首次使用可选日常陪伴。陪伴与成长还会调用模型整理聊天、形成兴趣。详细配置按各分组的保存值运行。",
+        json_schema_extra={"label": "使用方式"})
+    qq: str = Field(default="", validate_default=True, description="填写你自己的 QQ 号，用来识别唯一主人。",
+                    json_schema_extra={"label": "主人 QQ 号", "placeholder": "填写 5 至 20 位数字"})
     enabled: bool = Field(default=False, description="独立开关：根据 QQ 平台提供的用户ID识别主人；不改变其他插件的管理员权限")
-    qq: str = Field(default="", description="绑定主人 QQ 号（只填数字）；严禁在公开仓库写入真实号码")
     title: str = Field(default="主人", description="聊天时使用的关系称呼，建议简短；不影响身份校验")
     recognize_in_groups: bool = Field(default=True, description="群聊中主人本人发消息时，让本轮模型知道消息来自主人")
     recognize_in_private: bool = Field(default=True, description="在与主人 QQ 的私聊中识别其身份")
@@ -107,6 +112,13 @@ class Owner(PluginConfigBase):
     relationship_mode: Literal["banter", "gentle", "tsundere", "partner", "custom"] = Field(default="banter", description="风格预设：banter=损友亲近、gentle=温柔偏心、tsundere=嘴硬心软、partner=长期伴侣、custom=完全自定义")
     private_template: str = Field(default="", description="私聊专属风格模板；留空使用所选预设。建议写相处方式而不是固定台词")
     group_template: str = Field(default="", description="群聊专属风格模板；留空使用所选预设。请勿填入私聊秘密")
+
+    @field_validator("qq")
+    @classmethod
+    def check_setup_owner(cls, value: str, info: ValidationInfo) -> str:
+        if info.data.get("setup_mode") in {"日常陪伴", "陪伴与成长"} and not normalize_qq(value):
+            raise ValueError("请在快速开始中填写主人本人的 QQ 号，使用 5 至 20 位半角数字")
+        return value
 
 
 class Explorer(PluginConfigBase):
@@ -429,6 +441,42 @@ def _stream_id(stream: Any) -> str:
 class MaiLivingWorld(MaiBotPlugin):
     config_model = Config
 
+    def set_plugin_config(self, config: dict[str, Any]) -> None:
+        # The SDK keeps the normalized editor data and a separately validated runtime model.
+        # Every load and reload starts with the saved values, including when leaving a preset.
+        super().set_plugin_config(config)
+        settings = self.config
+        if settings.owner.setup_mode == "详细配置":
+            return
+        settings.owner.enabled = True
+        settings.owner.recognize_in_private = True
+        settings.owner.recognize_in_groups = False
+        settings.owner.relationship_enabled = True
+        settings.owner.relationship_mode = "partner"
+        settings.brain_memory.include_owner = True
+        settings.unified_mind.enabled = True
+        settings.unified_mind.mode = "active"
+        settings.bond.enabled = True
+        settings.reference.enabled = True
+        settings.continuity.enabled = True
+        learning = settings.owner.setup_mode == "陪伴与成长"
+        settings.continuity.auto_topics = learning
+        if learning:
+            settings.brain_memory.enabled = True
+            settings.brain_memory.auto_reflect = True
+            settings.brain_memory.enable_events = True
+            settings.brain_memory.enable_facts = True
+            settings.growth.enabled = True
+            settings.growth.mode = "active"
+
+    @classmethod
+    def build_config_schema(cls, *, plugin_id="", plugin_name="", plugin_version="", plugin_description="", plugin_author=""):
+        from .config_layout import config_layout
+        return config_layout(super().build_config_schema(
+            plugin_id=plugin_id, plugin_name=plugin_name, plugin_version=plugin_version,
+            plugin_description=plugin_description, plugin_author=plugin_author,
+        ))
+
     def __init__(self):
         super().__init__()
         self._loop_task: asyncio.Task | None = None
@@ -520,7 +568,7 @@ class MaiLivingWorld(MaiBotPlugin):
         if self.config.growth.enabled:
             self._ensure_growth()
         self._loop_task = asyncio.create_task(self._scheduler(), name="mai-living-world")
-        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.26.0；storage=%s enabled=%s dry_run=%s",
+        self.ctx.logger.info("[MaiLivingWorld] 已加载 v0.27.0；storage=%s enabled=%s dry_run=%s",
                              backend,self.config.general.enabled,self.config.general.dry_run)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:

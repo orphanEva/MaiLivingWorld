@@ -74,12 +74,14 @@ V24_LEDGERS = MappingProxyType({**V23_LEDGERS,
 V25_LEDGERS = MappingProxyType(dict(V24_LEDGERS))
 # v0.26 stores verified prior mentions in the existing reference payload.
 V26_LEDGERS = MappingProxyType(dict(V25_LEDGERS))
+# v0.27 simplifies configuration and retains the existing persistent state.
+V27_LEDGERS = MappingProxyType(dict(V26_LEDGERS))
 CATALOGS = MappingProxyType({"v0.14": V14_LEDGERS, "v0.15": V15_LEDGERS, "v0.16": V16_LEDGERS,
                            "v0.17": V17_LEDGERS, "v0.18": V18_LEDGERS, "v0.19": V19_LEDGERS,
                            "v0.20": V20_LEDGERS, "v0.21": V21_LEDGERS, "v0.22": V22_LEDGERS,
                            "v0.23": V23_LEDGERS, "v0.24": V24_LEDGERS, "v0.25": V25_LEDGERS,
-                           "v0.26": V26_LEDGERS})
-CURRENT_CATALOG = "v0.26"
+                           "v0.26": V26_LEDGERS, "v0.27": V27_LEDGERS})
+CURRENT_CATALOG = "v0.27"
 LEDGERS = CATALOGS[CURRENT_CATALOG]
 TABLES = tuple(table for tables in LEDGERS.values() for table in tables)
 MAX_MANIFEST = 1024 * 1024

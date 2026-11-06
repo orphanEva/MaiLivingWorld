@@ -24,7 +24,34 @@ fake_types.ErrorPolicy = types.SimpleNamespace(SKIP="skip")
 sys.modules.setdefault("maibot_sdk.types",fake_types)
 fake.Field = Field
 fake.PluginConfigBase = BaseModel
-fake.MaiBotPlugin = type("MaiBotPlugin",(object,),{})
+
+
+class FakePluginBase:
+    """The SDK keeps normalized on-disk values separate from its typed config instance."""
+
+    def normalize_plugin_config(self, config):
+        normalized = self.config_model.model_validate(config or {}).model_dump()
+        return normalized, normalized != config
+
+    def set_plugin_config(self, config):
+        normalized, _ = self.normalize_plugin_config(config)
+        self._plugin_config_data = normalized
+        self._plugin_config_instance = self.config_model.model_validate(normalized)
+
+    def get_plugin_config_data(self):
+        return dict(self._plugin_config_data)
+
+    @property
+    def config(self):
+        return self._plugin_config_instance
+
+    @config.setter
+    def config(self, value):
+        # Existing hook-level tests directly supply a typed config.
+        self._plugin_config_instance = value
+
+
+fake.MaiBotPlugin = FakePluginBase
 sys.modules.setdefault("maibot_sdk",fake)
 plugin = importlib.import_module("MaiLivingWorld.plugin")
 from MaiLivingWorld.store import Store
